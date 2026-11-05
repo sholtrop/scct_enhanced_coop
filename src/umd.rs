@@ -471,10 +471,10 @@ pub fn validate_level_specs(
                 _ => continue,
             };
             used_map_names.insert(stem.to_lowercase());
-            if let Some(id_str) = get_ini_key_value(ini_bytes, "General", "Identity") {
-                if let Ok(id_val) = id_str.trim().parse::<u8>() {
-                    used_identities.insert(id_val, stem.to_string());
-                }
+            if let Some(id_val) = get_ini_key_value(ini_bytes, "General", "Identity")
+                .and_then(|s| s.trim().parse::<u8>().ok())
+            {
+                used_identities.insert(id_val, stem.to_string());
             }
         }
     }
@@ -630,7 +630,8 @@ pub fn patch_umd_for_all_sp_levels(
     }
 
     // Update Seoul 1 and Seoul 2 mission display names in localization files
-    let seoul_missions = [("08_seoulone", "Seoul 1"), ("09_seoultwo", "Seoul 2")];
+    let seoul_missions = [("08_seoulone", "SEOUL 1"), ("09_seoultwo", "SEOUL 2")];
+    let re_map = Regex::new(r"(?im)^MapName=.*$").unwrap();
     for lang in LANG_EXTS {
         for (stem, name_en) in seoul_missions {
             let loc_key = format!("data\\system\\localization\\{}.{}", stem, lang);
@@ -643,12 +644,11 @@ pub fn patch_umd_for_all_sp_levels(
             let text = orig_bytes.iter().map(|&b| b as char).collect::<String>();
 
             let display_name = match *lang {
-                "esp" => if name_en == "Seoul 1" { "Seúl 1" } else { "Seúl 2" },
-                "ita" => if name_en == "Seoul 1" { "Seul 1" } else { "Seul 2" },
+                "esp" => if name_en == "SEOUL 1" { "SEÚL 1" } else { "SEÚL 2" },
+                "ita" => if name_en == "SEOUL 1" { "SEUL 1" } else { "SEUL 2" },
                 _ => name_en,
             };
 
-            let re_map = Regex::new(r"(?im)^MapName=.*$").unwrap();
             let new_text = re_map.replace(&text, format!("MapName={}", display_name)).to_string();
             let new_bytes: Vec<u8> = new_text.chars().map(|c| c as u8).collect();
             let (lpath, loff, lold, lnew) = append_virtual_file(

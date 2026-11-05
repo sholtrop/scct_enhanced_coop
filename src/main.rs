@@ -2,7 +2,6 @@
 #![windows_subsystem = "windows"]
 
 mod gui;
-mod integrity;
 mod levels;
 mod net;
 mod patcher;

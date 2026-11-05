@@ -79,8 +79,10 @@ pub fn read_fstring(data: &[u8], offset: &mut usize) -> Result<String> {
         }
         let slice = &data[*offset..*offset + byte_len];
         let u16s: Vec<u16> = slice
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&chunk| u16::from_le_bytes(chunk))
             .collect();
         let decoded = String::from_utf16_lossy(&u16s);
         *offset += byte_len + 2; // skip null word

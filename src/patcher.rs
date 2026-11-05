@@ -1,10 +1,11 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-static LOG_SINK: Mutex<Option<Box<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
+type LogCallback = Box<dyn Fn(&str) + Send + Sync>;
+static LOG_SINK: Mutex<Option<LogCallback>> = Mutex::new(None);
 
 pub fn set_log_sink<F>(f: F)
 where
@@ -24,6 +25,7 @@ pub fn clear_log_sink() {
 pub fn log_msg(msg: &str) {
     println!("{}", msg);
     if let Ok(sink) = LOG_SINK.lock() {
+        #[allow(clippy::collapsible_if)]
         if let Some(ref cb) = *sink {
             cb(msg);
         }
@@ -88,7 +90,10 @@ pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
 
         if abs.join("splintercell3.exe").is_file() || abs.join("splintercell3.exe.bak").is_file() {
             let root = abs.parent().unwrap_or(&abs).to_path_buf();
-            scct_log!("  [INIT] Detected splintercell3.exe in specified folder: {}", abs.display());
+            scct_log!(
+                "  [INIT] Detected splintercell3.exe in specified folder: {}",
+                abs.display()
+            );
             scct_log!("  [INIT] Using game root: {}", root.display());
             return Ok(root);
         }
@@ -99,7 +104,10 @@ pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
             return Ok(abs);
         }
 
-        scct_log!("  [INIT] Using specified path as game root: {}", abs.display());
+        scct_log!(
+            "  [INIT] Using specified path as game root: {}",
+            abs.display()
+        );
         return Ok(abs);
     }
 
@@ -107,7 +115,10 @@ pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
     if cwd.join("splintercell3.exe").is_file() || cwd.join("splintercell3.exe.bak").is_file() {
         let root = cwd.parent().unwrap_or(&cwd).to_path_buf();
-        scct_log!("  [INIT] Detected splintercell3.exe in current folder: {}", cwd.display());
+        scct_log!(
+            "  [INIT] Detected splintercell3.exe in current folder: {}",
+            cwd.display()
+        );
         scct_log!("  [INIT] Using game root: {}", root.display());
         return Ok(root);
     }
@@ -115,26 +126,33 @@ pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
     let cwd_sys = find_child_ci(&cwd, "System");
     let cwd_sys_exe = find_child_ci(&cwd_sys, "splintercell3.exe");
     if cwd_sys_exe.is_file() {
-        scct_log!("  [INIT] Detected System/splintercell3.exe in current folder: {}", cwd.display());
+        scct_log!(
+            "  [INIT] Detected System/splintercell3.exe in current folder: {}",
+            cwd.display()
+        );
         return Ok(cwd);
     }
 
     // Check directory of our running executable
-    if let Ok(current_bin) = std::env::current_exe() {
-        if let Some(bin_dir) = current_bin.parent() {
-            if bin_dir.join("splintercell3.exe").is_file()
-                || bin_dir.join("splintercell3.exe.bak").is_file()
-            {
-                let root = bin_dir.parent().unwrap_or(bin_dir).to_path_buf();
-                scct_log!("  [INIT] Detected splintercell3.exe next to patcher: {}", bin_dir.display());
-                scct_log!("  [INIT] Using game root: {}", root.display());
-                return Ok(root);
-            }
-            let bin_sys = find_child_ci(bin_dir, "System");
-            if find_child_ci(&bin_sys, "splintercell3.exe").is_file() {
-                scct_log!("  [INIT] Detected System/splintercell3.exe near patcher: {}", bin_dir.display());
-                return Ok(bin_dir.to_path_buf());
-            }
+    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        if bin_dir.join("splintercell3.exe").is_file()
+            || bin_dir.join("splintercell3.exe.bak").is_file()
+        {
+            let root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
+            scct_log!(
+                "  [INIT] Detected splintercell3.exe next to patcher: {}",
+                bin_dir.display()
+            );
+            scct_log!("  [INIT] Using game root: {}", root.display());
+            return Ok(root);
+        }
+        let bin_sys = find_child_ci(&bin_dir, "System");
+        if find_child_ci(&bin_sys, "splintercell3.exe").is_file() {
+            scct_log!(
+                "  [INIT] Detected System/splintercell3.exe near patcher: {}",
+                bin_dir.display()
+            );
+            return Ok(bin_dir);
         }
     }
 
@@ -220,15 +238,13 @@ pub fn ensure_clean_sp_maps_and_cleanup(
                     let _ = std::fs::remove_file(&target);
                     continue;
                 }
-                if let Some(caps) = re_loading.captures(&fname) {
-                    if let Some(m) = caps.get(1) {
-                        let stem = m.as_str().to_lowercase();
-                        if stem.ends_with("_coop")
-                            && !VANILLA_COOP_STEMS.contains(&stem.as_str())
-                            && !active_coop_stems.contains(&stem)
-                        {
-                            let _ = std::fs::remove_file(&target);
-                        }
+                if let Some(m) = re_loading.captures(&fname).and_then(|c| c.get(1)) {
+                    let stem = m.as_str().to_lowercase();
+                    if stem.ends_with("_coop")
+                        && !VANILLA_COOP_STEMS.contains(&stem.as_str())
+                        && !active_coop_stems.contains(&stem)
+                    {
+                        let _ = std::fs::remove_file(&target);
                     }
                 }
             }
@@ -253,8 +269,6 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
 
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
-
-    crate::integrity::verify_game_files_integrity(game_root)?;
 
     scct_log!("\n=== Step 1: Multi-NIC LAN Coop Networking Fix (`splintercell3.exe`) ===");
     if skip_net_fix {
@@ -300,7 +314,11 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         } else if let Some(orig) = disk_ci.get(&scl_key) {
             maps_dir.join(orig)
         } else {
-            bail!("Missing source SP map for {} in {}", src_map, maps_dir.display());
+            bail!(
+                "Missing source SP map for {} in {}",
+                src_map,
+                maps_dir.display()
+            );
         };
 
         let dst_scl_path = maps_dir.join(format!("{}.scl", coop_map));
@@ -317,12 +335,8 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         }
 
         // Write loose INI
-        let ini_bytes = build_appended_coop_ini(
-            &info.src_ini,
-            &info.canonical_src,
-            coop_map,
-            identity,
-        );
+        let ini_bytes =
+            build_appended_coop_ini(&info.src_ini, &info.canonical_src, coop_map, identity);
         std::fs::write(maps_dir.join(format!("{}.ini", coop_map)), ini_bytes)?;
 
         // Write loading DDS

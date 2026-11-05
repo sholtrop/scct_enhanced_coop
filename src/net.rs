@@ -129,7 +129,7 @@ pub fn va_to_text_off(va: u32) -> Result<usize> {
         bail!("VA 0x{:08X} < ImageBase", va);
     }
     let rva = va - PE_IMAGE_BASE;
-    if rva < PE_TEXT_RVA || rva >= PE_TEXT_RVA + PE_TEXT_RAW_SIZE {
+    if !(PE_TEXT_RVA..PE_TEXT_RVA + PE_TEXT_RAW_SIZE).contains(&rva) {
         bail!("VA 0x{:08X} outside .text", va);
     }
     Ok((PE_TEXT_RAW_OFF + (rva - PE_TEXT_RVA)) as usize)
@@ -259,7 +259,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
                 site.va,
                 exe_bak_path.display(),
                 &buf[so..so + site.orig.len()],
-                &site.orig
+                site.orig
             );
         }
     }
