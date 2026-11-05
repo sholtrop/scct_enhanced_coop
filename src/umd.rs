@@ -629,6 +629,42 @@ pub fn patch_umd_for_all_sp_levels(
         );
     }
 
+    // Update Seoul 1 and Seoul 2 mission display names in localization files
+    let seoul_missions = [("08_seoulone", "Seoul 1"), ("09_seoultwo", "Seoul 2")];
+    for lang in LANG_EXTS {
+        for (stem, name_en) in seoul_missions {
+            let loc_key = format!("data\\system\\localization\\{}.{}", stem, lang);
+            if !index_by_lower.contains_key(&loc_key) {
+                continue;
+            }
+            let loc_idx = index_by_lower[&loc_key];
+            let loc_ent = &entries[loc_idx];
+            let orig_bytes = payload[loc_ent.offset..loc_ent.offset + loc_ent.size].to_vec();
+            let text = orig_bytes.iter().map(|&b| b as char).collect::<String>();
+
+            let display_name = match *lang {
+                "esp" => if name_en == "Seoul 1" { "Seúl 1" } else { "Seúl 2" },
+                "ita" => if name_en == "Seoul 1" { "Seul 1" } else { "Seul 2" },
+                _ => name_en,
+            };
+
+            let re_map = Regex::new(r"(?im)^MapName=.*$").unwrap();
+            let new_text = re_map.replace(&text, format!("MapName={}", display_name)).to_string();
+            let new_bytes: Vec<u8> = new_text.chars().map(|c| c as u8).collect();
+            let (lpath, loff, lold, lnew) = append_virtual_file(
+                &mut payload,
+                &mut entries,
+                &index_by_lower,
+                &loc_key,
+                &new_bytes,
+            );
+            crate::scct_log!(
+                "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, MapName={})",
+                lpath, loff, lold, lnew, display_name
+            );
+        }
+    }
+
     serialize_umd_toc_and_footer(&mut payload, &entries, footer.tag);
     std::fs::write(umd_path, &payload)?;
     crate::scct_log!("  [UMD] Wrote {} ({} bytes)", umd_path.display(), payload.len());

@@ -209,7 +209,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         }
         let cur_data = fs::read(exe_path).with_context(|| format!("Reading {}", exe_path.display()))?;
         if is_lan_and_zerotier_fix_applied(&cur_data) {
-            crate::scct_log!("  [NET] Multi-NIC LAN + ZeroTier fix is already present in splintercell3.exe");
+            crate::scct_log!("  [NET] Multi-NIC LAN fix is already present in splintercell3.exe");
             return Ok(());
         }
         fs::copy(exe_path, exe_bak_path)
@@ -221,7 +221,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     if is_lan_and_zerotier_fix_applied(&buf) {
         fs::copy(exe_bak_path, exe_path)
             .with_context(|| format!("Copying {} to {}", exe_bak_path.display(), exe_path.display()))?;
-        crate::scct_log!("  [NET] Applied multi-NIC LAN + ZeroTier fix to splintercell3.exe");
+        crate::scct_log!("  [NET] Applied multi-NIC LAN fix to splintercell3.exe");
         return Ok(());
     }
 
@@ -281,7 +281,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
 
     fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
     crate::scct_log!(
-        "  [NET] Patched System/splintercell3.exe (v2 LAN+ZeroTier fix @ 0x{:08X}, 7 sites)",
+        "  [NET] Patched System/splintercell3.exe (Multi-NIC LAN fix @ 0x{:08X}, 7 sites)",
         NET_CAVE_VA
     );
     Ok(())

@@ -254,7 +254,9 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
 
-    scct_log!("=== Step 1: Multi-NIC LAN + ZeroTier Coop Networking Fix (`splintercell3.exe`) ===");
+    crate::integrity::verify_game_files_integrity(game_root)?;
+
+    scct_log!("\n=== Step 1: Multi-NIC LAN Coop Networking Fix (`splintercell3.exe`) ===");
     if skip_net_fix {
         if exe_bak_path.exists() {
             std::fs::copy(&exe_bak_path, &exe_path)?;

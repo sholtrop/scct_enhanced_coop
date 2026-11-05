@@ -75,7 +75,7 @@ impl eframe::App for PatcherApp {
             // Title
             ui.heading(RichText::new("Splinter Cell: Chaos Theory — Coop Mod").strong().size(22.0));
             ui.label(
-                RichText::new("Convert all 11 Single Player missions to Coop + fix multi-NIC LAN/ZeroTier")
+                RichText::new("Convert all 11 Single Player missions to Coop + fix multi-NIC LAN")
                     .size(13.0)
                     .color(Color32::from_rgb(180, 180, 180)),
             );

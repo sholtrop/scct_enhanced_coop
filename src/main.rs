@@ -1,6 +1,8 @@
 #![allow(dead_code)]
+#![windows_subsystem = "windows"]
 
 mod gui;
+mod integrity;
 mod levels;
 mod net;
 mod patcher;
@@ -39,6 +41,17 @@ fn main() -> Result<()> {
 
     // If restore or --cli is specified, run directly in CLI mode
     if args.restore || args.cli {
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn AttachConsole(dwProcessId: u32) -> i32;
+            }
+            const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+            unsafe {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
+
         let game_root = patcher::resolve_game_root(args.game_dir.as_deref())?;
         if args.restore {
             patcher::restore_vanilla(&game_root)?;
@@ -51,6 +64,16 @@ fn main() -> Result<()> {
     // Default: Launch GUI!
     // If GUI launch fails (e.g. headless environment without DISPLAY), fallback gracefully to CLI.
     if let Err(e) = gui::run_gui(args.game_dir.clone()) {
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn AttachConsole(dwProcessId: u32) -> i32;
+            }
+            const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+            unsafe {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        }
         eprintln!("Could not initialize GUI ({}). Running in CLI mode...", e);
         let game_root = patcher::resolve_game_root(args.game_dir.as_deref())?;
         patcher::apply_all(&game_root, args.no_net_fix)?;
