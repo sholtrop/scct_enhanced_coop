@@ -258,10 +258,9 @@ impl PatcherApp {
                         ">>> Chaos Theory Coop launched successfully (PID: {})!",
                         pid
                     ));
-                    self.log_lines.push(format!(
-                        ">>> Connected directly to peer (IP: {})!",
-                        peer_ip
-                    ));
+                    self.log_lines.push(
+                        ">>> Connected directly to your friend!".to_string(),
+                    );
                     if is_host {
                         self.log_lines.push(
                             ">>> [HOST]: In game, select Coop -> LAN -> Host Game to create your match."
@@ -1199,16 +1198,14 @@ fn run_host_match(
                 // If peer shares identical public IP (both behind same router), connect via LAN IP
                 let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
                 let peer_ip = if is_same_public_ip && let Some(local_ip) = peer_local_ip {
-                    let _ = tx.send(GuiEvent::Log(format!(
-                        "  [HOST] Detected friend on the same local network (LAN)! Connecting directly to {}.",
-                        local_ip
-                    )));
+                    let _ = tx.send(GuiEvent::Log(
+                        "  [HOST] Detected friend on the same local network (LAN)!".to_string(),
+                    ));
                     local_ip
                 } else {
-                    let _ = tx.send(GuiEvent::Log(format!(
-                        "  [HOST] Connecting across Internet to friend at {}.",
-                        peer_disco.ip()
-                    )));
+                    let _ = tx.send(GuiEvent::Log(
+                        "  [HOST] Connecting to friend across the Internet...".to_string(),
+                    ));
                     match peer_disco.ip() {
                         std::net::IpAddr::V4(v4) => v4,
                         _ => Ipv4Addr::new(127, 0, 0, 1),
@@ -1366,16 +1363,14 @@ fn run_join_match(
 
     let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
     let peer_ip = if is_same_public_ip && let Some(local_ip) = peer_local_ip {
-        let _ = tx.send(GuiEvent::Log(format!(
-            "  [JOIN] Detected friend on the same local network (LAN)! Connecting directly to {}.",
-            local_ip
-        )));
+        let _ = tx.send(GuiEvent::Log(
+            "  [JOIN] Detected friend on the same local network (LAN)!".to_string(),
+        ));
         local_ip
     } else {
-        let _ = tx.send(GuiEvent::Log(format!(
-            "  [JOIN] Connecting across Internet to friend at {}.",
-            peer_disco.ip()
-        )));
+        let _ = tx.send(GuiEvent::Log(
+            "  [JOIN] Connecting to friend across the Internet...".to_string(),
+        ));
         match peer_disco.ip() {
             std::net::IpAddr::V4(v4) => v4,
             _ => Ipv4Addr::new(127, 0, 0, 1),

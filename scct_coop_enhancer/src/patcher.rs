@@ -41,7 +41,7 @@ macro_rules! scct_log {
 }
 
 use crate::levels::{SP_COOP_LEVELS, VANILLA_COOP_STEMS};
-use crate::net::{apply_online_coop_fix, load_direct_ip_ini, save_direct_ip_ini};
+use crate::net::{apply_online_coop_fix, save_direct_ip_ini};
 use crate::umd::{
     append_missions_to_map_rotation, build_appended_coop_ini, normalize_umd_payload_baseline,
     parse_umd_archive, patch_umd_for_all_sp_levels,
@@ -423,9 +423,7 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         }
         scct_log!("  [SKIP] Skipped EXE networking fix (--no-net-fix)");
     } else {
-        let ini_path = system_dir.join("direct_ip.ini");
-        let target_ip = load_direct_ip_ini(&ini_path);
-        apply_online_coop_fix(&exe_path, &exe_bak_path, target_ip)?;
+        apply_online_coop_fix(&exe_path, &exe_bak_path, None)?;
     }
 
     scct_log!("\n=== Step 2: Patching `System/dynamic-pc.umd` (Coop Dropdown + Localization) ===");

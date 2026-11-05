@@ -499,11 +499,7 @@ pub fn apply_online_coop_fix(
     if is_online_coop_fix_applied(&buf) {
         set_direct_ip_in_exe(&mut buf, target_ip)?;
         fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
-        if let Some(ip) = target_ip {
-            crate::scct_log!("  [NET] Direct Host IP updated in splintercell3.exe -> {}", ip);
-        } else {
-            crate::scct_log!("  [NET] Online Coop patch active in splintercell3.exe (LAN mode)");
-        }
+        crate::scct_log!("  [NET] Online Coop fix active in System/splintercell3.exe");
         return Ok(());
     }
 
@@ -538,14 +534,7 @@ pub fn apply_online_coop_fix(
     }
 
     fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
-    if let Some(ip) = target_ip {
-        crate::scct_log!(
-            "  [NET] Applied Online Coop fix to System/splintercell3.exe (Direct IP: {})",
-            ip
-        );
-    } else {
-        crate::scct_log!("  [NET] Applied Online Coop fix to System/splintercell3.exe");
-    }
+    crate::scct_log!("  [NET] Applied Online Coop fix to System/splintercell3.exe");
     Ok(())
 }
 
