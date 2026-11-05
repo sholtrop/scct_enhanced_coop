@@ -71,6 +71,11 @@ pub async fn run_api_server(bind_addr: &str, registry: FriendCodeRegistry) -> Re
 }
 
 async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegistry>) -> Result<(), Box<dyn std::error::Error>> {
+    let peer_addr = stream.peer_addr().ok();
+    let peer_str = peer_addr
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).await?;
     if n == 0 {
@@ -82,6 +87,12 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
     let req_line = lines.next().unwrap_or("");
     let parts: Vec<&str> = req_line.split_whitespace().collect();
     if parts.len() < 2 {
+        println!(
+            "  [API] [{}] 400 Bad Request from {}: invalid request line {:?}",
+            crate::now_str(),
+            peer_str,
+            req_line
+        );
         send_response(&mut stream, 400, "Bad Request", "text/plain", b"Bad Request").await?;
         return Ok(());
     }
@@ -93,12 +104,28 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
 
     match (method, path) {
         ("GET", "/health") => {
+            println!(
+                "  [API] [{}] GET /health from {} -> 200 OK",
+                crate::now_str(),
+                peer_str
+            );
             send_response(&mut stream, 200, "OK", "application/json", b"{\"status\":\"ok\"}").await?;
         }
         ("POST", "/api/register") => {
+            println!(
+                "  [API] [{}] POST /api/register from {} | Body: {}",
+                crate::now_str(),
+                peer_str,
+                body.trim()
+            );
             let req: RegisterRequest = match serde_json::from_str(body) {
                 Ok(r) => r,
                 Err(e) => {
+                    println!(
+                        "  [API] [{}] 400 Bad Request in /api/register from {}: {e}",
+                        crate::now_str(),
+                        peer_str
+                    );
                     let err = format!("{{\"error\":\"{e}\"}}");
                     send_response(&mut stream, 400, "Bad Request", "application/json", err.as_bytes()).await?;
                     return Ok(());
@@ -112,7 +139,16 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                 local_ip: req.local_ip,
             };
 
-            let final_code = registry.register(code, endpoints).await;
+            let final_code = registry.register(code, endpoints.clone()).await;
+            println!(
+                "  [API] [{}] Registered Host: Code='{}', Peer WAN: disco={}, game={}, Local LAN: {:?} (from {})",
+                crate::now_str(),
+                final_code,
+                endpoints.disco_addr,
+                endpoints.game_addr,
+                endpoints.local_ip,
+                peer_str
+            );
             let resp = RegisterResponse {
                 status: "registered".to_string(),
                 friend_code: final_code,
@@ -121,9 +157,20 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
             send_response(&mut stream, 200, "OK", "application/json", &json).await?;
         }
         ("POST", "/api/join") => {
+            println!(
+                "  [API] [{}] POST /api/join from {} | Body: {}",
+                crate::now_str(),
+                peer_str,
+                body.trim()
+            );
             let req: JoinRequest = match serde_json::from_str(body) {
                 Ok(r) => r,
                 Err(e) => {
+                    println!(
+                        "  [API] [{}] 400 Bad Request in /api/join from {}: {e}",
+                        crate::now_str(),
+                        peer_str
+                    );
                     let err = format!("{{\"error\":\"{e}\"}}");
                     send_response(&mut stream, 400, "Bad Request", "application/json", err.as_bytes()).await?;
                     return Ok(());
@@ -136,7 +183,21 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                 local_ip: req.local_ip,
             };
 
-            if let Some(host_endpoints) = registry.join(&req.friend_code, guest_endpoints).await {
+            if let Some(host_endpoints) = registry.join(&req.friend_code, guest_endpoints.clone()).await {
+                println!(
+                    "  [API] [{}] >>> MATCH PAIRED! Code='{}' <<<\n\
+                     \x20       HOST:  WAN disco={}, game={}, Local LAN={:?}\n\
+                     \x20       GUEST: WAN disco={}, game={}, Local LAN={:?} (Guest from {})",
+                    crate::now_str(),
+                    req.friend_code,
+                    host_endpoints.disco_addr,
+                    host_endpoints.game_addr,
+                    host_endpoints.local_ip,
+                    guest_endpoints.disco_addr,
+                    guest_endpoints.game_addr,
+                    guest_endpoints.local_ip,
+                    peer_str
+                );
                 let resp = JoinResponse {
                     status: "paired".to_string(),
                     peer_disco_addr: Some(host_endpoints.disco_addr),
@@ -146,6 +207,12 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
             } else {
+                println!(
+                    "  [API] [{}] /api/join FAILED for code='{}': not found or expired (from {})",
+                    crate::now_str(),
+                    req.friend_code,
+                    peer_str
+                );
                 let resp = JoinResponse {
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
@@ -159,6 +226,15 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
         ("GET", p) if p.starts_with("/api/poll/") => {
             let code = &p["/api/poll/".len()..];
             if let Some(guest_endpoints) = registry.poll(code).await {
+                println!(
+                    "  [API] [{}] Host polled code='{}' -> GUEST IS READY! Returning Guest WAN: disco={}, game={}, LAN: {:?} (to host {})",
+                    crate::now_str(),
+                    code,
+                    guest_endpoints.disco_addr,
+                    guest_endpoints.game_addr,
+                    guest_endpoints.local_ip,
+                    peer_str
+                );
                 let resp = PollResponse {
                     status: "paired".to_string(),
                     peer_disco_addr: Some(guest_endpoints.disco_addr),
@@ -168,6 +244,12 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
             } else if registry.lookup(code).await.is_some() {
+                println!(
+                    "  [API] [{}] Host polled code='{}' -> still waiting for guest (host {})",
+                    crate::now_str(),
+                    code,
+                    peer_str
+                );
                 let resp = PollResponse {
                     status: "waiting".to_string(),
                     peer_disco_addr: None,
@@ -177,6 +259,12 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
             } else {
+                println!(
+                    "  [API] [{}] Host polled code='{}' -> code not found / expired (from {})",
+                    crate::now_str(),
+                    code,
+                    peer_str
+                );
                 let resp = PollResponse {
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
@@ -188,6 +276,13 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
             }
         }
         _ => {
+            println!(
+                "  [API] [{}] 404 Not Found: {} {} from {}",
+                crate::now_str(),
+                method,
+                path,
+                peer_str
+            );
             send_response(&mut stream, 404, "Not Found", "text/plain", b"404 Not Found").await?;
         }
     }

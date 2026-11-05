@@ -124,7 +124,27 @@ impl FriendCodeRegistry {
     pub async fn cleanup_expired(&self, ttl: Duration) {
         let now = Instant::now();
         let mut lock = self.sessions.write().await;
-        lock.retain(|_, s| now.duration_since(s.last_seen) < ttl);
+        let before = lock.len();
+        lock.retain(|code, s| {
+            let keep = now.duration_since(s.last_seen) < ttl;
+            if !keep {
+                println!(
+                    "  [CLEANUP] [{}] Friend code '{}' expired and removed",
+                    crate::now_str(),
+                    code
+                );
+            }
+            keep
+        });
+        let removed = before - lock.len();
+        if removed > 0 {
+            println!(
+                "  [CLEANUP] [{}] Pruned {} expired session(s). Active sessions: {}",
+                crate::now_str(),
+                removed,
+                lock.len()
+            );
+        }
     }
 }
 

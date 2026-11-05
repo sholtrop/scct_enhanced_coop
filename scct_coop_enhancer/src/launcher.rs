@@ -13,6 +13,7 @@ pub const CAVE_INHERITED_PRIMED_9103: usize = 0x113303DC;
 
 pub const CAVE_ONLINE_ENABLED_VA: usize = 0x110B6760;
 pub const CAVE_ONLINE_IP_VA: usize = 0x110B678B;
+pub const CAVE_LAN_PEER_VA: usize = 0x113303A0;
 
 #[cfg(windows)]
 pub fn launch_game(
@@ -103,7 +104,7 @@ pub fn launch_game(
             &mut written,
         );
 
-        // 2. Configure ONLINE_CAVE for direct IP replication if peer_ip is set
+        // 2. Configure ONLINE_CAVE for direct IP replication and set CAVE_LAN_PEER_VA if peer_ip is set
         if let Some(ip) = peer_ip {
             let enabled: u8 = 1;
             let ip_bytes = ip.octets();
@@ -121,6 +122,13 @@ pub fn launch_game(
                 4,
                 &mut written,
             );
+            WriteProcessMemory(
+                h_process,
+                CAVE_LAN_PEER_VA as *mut _,
+                ip_bytes.as_ptr() as *const _,
+                4,
+                &mut written,
+            );
         } else {
             let disabled: u8 = 0;
             let zero_ip = [0u8; 4];
@@ -134,6 +142,13 @@ pub fn launch_game(
             WriteProcessMemory(
                 h_process,
                 CAVE_ONLINE_IP_VA as *mut _,
+                zero_ip.as_ptr() as *const _,
+                4,
+                &mut written,
+            );
+            WriteProcessMemory(
+                h_process,
+                CAVE_LAN_PEER_VA as *mut _,
                 zero_ip.as_ptr() as *const _,
                 4,
                 &mut written,

@@ -111,7 +111,7 @@ pub const ONLINE_CAVE_HEX: &str = "\
 ff742418ff742418ff742418ff742418ff742418ff742418ff15a8760b1150\
 b00084c0744b8b54241885d2744366833a02753d66817a02238c7535837a04ff\
 7406837a04007529ff7204b800000000894204ff74242052ff742420ff742420\
-ff742420ff742420ff15a8760b118f420458c21800";
+ff742420ff742420ff15a8760b118b54241c8f420458c21800";
 pub const ONLINE_CAVE_ENABLED_OFFSET: usize = 0x20;
 pub const ONLINE_CAVE_IP_OFFSET: usize = 0x4B;
 pub const CAVE_ONLINE_ENABLED_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_ENABLED_OFFSET as u32;
@@ -513,11 +513,12 @@ pub fn apply_online_coop_fix(
     let sites = get_online_sites();
     for site in &sites {
         let so = va_to_text_off(site.va)?;
-        if &buf[so..so + site.orig.len()] != site.orig.as_slice() {
+        let cur = &buf[so..so + site.orig.len()];
+        if cur != site.orig.as_slice() && cur != site.new.as_slice() {
             bail!(
                 "Unexpected bytes at 0x{:08X} for online fix: {:02x?} (expected {:02x?})",
                 site.va,
-                &buf[so..so + site.orig.len()],
+                cur,
                 site.orig
             );
         }
@@ -594,7 +595,7 @@ mod tests {
     #[test]
     fn test_online_cave_hex_integrity() {
         let bytes = decode_hex(ONLINE_CAVE_HEX);
-        assert_eq!(bytes.len(), 116);
+        assert_eq!(bytes.len(), 120);
         assert_eq!(bytes[ONLINE_CAVE_ENABLED_OFFSET], 0x00);
         assert_eq!(&bytes[ONLINE_CAVE_IP_OFFSET..ONLINE_CAVE_IP_OFFSET + 4], &[0, 0, 0, 0]);
     }
