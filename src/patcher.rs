@@ -1,9 +1,6 @@
 use anyhow::{Context, Result, bail};
-use md5::{Digest, Md5};
 use regex::Regex;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -337,106 +334,7 @@ pub fn ensure_clean_sp_maps_and_cleanup(
     Ok(())
 }
 
-pub fn compute_md5(path: &Path) -> Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Md5::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(format!("{:032x}", hasher.finalize()))
-}
-
-pub const CLEAN_FILE_MD5: &[(&str, &str)] = &[
-    ("System/splintercell3.exe", "46cd0fed7c83269e516767de9f809e76"),
-    ("System/dynamic-pc.umd", "22e79861cc0750f4353d5e8821b2cb1e"),
-    ("Data/Maps/01_Lighthouse.scl", "0ad2d1ac79dbc2e9a5b042b2e23c45e5"),
-    ("Data/Maps/02_CargoShip.scl", "9eb92254487752e6428cec4d91c0a012"),
-    ("Data/Maps/03_Bank.scl", "e0f3e9f5e7060ff6428c7e83c75db999"),
-    ("Data/Maps/04_Penthouse.scl", "d251b6a1941bf29600fa2abee752f8c1"),
-    ("Data/Maps/05_Displace01.scl", "17bb9cef08fad2ac4e21acb2ae90a544"),
-    ("Data/Maps/06_Hokkaido.scl", "5865518ed3f53d57c86cbefe4cbc668c"),
-    ("Data/Maps/07_Battery.scl", "1c71002e9577320faa4b29a8ea3cc0a0"),
-    ("Data/Maps/08_SeoulOne.scl", "99b1771374249d0c8ff578af46743b5a"),
-    ("Data/Maps/09_SeoulTwo.scl", "660a2affa72a68b2142c1a977f8f05d5"),
-    ("Data/Maps/10_Bathhouse.scl", "ee6a6fc91d6ced6f3bdc31750db95d07"),
-    ("Data/Maps/11_KokuboSosho.scl", "13f7914729ca64279d036c45a046d950"),
-];
-
-pub fn verify_clean_files(game_root: &Path) -> Result<()> {
-    for &(rel_path, expected_md5) in CLEAN_FILE_MD5 {
-        let parts: Vec<&str> = rel_path.split('/').collect();
-        let mut curr = game_root.to_path_buf();
-        for part in parts {
-            curr = find_child_ci(&curr, part);
-        }
-
-        // Check file or its .bak
-        let file_to_check = if curr.is_file() {
-            let bak = curr.with_extension(format!(
-                "{}.bak",
-                curr.extension().and_then(|s| s.to_str()).unwrap_or("")
-            ));
-            if bak.is_file() {
-                bak
-            } else {
-                curr
-            }
-        } else {
-            let bak = curr.with_extension(format!(
-                "{}.bak",
-                curr.extension().and_then(|s| s.to_str()).unwrap_or("")
-            ));
-            if bak.is_file() {
-                bak
-            } else {
-                curr
-            }
-        };
-
-        if !file_to_check.is_file() {
-            bail!(
-                "Missing required game file: {}.\nPlease ensure you are using an official / Steam installation of Splinter Cell Chaos Theory.",
-                file_to_check.display()
-            );
-        }
-
-        let actual_md5 = compute_md5(&file_to_check)?;
-        if actual_md5 != expected_md5 {
-            let bak = file_to_check.with_extension(format!(
-                "{}.bak",
-                file_to_check
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-            ));
-            let bak_ok = if bak.is_file() {
-                compute_md5(&bak).map(|h| h == expected_md5).unwrap_or(false)
-            } else {
-                false
-            };
-
-            if !bak_ok {
-                bail!(
-                    "MD5 checksum verification failed for {}:\nExpected official / Steam clean version: {}\nFound: {}\nPlease ensure you have an official or Steam installation of Splinter Cell Chaos Theory.",
-                    rel_path,
-                    expected_md5,
-                    actual_md5
-                );
-            }
-        }
-    }
-    scct_log!("  [MD5] Verified all required game files match official Steam version");
-    Ok(())
-}
-
 pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
-    verify_clean_files(game_root)?;
-
     let system_dir = find_child_ci(game_root, "System");
     let data_dir = find_child_ci(game_root, "Data");
     let maps_dir = find_child_ci(&data_dir, "Maps");
@@ -636,15 +534,6 @@ pub fn apply_online_patch(game_root: &Path, target_ip: Option<Ipv4Addr>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_verify_clean_files_on_clean_dir() {
-        let clean_path = Path::new("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
-        if clean_path.exists() {
-            let res = verify_clean_files(clean_path);
-            assert!(res.is_ok(), "Clean files verification failed: {:?}", res.err());
-        }
-    }
 
     #[test]
     fn test_validate_game_root() {
