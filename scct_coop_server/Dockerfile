@@ -1,5 +1,5 @@
 # Multi-stage build for a minimal Linux container
-FROM rust:1.85-alpine AS builder
+FROM rust:1.99.1-alpine AS builder
 
 RUN apk add --no-cache musl-dev
 

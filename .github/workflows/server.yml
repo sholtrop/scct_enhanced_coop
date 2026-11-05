@@ -1,0 +1,64 @@
+name: Build & Publish Server Docker Image
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'scct_coop_server/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/server.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-server:
+    name: Build & Publish Server Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract server version from Cargo.toml
+        id: get_server_version
+        run: |
+          if [ -f "scct_coop_server/Cargo.toml" ]; then
+            SERVER_CARGO="scct_coop_server/Cargo.toml"
+            ROOT_DIR="."
+          else
+            SERVER_CARGO="public/scct_coop_server/Cargo.toml"
+            ROOT_DIR="public"
+          fi
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$SERVER_CARGO" | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "Failed to extract server version from $SERVER_CARGO"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_OUTPUT
+          echo "Server version: $VERSION"
+
+      - name: Build and push Docker image
+        shell: bash
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/scct_coop_server"
+          VERSION="${{ steps.get_server_version.outputs.VERSION }}"
+          ROOT_DIR="${{ steps.get_server_version.outputs.ROOT_DIR }}"
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          docker build \
+            -f "${ROOT_DIR}/scct_coop_server/Dockerfile" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            "${ROOT_DIR}"
+
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+
