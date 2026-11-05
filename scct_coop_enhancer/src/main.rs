@@ -64,21 +64,39 @@ fn main() -> Result<()> {
     }
 
     // Default: Launch GUI!
-    // If GUI launch fails (e.g. headless environment without DISPLAY), fallback gracefully to CLI.
     if let Err(e) = gui::run_gui(args.game_dir.clone()) {
         #[cfg(windows)]
         {
             unsafe extern "system" {
                 fn AttachConsole(dwProcessId: u32) -> i32;
+                fn MessageBoxA(
+                    hWnd: *mut std::ffi::c_void,
+                    lpText: *const u8,
+                    lpCaption: *const u8,
+                    uType: u32,
+                ) -> i32;
             }
             const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
             unsafe {
                 AttachConsole(ATTACH_PARENT_PROCESS);
             }
+            let err_msg = format!(
+                "Failed to initialize GUI:\n\n{}\n\nTo run in command-line mode instead, launch with the --cli flag.\0",
+                e
+            );
+            let caption = b"SCCT Coop Enhancer Error\0";
+            unsafe {
+                MessageBoxA(
+                    std::ptr::null_mut(),
+                    err_msg.as_ptr(),
+                    caption.as_ptr(),
+                    0x0000_0010, // MB_ICONERROR
+                );
+            }
         }
-        eprintln!("Could not initialize GUI ({}). Running in CLI mode...", e);
-        let game_root = patcher::resolve_game_root(args.game_dir.as_deref())?;
-        patcher::apply_all(&game_root, args.no_net_fix)?;
+        eprintln!("Failed to initialize GUI: {e}");
+        eprintln!("To run in command-line mode instead, launch with the --cli flag.");
+        std::process::exit(1);
     }
 
     Ok(())

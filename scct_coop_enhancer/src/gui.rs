@@ -40,7 +40,6 @@ pub enum MatchState {
 pub enum GuiEvent {
     Log(String),
     InstallDone(bool),
-    PublicIp(Result<Ipv4Addr, String>),
     FriendCodeRegistered(String),
     MatchStatus(String),
     Matched {
@@ -63,12 +62,7 @@ pub struct PatcherApp {
     receiver: Receiver<GuiEvent>,
     sender: Sender<GuiEvent>,
 
-    // Public IP state
-    public_ip: Option<Ipv4Addr>,
-    fetching_ip: bool,
-    ip_fetch_err: Option<String>,
-
-    // Friend Code & STUN Matchmaking
+    // Friend Code Matchmaking
     match_state: MatchState,
     guest_code_input: String,
     cancel_tx: Option<Sender<()>>,
@@ -92,9 +86,6 @@ impl PatcherApp {
             log_lines: Vec::new(),
             receiver,
             sender,
-            public_ip: None,
-            fetching_ip: true,
-            ip_fetch_err: None,
             match_state: MatchState::Idle,
             guest_code_input: String::new(),
             cancel_tx: None,
@@ -102,19 +93,6 @@ impl PatcherApp {
             stun_port: crate::stun::DEFAULT_STUN_PORT,
             api_port: crate::stun::DEFAULT_API_PORT,
         };
-
-        // Automatically fetch public IP in background on startup
-        let tx_ip = app.sender.clone();
-        thread::spawn(move || {
-            match crate::ip::fetch_public_ip() {
-                Ok(ip) => {
-                    let _ = tx_ip.send(GuiEvent::PublicIp(Ok(ip)));
-                }
-                Err(e) => {
-                    let _ = tx_ip.send(GuiEvent::PublicIp(Err(e.to_string())));
-                }
-            }
-        });
 
         let detected = crate::patcher::auto_detect_game_roots();
         app.detected_roots = detected.clone();
@@ -187,7 +165,7 @@ impl PatcherApp {
         self.cancel_tx = Some(cancel_tx);
         self.match_state = MatchState::Hosting {
             code: "Connecting...".to_string(),
-            status_text: "Discovering NAT endpoints via STUN server...".to_string(),
+            status_text: "Connecting to server...".to_string(),
         };
 
         let server_host = self.server_host.clone();
@@ -276,19 +254,18 @@ impl PatcherApp {
                         pid
                     ));
                     self.log_lines.push(
-                        ">>> Ingested primed UDP sockets (9100 & 9103) with STUN NAT traversal."
-                            .to_string(),
+                        ">>> Connected directly to your friend!".to_string(),
                     );
                     if is_host {
                         self.log_lines.push(
-                            ">>> [HOST]: In game main menu, select Coop -> Host Game to create the room."
+                            ">>> [HOST]: In the game menu, select Coop -> Host Game to create your match."
                                 .to_string(),
                         );
                     } else {
-                        self.log_lines.push(format!(
-                            ">>> [GUEST]: In game main menu, select Coop -> click 'Online' to join Host ({}).",
-                            peer_ip
-                        ));
+                        self.log_lines.push(
+                            ">>> [GUEST]: In the game menu, select Coop -> Join Game to connect to your friend."
+                                .to_string(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -313,13 +290,6 @@ impl eframe::App for PatcherApp {
                     } else {
                         InstallState::Failed
                     };
-                }
-                GuiEvent::PublicIp(res) => {
-                    self.fetching_ip = false;
-                    match res {
-                        Ok(ip) => self.public_ip = Some(ip),
-                        Err(err) => self.ip_fetch_err = Some(err),
-                    }
                 }
                 GuiEvent::FriendCodeRegistered(code) => {
                     self.match_state = MatchState::Hosting {
@@ -366,9 +336,7 @@ impl eframe::App for PatcherApp {
                     .size(20.0),
             );
             ui.label(
-                RichText::new(
-                    "Convert all 11 Single Player missions to Coop + STUN Zero-Config P2P Online",
-                )
+                RichText::new("Play all Single Player missions in online co-op with friends")
                 .size(12.5)
                 .color(Color32::from_rgb(180, 180, 180)),
             );
@@ -509,7 +477,7 @@ impl eframe::App for PatcherApp {
                     let res = crate::patcher::apply_all(&root, false);
                     match res {
                         Ok(_) => {
-                            let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code Matchmaking below to play online with zero port forwarding.".to_string()));
+                            let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.".to_string()));
                             let _ = tx_status.send(GuiEvent::InstallDone(true));
                         }
                         Err(e) => {
@@ -525,29 +493,18 @@ impl eframe::App for PatcherApp {
             ui.add_space(6.0);
 
             // =================================================================
-            // Online Coop (Friend Code & STUN P2P Matchmaking) Section
+            // Online Co-op (Friend Code) Section
             // =================================================================
             let online_frame = egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(20, 24, 30))
                 .inner_margin(10.0);
 
             online_frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(
-                        RichText::new("🌐 Online Coop (Friend Code & P2P Matchmaking)")
-                            .size(14.0)
-                            .strong(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(ip) = self.public_ip {
-                            ui.label(
-                                RichText::new(format!("Public IP: {}", ip))
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(140, 180, 220)),
-                            );
-                        }
-                    });
-                });
+                ui.heading(
+                    RichText::new("🌐 Online Co-op with Friends")
+                        .size(14.0)
+                        .strong(),
+                );
 
                 ui.add_space(4.0);
 
@@ -562,10 +519,10 @@ impl eframe::App for PatcherApp {
                                 .fill(Color32::from_rgb(26, 32, 40))
                                 .inner_margin(8.0);
                             left_frame.show(&mut cols[0], |ui| {
-                                ui.label(RichText::new("Host a Session").strong().size(13.0));
+                                ui.label(RichText::new("Host a Game").strong().size(13.0));
                                 ui.label(
                                     RichText::new(
-                                        "Generates a 5-character Friend Code and waits for your friend to connect.",
+                                        "Generates a 5-letter code to give to your friend to connect.",
                                     )
                                     .size(11.0)
                                     .color(Color32::from_rgb(180, 180, 180)),
@@ -573,7 +530,7 @@ impl eframe::App for PatcherApp {
                                 ui.add_space(6.0);
                                 if ui
                                     .button(
-                                        RichText::new("🎮 Host New Session")
+                                        RichText::new("🎮 Host Game")
                                             .size(12.5)
                                             .strong()
                                             .color(Color32::WHITE),
@@ -592,7 +549,7 @@ impl eframe::App for PatcherApp {
                                 ui.label(RichText::new("Join a Friend").strong().size(13.0));
                                 ui.label(
                                     RichText::new(
-                                        "Enter your friend's 5-character code to puncture NAT & connect.",
+                                        "Enter your friend's 5-letter code to connect directly.",
                                     )
                                     .size(11.0)
                                     .color(Color32::from_rgb(180, 180, 180)),
@@ -614,7 +571,7 @@ impl eframe::App for PatcherApp {
                                         .add_enabled(
                                             can_join,
                                             egui::Button::new(
-                                                RichText::new("🔗 Join Session")
+                                                RichText::new("🔗 Join Game")
                                                     .size(12.0)
                                                     .strong(),
                                             ),
@@ -712,7 +669,7 @@ impl eframe::App for PatcherApp {
                     MatchState::Matched {
                         code,
                         is_host,
-                        peer_ip,
+                        peer_ip: _,
                         game_launched,
                         ..
                     } => {
@@ -721,16 +678,15 @@ impl eframe::App for PatcherApp {
                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(80, 200, 120)))
                             .inner_margin(10.0);
                         let info_text = format!(
-                            "(Code: {}, Peer IP: {}, Role: {})",
+                            "(Code: {}, Role: {})",
                             code,
-                            peer_ip,
                             if *is_host { "Host" } else { "Guest" }
                         );
                         let is_launched = *game_launched;
                         matched_box.show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.label(
-                                    RichText::new("✔ Peer Connected & Primed!")
+                                    RichText::new("✔ Connected to Friend!")
                                         .strong()
                                         .size(14.0)
                                         .color(Color32::from_rgb(100, 240, 140)),
@@ -742,7 +698,7 @@ impl eframe::App for PatcherApp {
                                 );
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button(RichText::new("❌ End Match").size(11.5)).clicked() {
+                                    if ui.button(RichText::new("❌ Disconnect").size(11.5)).clicked() {
                                         action_cancel = true;
                                     }
                                 });
@@ -752,7 +708,7 @@ impl eframe::App for PatcherApp {
 
                             if !is_launched {
                                 let launch_btn = egui::Button::new(
-                                    RichText::new("🚀 Launch Splinter Cell: Chaos Theory Coop")
+                                    RichText::new("🚀 Launch Game (Co-op)")
                                         .size(14.0)
                                         .strong()
                                         .color(Color32::WHITE),
@@ -765,7 +721,7 @@ impl eframe::App for PatcherApp {
                                 }
                             } else {
                                 ui.label(
-                                    RichText::new("✔ Game is currently running with inherited primed sockets!")
+                                    RichText::new("✔ Game is running! Enter the in-game co-op lobby.")
                                         .size(12.5)
                                         .strong()
                                         .color(Color32::from_rgb(120, 230, 140)),
@@ -810,17 +766,17 @@ impl eframe::App for PatcherApp {
                 ui.collapsing("⚙ Advanced Server Settings", |ui| {
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Rendezvous Server:").size(11.5));
+                        ui.label(RichText::new("Server Address:").size(11.5));
                         ui.add(
                             egui::TextEdit::singleline(&mut self.server_host)
                                 .desired_width(180.0)
                                 .hint_text("scct_coop.sholtrop.dev"),
                         );
 
-                        ui.label(RichText::new("STUN Port:").size(11.5));
+                        ui.label(RichText::new("Connection Port (UDP):").size(11.5));
                         ui.add(egui::DragValue::new(&mut self.stun_port).range(1..=65535));
 
-                        ui.label(RichText::new("API Port:").size(11.5));
+                        ui.label(RichText::new("Web Port (TCP):").size(11.5));
                         ui.add(egui::DragValue::new(&mut self.api_port).range(1..=65535));
 
                         if ui.button(RichText::new("Reset Defaults").size(11.0)).clicked() {
@@ -899,7 +855,7 @@ fn run_host_match(
     cancel_rx: Receiver<()>,
     ctx: egui::Context,
 ) {
-    let _ = tx.send(GuiEvent::Log("  [HOST] Initializing UDP sockets (9100 / 9103)...".to_string()));
+    let _ = tx.send(GuiEvent::Log("  [HOST] Initializing network session...".to_string()));
     ctx.request_repaint();
 
     // 1. Bind UDP sockets
@@ -934,7 +890,7 @@ fn run_host_match(
     };
 
     let _ = tx.send(GuiEvent::Log(format!(
-        "  [HOST] Querying STUN server ({}:{})...",
+        "  [HOST] Connecting to online service ({}:{})...",
         server_host, stun_port
     )));
     ctx.request_repaint();
@@ -943,7 +899,7 @@ fn run_host_match(
     let disco_ext = match crate::stun::stun_query(&sock_disco, &server_host, stun_port) {
         Ok(addr) => addr,
         Err(e) => {
-            let _ = tx.send(GuiEvent::MatchFailed(format!("STUN discovery failed: {:#}", e)));
+            let _ = tx.send(GuiEvent::MatchFailed(format!("Connection failed: {:#}", e)));
             ctx.request_repaint();
             return;
         }
@@ -953,7 +909,7 @@ fn run_host_match(
         Ok(addr) => addr,
         Err(e) => {
             let _ = tx.send(GuiEvent::MatchFailed(format!(
-                "STUN discovery failed for gameplay socket: {:#}",
+                "Connection failed for game socket: {:#}",
                 e
             )));
             ctx.request_repaint();
@@ -961,10 +917,9 @@ fn run_host_match(
         }
     };
 
-    let _ = tx.send(GuiEvent::Log(format!(
-        "  [HOST] Mapped public endpoints: Discovery={}, Game={}",
-        disco_ext, game_ext
-    )));
+    let _ = tx.send(GuiEvent::Log(
+        "  [HOST] Connection established with online service.".to_string(),
+    ));
     ctx.request_repaint();
 
     // 3. Register with rendezvous server
@@ -988,7 +943,7 @@ fn run_host_match(
 
     let _ = tx.send(GuiEvent::FriendCodeRegistered(code.clone()));
     let _ = tx.send(GuiEvent::Log(format!(
-        "  [HOST] Friend Code registered: {}",
+        "  [HOST] Friend Code created: {}. Share this with your friend!",
         code
     )));
     ctx.request_repaint();
@@ -1011,16 +966,12 @@ fn run_host_match(
 
         match crate::stun::poll_server_for_peer(&server_host, api_port, &code) {
             Ok(Some((peer_disco, peer_game))) => {
-                let _ = tx.send(GuiEvent::MatchStatus(format!(
-                    "Friend connected! Punching NAT holes to {}...",
-                    peer_disco.ip()
-                )));
-                let _ = tx.send(GuiEvent::Log(format!(
-                    "  [HOST] Peer matched! Performing UDP hole punch to {} (disco={}, game={})",
-                    peer_disco.ip(),
-                    peer_disco.port(),
-                    peer_game.port()
-                )));
+                let _ = tx.send(GuiEvent::MatchStatus(
+                    "Friend connected! Establishing direct connection...".to_string(),
+                ));
+                let _ = tx.send(GuiEvent::Log(
+                    "  [HOST] Friend connected! Establishing direct connection...".to_string(),
+                ));
                 ctx.request_repaint();
 
                 // Simultaneous UDP hole punch
@@ -1039,7 +990,7 @@ fn run_host_match(
                     sock_game,
                 });
                 let _ = tx.send(GuiEvent::Log(
-                    "  [HOST] UDP hole punch complete. Ready to launch!".to_string(),
+                    "  [HOST] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
                 ));
                 ctx.request_repaint();
                 return;
@@ -1068,7 +1019,7 @@ fn run_join_match(
     ctx: egui::Context,
 ) {
     let _ = tx.send(GuiEvent::Log(format!(
-        "  [JOIN] Joining friend code '{}'...",
+        "  [JOIN] Connecting to friend with code '{}'...",
         target_code
     )));
     ctx.request_repaint();
@@ -1105,7 +1056,7 @@ fn run_join_match(
     };
 
     let _ = tx.send(GuiEvent::Log(format!(
-        "  [JOIN] Querying STUN server ({}:{})...",
+        "  [JOIN] Connecting to online service ({}:{})...",
         server_host, stun_port
     )));
     ctx.request_repaint();
@@ -1114,7 +1065,7 @@ fn run_join_match(
     let disco_ext = match crate::stun::stun_query(&sock_disco, &server_host, stun_port) {
         Ok(addr) => addr,
         Err(e) => {
-            let _ = tx.send(GuiEvent::MatchFailed(format!("STUN discovery failed: {:#}", e)));
+            let _ = tx.send(GuiEvent::MatchFailed(format!("Connection failed: {:#}", e)));
             ctx.request_repaint();
             return;
         }
@@ -1124,7 +1075,7 @@ fn run_join_match(
         Ok(addr) => addr,
         Err(e) => {
             let _ = tx.send(GuiEvent::MatchFailed(format!(
-                "STUN discovery failed for gameplay socket: {:#}",
+                "Connection failed for game socket: {:#}",
                 e
             )));
             ctx.request_repaint();
@@ -1132,12 +1083,11 @@ fn run_join_match(
         }
     };
 
-    let _ = tx.send(GuiEvent::Log(format!(
-        "  [JOIN] Mapped public endpoints: Discovery={}, Game={}",
-        disco_ext, game_ext
-    )));
     let _ = tx.send(GuiEvent::MatchStatus(
-        "Exchanging rendezvous endpoints with host...".to_string(),
+        "Exchanging connection details with host...".to_string(),
+    ));
+    let _ = tx.send(GuiEvent::Log(
+        "  [JOIN] Exchanging connection details with host...".to_string(),
     ));
     ctx.request_repaint();
 
@@ -1160,16 +1110,12 @@ fn run_join_match(
         }
     };
 
-    let _ = tx.send(GuiEvent::MatchStatus(format!(
-        "Host located at {}! Punching NAT holes...",
-        peer_disco.ip()
-    )));
-    let _ = tx.send(GuiEvent::Log(format!(
-        "  [JOIN] Host matched! Performing UDP hole punch to {} (disco={}, game={})",
-        peer_disco.ip(),
-        peer_disco.port(),
-        peer_game.port()
-    )));
+    let _ = tx.send(GuiEvent::MatchStatus(
+        "Host found! Establishing connection...".to_string(),
+    ));
+    let _ = tx.send(GuiEvent::Log(
+        "  [JOIN] Connected to friend! Establishing direct connection...".to_string(),
+    ));
     ctx.request_repaint();
 
     // 4. Simultaneous UDP hole punch
@@ -1188,7 +1134,7 @@ fn run_join_match(
         sock_game,
     });
     let _ = tx.send(GuiEvent::Log(
-        "  [JOIN] UDP hole punch complete. Ready to launch!".to_string(),
+        "  [JOIN] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
     ));
     ctx.request_repaint();
 }
