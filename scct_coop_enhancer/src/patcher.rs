@@ -49,6 +49,72 @@ use crate::umd::{
 use crate::upk::patch_sp_map_to_coop;
 use std::net::Ipv4Addr;
 
+pub const MOD_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const VERSION_FILENAME: &str = "scct_coop_version.txt";
+
+pub fn parse_version_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(stripped) = trimmed.strip_prefix("version=") {
+        stripped.trim().to_string()
+    } else if let Some(stripped) = trimmed.strip_prefix('v') {
+        stripped.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Check if the Co-op Mod version file exists in System/ or the game root.
+/// Returns `Some(version_string)` if installed, or `None` if vanilla.
+pub fn get_installed_version(game_root: &Path) -> Option<String> {
+    let system_dir = find_child_ci(game_root, "System");
+    let ver_file = find_child_ci(&system_dir, VERSION_FILENAME);
+    if ver_file.is_file()
+        && let Ok(content) = std::fs::read_to_string(&ver_file)
+    {
+        let ver = parse_version_str(&content);
+        if !ver.is_empty() {
+            return Some(ver);
+        }
+    }
+    let root_file = find_child_ci(game_root, VERSION_FILENAME);
+    if root_file.is_file()
+        && let Ok(content) = std::fs::read_to_string(&root_file)
+    {
+        let ver = parse_version_str(&content);
+        if !ver.is_empty() {
+            return Some(ver);
+        }
+    }
+    None
+}
+
+/// Writes `scct_coop_version.txt` containing the current mod version to System/.
+pub fn write_version_file(game_root: &Path) -> Result<()> {
+    let system_dir = find_child_ci(game_root, "System");
+    if system_dir.is_dir() {
+        let ver_file = system_dir.join(VERSION_FILENAME);
+        std::fs::write(&ver_file, format!("{}\n", MOD_VERSION))
+            .with_context(|| format!("Writing {}", ver_file.display()))?;
+        scct_log!("  [VER] Created {} (v{})", VERSION_FILENAME, MOD_VERSION);
+    }
+    Ok(())
+}
+
+/// Deletes `scct_coop_version.txt` from System/ and the game root during uninstallation.
+pub fn remove_version_file(game_root: &Path) -> Result<()> {
+    let system_dir = find_child_ci(game_root, "System");
+    let ver_file = find_child_ci(&system_dir, VERSION_FILENAME);
+    if ver_file.is_file() {
+        let _ = std::fs::remove_file(&ver_file);
+        scct_log!("  [VER] Removed {}", ver_file.display());
+    }
+    let root_file = find_child_ci(game_root, VERSION_FILENAME);
+    if root_file.is_file() {
+        let _ = std::fs::remove_file(&root_file);
+    }
+    Ok(())
+}
+
 /// Find a case-insensitive child in `parent`. If not found, returns `parent.join(child)`.
 pub fn find_child_ci(parent: &Path, child: &str) -> PathBuf {
     let direct = parent.join(child);
@@ -460,9 +526,12 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         scct_log!("  [INI ] Updated loose System/MapRotation.ini");
     }
 
+    write_version_file(game_root)?;
+
     scct_log!(
-        "\nSuccess! Patched {} SP missions into Coop + applied multi-NIC LAN fix.",
-        SP_COOP_LEVELS.len()
+        "\nSuccess! Patched {} SP missions into Coop + applied multi-NIC LAN fix (v{}).",
+        SP_COOP_LEVELS.len(),
+        MOD_VERSION
     );
     Ok(())
 }
@@ -516,6 +585,8 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
         scct_log!("  [INI] Restored loose System/MapRotation.ini");
     }
 
+    remove_version_file(game_root)?;
+
     scct_log!("\nVanilla SCCT restoration complete!");
     Ok(())
 }
@@ -542,5 +613,20 @@ mod tests {
             assert!(validate_game_root(clean_path).is_some());
             assert!(validate_game_root(&clean_path.join("System")).is_some());
         }
+    }
+
+    #[test]
+    fn test_version_file_crud() {
+        let dir = std::env::temp_dir().join("scct_test_ver_crud");
+        let sys = dir.join("System");
+        let _ = std::fs::create_dir_all(&sys);
+
+        assert_eq!(get_installed_version(&dir), None);
+        write_version_file(&dir).unwrap();
+        assert_eq!(get_installed_version(&dir), Some(MOD_VERSION.to_string()));
+        remove_version_file(&dir).unwrap();
+        assert_eq!(get_installed_version(&dir), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

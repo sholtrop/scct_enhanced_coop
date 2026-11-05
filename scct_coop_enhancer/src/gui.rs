@@ -8,7 +8,8 @@ use std::time::Duration;
 #[derive(Debug, PartialEq, Eq)]
 enum InstallState {
     Idle,
-    Running,
+    Installing,
+    Uninstalling,
     Success,
     Failed,
 }
@@ -40,6 +41,7 @@ pub enum MatchState {
 pub enum GuiEvent {
     Log(String),
     InstallDone(bool),
+    UninstallDone(bool),
     FriendCodeRegistered(String),
     MatchStatus(String),
     Matched {
@@ -57,6 +59,7 @@ pub struct PatcherApp {
     resolved_root: Option<PathBuf>,
     detected_roots: Vec<PathBuf>,
     detection_msg: String,
+    installed_version: Option<String>,
     state: InstallState,
     log_lines: Vec<String>,
     receiver: Receiver<GuiEvent>,
@@ -82,6 +85,7 @@ impl PatcherApp {
             resolved_root: None,
             detected_roots: Vec::new(),
             detection_msg: String::new(),
+            installed_version: None,
             state: InstallState::Idle,
             log_lines: Vec::new(),
             receiver,
@@ -127,7 +131,12 @@ impl PatcherApp {
 
     pub fn set_game_root(&mut self, root: PathBuf) {
         self.game_dir_input = root.display().to_string();
-        self.detection_msg = format!("Game detected: {}", root.display());
+        self.installed_version = crate::patcher::get_installed_version(&root);
+        if let Some(ref ver) = self.installed_version {
+            self.detection_msg = format!("Game detected: {} (Co-op Mod v{} installed)", root.display(), ver);
+        } else {
+            self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
+        }
         self.resolved_root = Some(root);
     }
 
@@ -135,6 +144,7 @@ impl PatcherApp {
         let trimmed = self.game_dir_input.trim();
         if trimmed.is_empty() {
             self.resolved_root = None;
+            self.installed_version = None;
             self.detection_msg = "Please select or enter the Chaos Theory game folder.".to_string();
             return;
         }
@@ -146,6 +156,7 @@ impl PatcherApp {
             }
         } else {
             self.resolved_root = None;
+            self.installed_version = None;
             self.detection_msg =
                 "System/splintercell3.exe not found in this folder. Please verify the path."
                     .to_string();
@@ -290,6 +301,27 @@ impl eframe::App for PatcherApp {
                     } else {
                         InstallState::Failed
                     };
+                    if ok && let Some(ref root) = self.resolved_root {
+                        self.installed_version = crate::patcher::get_installed_version(root);
+                        self.detection_msg = format!(
+                            "Game detected: {} (Co-op Mod v{} installed)",
+                            root.display(),
+                            self.installed_version.as_deref().unwrap_or(crate::patcher::MOD_VERSION)
+                        );
+                    }
+                }
+                GuiEvent::UninstallDone(ok) => {
+                    self.state = if ok {
+                        InstallState::Success
+                    } else {
+                        InstallState::Failed
+                    };
+                    if ok {
+                        self.installed_version = None;
+                        if let Some(ref root) = self.resolved_root {
+                            self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
+                        }
+                    }
                 }
                 GuiEvent::FriendCodeRegistered(code) => {
                     self.match_state = MatchState::Hosting {
@@ -437,57 +469,181 @@ impl eframe::App for PatcherApp {
             ui.add_space(6.0);
 
             // =================================================================
-            // Main Action Button ("Install Mod")
+            // Main Action Buttons ("Install Mod" / "Reinstall" + "Uninstall")
             // =================================================================
-            let can_click = self.state != InstallState::Running && self.resolved_root.is_some();
-            let button_text = match self.state {
-                InstallState::Idle => "Install Mod",
-                InstallState::Running => "Installing Mod... (Please wait)",
-                InstallState::Success => "✔ Mod Installed Successfully (Click to Reinstall)",
-                InstallState::Failed => "❌ Installation Failed (Click to Retry)",
-            };
+            let is_busy = self.state == InstallState::Installing || self.state == InstallState::Uninstalling;
+            let can_click = !is_busy && self.resolved_root.is_some();
 
-            let btn = egui::Button::new(
-                RichText::new(button_text).size(15.0).strong().color(
-                    if can_click {
-                        Color32::WHITE
-                    } else {
-                        Color32::from_rgb(160, 160, 160)
-                    },
-                ),
-            )
-            .min_size(Vec2::new(ui.available_width(), 36.0));
-
-            if ui.add_enabled(can_click, btn).clicked() {
-                self.state = InstallState::Running;
-                self.log_lines.clear();
-
-                let tx = self.sender.clone();
-                let tx_status = self.sender.clone();
-                let ctx_clone = ctx.clone();
-                let root = self.resolved_root.clone().unwrap();
-
-                crate::patcher::set_log_sink(move |msg| {
-                    let _ = tx.send(GuiEvent::Log(msg.to_string()));
-                    ctx_clone.request_repaint();
+            if let Some(ref ver) = self.installed_version {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Mod Status:").size(12.5).color(Color32::from_rgb(180, 180, 180)));
+                    ui.label(
+                        RichText::new(format!("✔ Co-op Mod v{} is installed", ver))
+                            .size(12.5)
+                            .strong()
+                            .color(Color32::from_rgb(100, 220, 120)),
+                    );
                 });
+                ui.add_space(4.0);
 
-                let ctx_finish = ctx.clone();
-                thread::spawn(move || {
-                    let res = crate::patcher::apply_all(&root, false);
-                    match res {
-                        Ok(_) => {
-                            let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.".to_string()));
-                            let _ = tx_status.send(GuiEvent::InstallDone(true));
-                        }
-                        Err(e) => {
-                            let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
-                            let _ = tx_status.send(GuiEvent::InstallDone(false));
-                        }
+                ui.columns(2, |cols| {
+                    // Reinstall Button
+                    let reinstall_text = match self.state {
+                        InstallState::Installing => "Installing Mod... (Please wait)",
+                        _ => "🔄 Reinstall",
+                    };
+                    let btn_reinstall = egui::Button::new(
+                        RichText::new(reinstall_text).size(14.0).strong().color(
+                            if can_click {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(160, 160, 160)
+                            },
+                        ),
+                    )
+                    .min_size(Vec2::new(cols[0].available_width(), 36.0));
+
+                    if cols[0].add_enabled(can_click, btn_reinstall).clicked() {
+                        self.state = InstallState::Installing;
+                        self.log_lines.clear();
+
+                        let tx = self.sender.clone();
+                        let tx_status = self.sender.clone();
+                        let ctx_clone = ctx.clone();
+                        let root = self.resolved_root.clone().unwrap();
+
+                        crate::patcher::set_log_sink(move |msg| {
+                            let _ = tx.send(GuiEvent::Log(msg.to_string()));
+                            ctx_clone.request_repaint();
+                        });
+
+                        let ctx_finish = ctx.clone();
+                        thread::spawn(move || {
+                            let res = crate::patcher::apply_all(&root, false);
+                            match res {
+                                Ok(_) => {
+                                    let _ = tx_status.send(GuiEvent::Log("\n>>> Reinstallation complete! All coop missions and network fixes re-applied.".to_string()));
+                                    let _ = tx_status.send(GuiEvent::InstallDone(true));
+                                }
+                                Err(e) => {
+                                    let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
+                                    let _ = tx_status.send(GuiEvent::InstallDone(false));
+                                }
+                            }
+                            crate::patcher::clear_log_sink();
+                            ctx_finish.request_repaint();
+                        });
                     }
-                    crate::patcher::clear_log_sink();
-                    ctx_finish.request_repaint();
+
+                    // Uninstall Button
+                    let uninstall_text = match self.state {
+                        InstallState::Uninstalling => "Uninstalling Mod... (Please wait)",
+                        _ => "🗑 Uninstall",
+                    };
+                    let btn_uninstall = egui::Button::new(
+                        RichText::new(uninstall_text).size(14.0).strong().color(
+                            if can_click {
+                                Color32::from_rgb(255, 180, 180)
+                            } else {
+                                Color32::from_rgb(160, 160, 160)
+                            },
+                        ),
+                    )
+                    .min_size(Vec2::new(cols[1].available_width(), 36.0));
+
+                    if cols[1].add_enabled(can_click, btn_uninstall).clicked() {
+                        self.state = InstallState::Uninstalling;
+                        self.log_lines.clear();
+
+                        let tx = self.sender.clone();
+                        let tx_status = self.sender.clone();
+                        let ctx_clone = ctx.clone();
+                        let root = self.resolved_root.clone().unwrap();
+
+                        crate::patcher::set_log_sink(move |msg| {
+                            let _ = tx.send(GuiEvent::Log(msg.to_string()));
+                            ctx_clone.request_repaint();
+                        });
+
+                        let ctx_finish = ctx.clone();
+                        thread::spawn(move || {
+                            let res = crate::patcher::restore_vanilla(&root);
+                            match res {
+                                Ok(_) => {
+                                    let _ = tx_status.send(GuiEvent::Log("\n>>> Uninstallation complete! Restored 100% vanilla game files.".to_string()));
+                                    let _ = tx_status.send(GuiEvent::UninstallDone(true));
+                                }
+                                Err(e) => {
+                                    let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
+                                    let _ = tx_status.send(GuiEvent::UninstallDone(false));
+                                }
+                            }
+                            crate::patcher::clear_log_sink();
+                            ctx_finish.request_repaint();
+                        });
+                    }
                 });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Mod Status:").size(12.5).color(Color32::from_rgb(180, 180, 180)));
+                    ui.label(
+                        RichText::new("Not Installed (Vanilla game)")
+                            .size(12.5)
+                            .color(Color32::from_rgb(200, 200, 200)),
+                    );
+                });
+                ui.add_space(4.0);
+
+                let button_text = match self.state {
+                    InstallState::Idle => "🎮 Install Mod",
+                    InstallState::Installing => "Installing Mod... (Please wait)",
+                    InstallState::Uninstalling => "Uninstalling Mod... (Please wait)",
+                    InstallState::Success => "✔ Mod Installed Successfully",
+                    InstallState::Failed => "❌ Installation Failed (Click to Retry)",
+                };
+
+                let btn = egui::Button::new(
+                    RichText::new(button_text).size(15.0).strong().color(
+                        if can_click {
+                            Color32::WHITE
+                        } else {
+                            Color32::from_rgb(160, 160, 160)
+                        },
+                    ),
+                )
+                .min_size(Vec2::new(ui.available_width(), 36.0));
+
+                if ui.add_enabled(can_click, btn).clicked() {
+                    self.state = InstallState::Installing;
+                    self.log_lines.clear();
+
+                    let tx = self.sender.clone();
+                    let tx_status = self.sender.clone();
+                    let ctx_clone = ctx.clone();
+                    let root = self.resolved_root.clone().unwrap();
+
+                    crate::patcher::set_log_sink(move |msg| {
+                        let _ = tx.send(GuiEvent::Log(msg.to_string()));
+                        ctx_clone.request_repaint();
+                    });
+
+                    let ctx_finish = ctx.clone();
+                    thread::spawn(move || {
+                        let res = crate::patcher::apply_all(&root, false);
+                        match res {
+                            Ok(_) => {
+                                let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.".to_string()));
+                                let _ = tx_status.send(GuiEvent::InstallDone(true));
+                            }
+                            Err(e) => {
+                                let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
+                                let _ = tx_status.send(GuiEvent::InstallDone(false));
+                            }
+                        }
+                        crate::patcher::clear_log_sink();
+                        ctx_finish.request_repaint();
+                    });
+                }
             }
 
             ui.add_space(6.0);
