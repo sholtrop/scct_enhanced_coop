@@ -28,7 +28,6 @@ pub struct PatcherApp {
     public_ip: Option<Ipv4Addr>,
     fetching_ip: bool,
     ip_fetch_err: Option<String>,
-    online_patch_applied: bool,
 }
 
 impl PatcherApp {
@@ -49,7 +48,6 @@ impl PatcherApp {
             public_ip: None,
             fetching_ip: true,
             ip_fetch_err: None,
-            online_patch_applied: false,
         };
 
         // Automatically fetch public IP in background on startup
@@ -115,16 +113,12 @@ impl PatcherApp {
         }
 
         let exe_path = crate::patcher::find_child_ci(&sys, "splintercell3.exe");
-        if let Ok(pe_bytes) = std::fs::read(&exe_path) {
-            self.online_patch_applied = crate::net::is_online_coop_fix_applied(&pe_bytes);
-            if self.configured_host_ip.is_none()
-                && let Some(ip) = crate::net::get_direct_ip_from_exe(&pe_bytes)
-            {
-                self.host_ip_input = ip.to_string();
-                self.configured_host_ip = Some(ip);
-            }
-        } else {
-            self.online_patch_applied = false;
+        if let Ok(pe_bytes) = std::fs::read(&exe_path)
+            && self.configured_host_ip.is_none()
+            && let Some(ip) = crate::net::get_direct_ip_from_exe(&pe_bytes)
+        {
+            self.host_ip_input = ip.to_string();
+            self.configured_host_ip = Some(ip);
         }
     }
 
@@ -175,7 +169,6 @@ impl eframe::App for PatcherApp {
         while let Ok(msg) = self.receiver.try_recv() {
             if msg == "__SCCT_DONE_OK__" {
                 self.state = InstallState::Success;
-                self.online_patch_applied = true;
             } else if msg == "__SCCT_DONE_ERR__" {
                 self.state = InstallState::Failed;
             } else if let Some(ip_str) = msg.strip_prefix("__PUBLIC_IP__:") {
@@ -380,12 +373,7 @@ impl eframe::App for PatcherApp {
                 .inner_margin(10.0);
 
             online_frame.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading(RichText::new("🌐 Online Coop (Direct IP Networking)").size(14.0).strong());
-                    if self.online_patch_applied {
-                        ui.label(RichText::new("✔ Online Patch Active").color(Color32::from_rgb(100, 220, 140)).size(11.5));
-                    }
-                });
+                ui.heading(RichText::new("🌐 Online Coop (Direct IP Networking)").size(14.0).strong());
 
                 ui.add_space(4.0);
 
@@ -481,7 +469,6 @@ impl eframe::App for PatcherApp {
                         match crate::patcher::apply_online_patch(root, Some(ip)) {
                             Ok(_) => {
                                 self.configured_host_ip = Some(ip);
-                                self.online_patch_applied = true;
                                 self.log_lines.push(format!("  [NET] Direct Host IP set to {} (saved to direct_ip.ini)", ip));
                                 self.log_lines.push("  [NET] In-game 'Online' button will now join this host!".to_string());
                             }
