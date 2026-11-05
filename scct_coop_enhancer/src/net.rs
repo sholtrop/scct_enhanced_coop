@@ -59,9 +59,9 @@ pub const HOOK_QUAZAL_SOCKET: u32 = 0x110B6800;
 pub const HOOK_QUAZAL_BIND: u32 = 0x110B6820;
 
 pub const SOCKET_CAVE_HEX: &str = "\
-a1d003331185c0740bc705d003331100000000c20c00ff25ac760b1190909090\
-833dd803331100740ec705d80333110000000031c0c20c00ff25c0760b119090\
-a1d403331185c0740bc705d403331100000000c21800ff25b8760b1190909090\
+a1d003331185c0740dc705d003331100000000c20c00ff25ac760b1190909090\
+833dd803331100740fc705d80333110000000031c0c20c00ff25c0760b119090\
+a1d403331185c0740dc705d403331100000000c21800ff25b8760b1190909090\
 833ddc033311007505e983feffffc705dc0333110000000056575389ce8b7c24\
 10e9b1feffff";
 
@@ -338,7 +338,16 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     if &buf[sock_cave_off..sock_cave_off + sock_cave.len()] != sock_cave.as_slice()
         && buf[sock_cave_off..sock_cave_off + sock_cave.len()].iter().any(|&b| b != 0)
     {
-        bail!("Code cave at 0x{:08X} is non-zero in {}", SOCKET_CAVE_VA, exe_bak_path.display());
+        let old_buggy_hex = "\
+a1d003331185c0740bc705d003331100000000c20c00ff25ac760b1190909090\
+833dd803331100740ec705d80333110000000031c0c20c00ff25c0760b119090\
+a1d403331185c0740bc705d403331100000000c21800ff25b8760b1190909090\
+833ddc033311007505e983feffffc705dc0333110000000056575389ce8b7c24\
+10e9b1feffff";
+        let old_cave = decode_hex(old_buggy_hex);
+        if &buf[sock_cave_off..sock_cave_off + old_cave.len()] != old_cave.as_slice() {
+            bail!("Code cave at 0x{:08X} is non-zero in {}", SOCKET_CAVE_VA, exe_bak_path.display());
+        }
     }
 
     let sites = get_net_sites();
@@ -597,6 +606,38 @@ mod tests {
         assert_eq!(bytes.len(), 116);
         assert_eq!(bytes[ONLINE_CAVE_ENABLED_OFFSET], 0x00);
         assert_eq!(&bytes[ONLINE_CAVE_IP_OFFSET..ONLINE_CAVE_IP_OFFSET + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_socket_cave_jump_targets() {
+        let bytes = decode_hex(SOCKET_CAVE_HEX);
+        assert_eq!(bytes.len(), 134);
+
+        // Hook 1: Discovery Socket (0x110B67C0)
+        // je opcode is at bytes[7], operand at bytes[8]
+        assert_eq!(bytes[7], 0x74);
+        assert_eq!(bytes[8], 0x0D, "Hook 1 je must jump +13 bytes to fallback jmp at 0x110B67D6");
+        // Verify fallback jmp at offset 22 (0x110B67D6)
+        assert_eq!(&bytes[22..28], &[0xFF, 0x25, 0xAC, 0x76, 0x0B, 0x11]);
+
+        // Hook 2: Discovery Bind (0x110B67E0)
+        // je opcode is at bytes[39], operand at bytes[40]
+        assert_eq!(bytes[32 + 7], 0x74);
+        assert_eq!(bytes[32 + 8], 0x0F, "Hook 2 je must jump +15 bytes to fallback jmp at 0x110B67F8");
+        // Verify fallback jmp at offset 32 + 24 (0x110B67F8)
+        assert_eq!(&bytes[32 + 24..32 + 30], &[0xFF, 0x25, 0xC0, 0x76, 0x0B, 0x11]);
+
+        // Hook 3: Quazal Socket (0x110B6800)
+        // je opcode is at bytes[64 + 7], operand at bytes[64 + 8]
+        assert_eq!(bytes[64 + 7], 0x74);
+        assert_eq!(bytes[64 + 8], 0x0D, "Hook 3 je must jump +13 bytes to fallback jmp at 0x110B6816");
+        // Verify fallback jmp at offset 64 + 22 (0x110B6816)
+        assert_eq!(&bytes[64 + 22..64 + 28], &[0xFF, 0x25, 0xB8, 0x76, 0x0B, 0x11]);
+
+        // Hook 4: Quazal Bind (0x110B6820)
+        // jne opcode is at bytes[96 + 7], operand at bytes[96 + 8]
+        assert_eq!(bytes[96 + 7], 0x75);
+        assert_eq!(bytes[96 + 8], 0x05, "Hook 4 jne must jump +5 bytes to take primed branch");
     }
 
     #[test]
