@@ -8,11 +8,16 @@ pub const PE_IMAGE_BASE: u32 = 0x10900000;
 pub const PE_TEXT_RVA: u32 = 0x00001000;
 pub const PE_TEXT_RAW_OFF: u32 = 0x00001000;
 pub const PE_TEXT_RAW_SIZE: u32 = 0x007B6000;
-pub const PE_TEXT_PATCHED_VSIZE: u32 = 0x007B5800;
+pub const PE_TEXT_PATCHED_VSIZE: u32 = 0x007B6000;
 pub const PE_DATA_PATCHED_VSIZE: u32 = 0x001A2400;
 pub const G_LAN_PEER_VA: u32 = 0x113303A0;
 pub const G_DIRECT_IP_U32_VA: u32 = 0x113303A4;
 pub const G_DIRECT_IP_ENABLED_VA: u32 = 0x113303A8;
+
+pub const G_INHERITED_SOCK_9100_VA: u32 = 0x113303D0;
+pub const G_INHERITED_SOCK_9103_VA: u32 = 0x113303D4;
+pub const G_INHERITED_PRIMED_9100_VA: u32 = 0x113303D8;
+pub const G_INHERITED_PRIMED_9103_VA: u32 = 0x113303DC;
 
 pub const NET_CAVE_VA: u32 = 0x110B6450;
 pub const NET_CAVE_HEX: &str = "\
@@ -46,6 +51,23 @@ pub const RECV_FROM_WRAPPER: u32 = 0x110B65F2;
 pub const HOOK3_ON_SESSION_INFO: u32 = 0x110B668A;
 pub const HOOK4_ON_SESSION_ADDRESSES: u32 = 0x110B669E;
 pub const QUAZAL_SOCKET_BIND: u32 = 0x110B66B1;
+
+pub const SOCKET_CAVE_VA: u32 = 0x110B67C0;
+pub const HOOK_DISCOVERY_SOCKET: u32 = 0x110B67C0;
+pub const HOOK_DISCOVERY_BIND: u32 = 0x110B67E0;
+pub const HOOK_QUAZAL_SOCKET: u32 = 0x110B6800;
+pub const HOOK_QUAZAL_BIND: u32 = 0x110B6820;
+
+pub const SOCKET_CAVE_HEX: &str = "\
+a1d003331185c0740bc705d003331100000000c20c00ff25ac760b1190909090\
+833dd803331100740ec705d80333110000000031c0c20c00ff25c0760b119090\
+a1d403331185c0740bc705d403331100000000c21800ff25b8760b1190909090\
+833ddc033311007505e983feffffc705dc0333110000000056575389ce8b7c24\
+10e9b1feffff";
+
+pub const HOOK_SITE_DISCOVERY_SOCKET: u32 = 0x10EFBFF9;
+pub const HOOK_SITE_DISCOVERY_BIND: u32 = 0x10EFC0A3;
+pub const HOOK_SITE_QUAZAL_SOCKET: u32 = 0x10DE6490;
 
 pub fn decode_hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -145,8 +167,26 @@ pub fn get_net_sites() -> Vec<PatchSite> {
         PatchSite {
             va: 0x10DE6510,
             orig: decode_hex("56578b7c24"),
-            new: make_jmp(0x10DE6510, QUAZAL_SOCKET_BIND, 5),
-            desc: "Quazal SocketDriver::Bind -> 0.0.0.0",
+            new: make_jmp(0x10DE6510, HOOK_QUAZAL_BIND, 5),
+            desc: "Quazal SocketDriver::Bind -> HookQuazalBind (primed or 0.0.0.0)",
+        },
+        PatchSite {
+            va: HOOK_SITE_DISCOVERY_SOCKET,
+            orig: decode_hex("ff15ac760b11"),
+            new: make_call(HOOK_SITE_DISCOVERY_SOCKET, HOOK_DISCOVERY_SOCKET, 6),
+            desc: "GS_Socket::CreateUDP: ingest primed socket if present",
+        },
+        PatchSite {
+            va: HOOK_SITE_DISCOVERY_BIND,
+            orig: decode_hex("ff15c0760b11"),
+            new: make_call(HOOK_SITE_DISCOVERY_BIND, HOOK_DISCOVERY_BIND, 6),
+            desc: "GS_Socket::Bind: bypass bind if primed socket",
+        },
+        PatchSite {
+            va: HOOK_SITE_QUAZAL_SOCKET,
+            orig: decode_hex("ff15b8760b11"),
+            new: make_call(HOOK_SITE_QUAZAL_SOCKET, HOOK_QUAZAL_SOCKET, 6),
+            desc: "Quazal Net-Z WSASocketW: ingest primed socket if present",
         },
     ]
 }
@@ -207,12 +247,26 @@ pub fn is_lan_and_zerotier_fix_applied(pe_bytes: &[u8]) -> bool {
     if pe_bytes.len() < o + cave.len() || &pe_bytes[o..o + cave.len()] != cave.as_slice() {
         return false;
     }
+
+    let sock_cave = decode_hex(SOCKET_CAVE_HEX);
+    let so_sock = match va_to_text_off(SOCKET_CAVE_VA) {
+        Ok(off) => off,
+        Err(_) => return false,
+    };
+    if pe_bytes.len() < so_sock + sock_cave.len()
+        || &pe_bytes[so_sock..so_sock + sock_cave.len()] != sock_cave.as_slice()
+    {
+        return false;
+    }
+
     for site in get_net_sites() {
         let so = match va_to_text_off(site.va) {
             Ok(off) => off,
             Err(_) => return false,
         };
-        if pe_bytes.len() < so + site.new.len() || &pe_bytes[so..so + site.new.len()] != site.new.as_slice() {
+        if pe_bytes.len() < so + site.new.len()
+            || &pe_bytes[so..so + site.new.len()] != site.new.as_slice()
+        {
             return false;
         }
     }
@@ -236,7 +290,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         }
         let cur_data = fs::read(exe_path).with_context(|| format!("Reading {}", exe_path.display()))?;
         if is_lan_and_zerotier_fix_applied(&cur_data) {
-            crate::scct_log!("  [NET] Multi-NIC LAN fix is already present in splintercell3.exe");
+            crate::scct_log!("  [NET] Multi-NIC LAN & STUN fix is already present in splintercell3.exe");
             return Ok(());
         }
         fs::copy(exe_path, exe_bak_path)
@@ -248,7 +302,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     if is_lan_and_zerotier_fix_applied(&buf) {
         fs::copy(exe_bak_path, exe_path)
             .with_context(|| format!("Copying {} to {}", exe_bak_path.display(), exe_path.display()))?;
-        crate::scct_log!("  [NET] Applied multi-NIC LAN fix to splintercell3.exe");
+        crate::scct_log!("  [NET] Applied multi-NIC LAN & STUN fix to splintercell3.exe");
         return Ok(());
     }
 
@@ -273,25 +327,42 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
 
     let cave = decode_hex(NET_CAVE_HEX);
     let cave_off = va_to_text_off(NET_CAVE_VA)?;
-    if buf[cave_off..cave_off + cave.len()].iter().any(|&b| b != 0) {
+    if &buf[cave_off..cave_off + cave.len()] != cave.as_slice()
+        && buf[cave_off..cave_off + cave.len()].iter().any(|&b| b != 0)
+    {
         bail!("Code cave at 0x{:08X} is non-zero in {}", NET_CAVE_VA, exe_bak_path.display());
+    }
+
+    let sock_cave = decode_hex(SOCKET_CAVE_HEX);
+    let sock_cave_off = va_to_text_off(SOCKET_CAVE_VA)?;
+    if &buf[sock_cave_off..sock_cave_off + sock_cave.len()] != sock_cave.as_slice()
+        && buf[sock_cave_off..sock_cave_off + sock_cave.len()].iter().any(|&b| b != 0)
+    {
+        bail!("Code cave at 0x{:08X} is non-zero in {}", SOCKET_CAVE_VA, exe_bak_path.display());
     }
 
     let sites = get_net_sites();
     for site in &sites {
         let so = va_to_text_off(site.va)?;
-        if &buf[so..so + site.orig.len()] != site.orig.as_slice() {
-            bail!(
-                "Unexpected bytes at 0x{:08X} in {}: {:02x?} (expected {:02x?})",
-                site.va,
-                exe_bak_path.display(),
-                &buf[so..so + site.orig.len()],
-                site.orig
-            );
+        let cur = &buf[so..so + site.orig.len()];
+        if cur != site.orig.as_slice() && cur != site.new.as_slice() {
+            let old_quazal_bind = make_jmp(0x10DE6510, QUAZAL_SOCKET_BIND, 5);
+            if site.va == 0x10DE6510 && cur == old_quazal_bind.as_slice() {
+                // allow upgrading older version of quazal bind
+            } else {
+                bail!(
+                    "Unexpected bytes at 0x{:08X} in {}: {:02x?} (expected {:02x?})",
+                    site.va,
+                    exe_bak_path.display(),
+                    cur,
+                    site.orig
+                );
+            }
         }
     }
 
     buf[cave_off..cave_off + cave.len()].copy_from_slice(&cave);
+    buf[sock_cave_off..sock_cave_off + sock_cave.len()].copy_from_slice(&sock_cave);
     for site in &sites {
         let so = va_to_text_off(site.va)?;
         buf[so..so + site.new.len()].copy_from_slice(&site.new);
@@ -308,7 +379,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
 
     fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
     crate::scct_log!(
-        "  [NET] Patched System/splintercell3.exe (Multi-NIC LAN fix @ 0x{:08X}, 7 sites)",
+        "  [NET] Patched System/splintercell3.exe (Multi-NIC LAN + STUN hooks @ 0x{:08X}, 10 sites)",
         NET_CAVE_VA
     );
     Ok(())
