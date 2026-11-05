@@ -7,7 +7,7 @@ mod net;
 mod patcher;
 mod umd;
 mod upk;
-mod upnp;
+mod ip;
 
 use anyhow::Result;
 use clap::Parser;

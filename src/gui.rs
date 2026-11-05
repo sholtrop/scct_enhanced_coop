@@ -22,13 +22,12 @@ pub struct PatcherApp {
     receiver: Receiver<String>,
     sender: Sender<String>,
 
-    // Online & UPnP state
+    // Online & Public IP state
     host_ip_input: String,
     configured_host_ip: Option<Ipv4Addr>,
     public_ip: Option<Ipv4Addr>,
-    upnp_status_msg: Option<String>,
-    upnp_active: bool,
-    upnp_running: bool,
+    fetching_ip: bool,
+    ip_fetch_err: Option<String>,
     online_patch_applied: bool,
 }
 
@@ -48,11 +47,23 @@ impl PatcherApp {
             host_ip_input: String::new(),
             configured_host_ip: None,
             public_ip: None,
-            upnp_status_msg: None,
-            upnp_active: false,
-            upnp_running: false,
+            fetching_ip: true,
+            ip_fetch_err: None,
             online_patch_applied: false,
         };
+
+        // Automatically fetch public IP in background on startup
+        let tx_ip = app.sender.clone();
+        thread::spawn(move || {
+            match crate::ip::fetch_public_ip() {
+                Ok(ip) => {
+                    let _ = tx_ip.send(format!("__PUBLIC_IP__:{}", ip));
+                }
+                Err(e) => {
+                    let _ = tx_ip.send(format!("__PUBLIC_IP_ERR__:{:#}", e));
+                }
+            }
+        });
 
         let detected = crate::patcher::auto_detect_game_roots();
         app.detected_roots = detected.clone();
@@ -137,6 +148,25 @@ impl PatcherApp {
                     .to_string();
         }
     }
+
+    fn refresh_public_ip(&mut self) {
+        if self.fetching_ip {
+            return;
+        }
+        self.fetching_ip = true;
+        self.ip_fetch_err = None;
+        let tx = self.sender.clone();
+        thread::spawn(move || {
+            match crate::ip::fetch_public_ip() {
+                Ok(ip) => {
+                    let _ = tx.send(format!("__PUBLIC_IP__:{}", ip));
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("__PUBLIC_IP_ERR__:{:#}", e));
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for PatcherApp {
@@ -148,17 +178,14 @@ impl eframe::App for PatcherApp {
                 self.online_patch_applied = true;
             } else if msg == "__SCCT_DONE_ERR__" {
                 self.state = InstallState::Failed;
-            } else if let Some(rest) = msg.strip_prefix("__UPNP_RES__:") {
-                self.upnp_running = false;
-                // Format: <public_ip>|<ports_forwarded>|<message>
-                let parts: Vec<&str> = rest.splitn(3, '|').collect();
-                if parts.len() == 3 {
-                    if let Ok(ip) = parts[0].parse::<Ipv4Addr>() {
-                        self.public_ip = Some(ip);
-                    }
-                    self.upnp_active = parts[1] == "true";
-                    self.upnp_status_msg = Some(parts[2].to_string());
+            } else if let Some(ip_str) = msg.strip_prefix("__PUBLIC_IP__:") {
+                self.fetching_ip = false;
+                if let Ok(ip) = ip_str.parse::<Ipv4Addr>() {
+                    self.public_ip = Some(ip);
                 }
+            } else if let Some(err) = msg.strip_prefix("__PUBLIC_IP_ERR__:") {
+                self.fetching_ip = false;
+                self.ip_fetch_err = Some(err.to_string());
             } else {
                 self.log_lines.push(msg);
             }
@@ -346,7 +373,7 @@ impl eframe::App for PatcherApp {
             ui.add_space(6.0);
 
             // =================================================================
-            // Online Coop (Public IP & UPnP) Section
+            // Online Coop (Direct IP & Port Forwarding) Section
             // =================================================================
             let online_frame = egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(22, 26, 32))
@@ -354,52 +381,46 @@ impl eframe::App for PatcherApp {
 
             online_frame.show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(RichText::new("🌐 Online Coop (Direct IP & UPnP)").size(14.0).strong());
+                    ui.heading(RichText::new("🌐 Online Coop (Direct IP Networking)").size(14.0).strong());
                     if self.online_patch_applied {
                         ui.label(RichText::new("✔ Online Patch Active").color(Color32::from_rgb(100, 220, 140)).size(11.5));
                     }
                 });
 
-                ui.add_space(3.0);
+                ui.add_space(4.0);
 
-                // --- Hosting Section (UPnP) ---
+                // --- Port Forwarding Requirement Box ---
+                let alert_frame = egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgb(38, 30, 16))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(180, 140, 40)))
+                    .inner_margin(8.0);
+
+                alert_frame.show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("⚠ Router Port Forwarding Required:")
+                                .color(Color32::from_rgb(255, 210, 80))
+                                .strong()
+                                .size(12.0),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Make sure UDP ports 9100 and 9103 are port-forwarded on both players' routers:\n\
+                                 • UDP 9100 — Session Discovery & Lobby\n\
+                                 • UDP 9103 — Gameplay Traffic (Quazal Net-Z)",
+                            )
+                            .color(Color32::from_rgb(220, 215, 195))
+                            .size(11.0),
+                        );
+                    });
+                });
+
+                ui.add_space(6.0);
+
+                // --- Own Public IP Display ---
                 ui.horizontal(|ui| {
-                    let upnp_btn_text = if self.upnp_running {
-                        "Searching for UPnP Router..."
-                    } else if self.upnp_active {
-                        "✔ Ports Forwarded (Re-run UPnP)"
-                    } else {
-                        "Open Ports via UPnP & Get My IP"
-                    };
-
-                    let upnp_can_click = !self.upnp_running && self.state != InstallState::Running;
-                    let btn = egui::Button::new(
-                        RichText::new(upnp_btn_text).size(12.0).strong()
-                    );
-
-                    if ui.add_enabled(upnp_can_click, btn).clicked() {
-                        self.upnp_running = true;
-                        let tx = self.sender.clone();
-                        let ctx_clone = ctx.clone();
-                        thread::spawn(move || {
-                            let res = crate::upnp::open_coop_ports();
-                            match res {
-                                Ok(status) => {
-                                    let ip_str = status.public_ip.map(|ip| ip.to_string()).unwrap_or_default();
-                                    let _ = tx.send(format!("  [UPNP] {}", status.message));
-                                    let _ = tx.send(format!("__UPNP_RES__:{}:{}|{}", ip_str, status.ports_forwarded, status.message));
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(format!("  [UPNP] Error: {:#}", e));
-                                    let _ = tx.send(format!("__UPNP_RES__:||false|Error: {:#}", e));
-                                }
-                            }
-                            ctx_clone.request_repaint();
-                        });
-                    }
-
+                    ui.label(RichText::new("Your Public IP:").strong().size(12.0));
                     if let Some(ip) = self.public_ip {
-                        ui.label(RichText::new("Your Public IP:").strong().size(12.0));
                         ui.label(
                             RichText::new(ip.to_string())
                                 .color(Color32::from_rgb(120, 210, 255))
@@ -407,25 +428,38 @@ impl eframe::App for PatcherApp {
                                 .monospace()
                                 .size(12.5),
                         );
-                        if ui.button(RichText::new("📋 Copy").size(11.0)).clicked() {
+                        if ui.button(RichText::new("📋 Copy IP").size(11.0)).clicked() {
                             ctx.copy_text(ip.to_string());
                             self.log_lines.push(format!("  [GUI] Copied public IP {} to clipboard", ip));
                         }
+                    } else if self.fetching_ip {
+                        ui.label(
+                            RichText::new("Detecting public IP via api.ipify.org...")
+                                .size(11.5)
+                                .color(Color32::from_rgb(180, 180, 180)),
+                        );
+                    } else if let Some(ref err) = self.ip_fetch_err {
+                        ui.label(
+                            RichText::new(format!("Error: {}", err))
+                                .color(Color32::from_rgb(255, 120, 120))
+                                .size(11.0),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("Not detected")
+                                .size(11.5)
+                                .color(Color32::from_rgb(160, 160, 160)),
+                        );
+                    }
+
+                    if ui.add_enabled(!self.fetching_ip, egui::Button::new(RichText::new("🔄 Refresh").size(11.0))).clicked() {
+                        self.refresh_public_ip();
                     }
                 });
 
-                if let Some(ref msg) = self.upnp_status_msg {
-                    let color = if self.upnp_active {
-                        Color32::from_rgb(130, 220, 150)
-                    } else {
-                        Color32::from_rgb(255, 180, 100)
-                    };
-                    ui.label(RichText::new(msg).size(11.0).color(color));
-                }
-
-                ui.add_space(3.0);
+                ui.add_space(4.0);
                 ui.separator();
-                ui.add_space(3.0);
+                ui.add_space(4.0);
 
                 // --- Joining Section (Host IP Input) ---
                 ui.horizontal(|ui| {
@@ -469,13 +503,13 @@ impl eframe::App for PatcherApp {
 
                 if let Some(target) = self.configured_host_ip {
                     ui.label(
-                        RichText::new(format!("Active Target: Joining Host at {}", target))
+                        RichText::new(format!("Active Target: In-game 'Online' button joins {}", target))
                             .color(Color32::from_rgb(120, 220, 255))
                             .size(11.0),
                     );
                 } else {
                     ui.label(
-                        RichText::new("Active Target: Local LAN broadcast (No remote IP set)")
+                        RichText::new("Active Target: In-game 'Online' button uses Local LAN broadcast")
                             .color(Color32::from_rgb(180, 180, 180))
                             .size(11.0),
                     );
@@ -519,7 +553,7 @@ impl eframe::App for PatcherApp {
                                     Color32::from_rgb(255, 100, 100)
                                 } else if line.contains("[COOP]") {
                                     Color32::from_rgb(230, 230, 130)
-                                } else if line.contains("[UPNP]") || line.contains("[NET]") || line.contains("[UMD]") || line.contains("[MD5]") {
+                                } else if line.contains("[NET]") || line.contains("[UMD]") {
                                     Color32::from_rgb(140, 210, 255)
                                 } else {
                                     Color32::from_rgb(210, 215, 220)
