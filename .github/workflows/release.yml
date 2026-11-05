@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   build:
@@ -19,12 +20,12 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: patch_sp_levels.exe
-            asset_name: patch_sp_levels-windows-amd64.exe
+            artifact_name: scct_coop_enhancer.exe
+            asset_name: scct_coop_enhancer-windows-amd64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: patch_sp_levels
-            asset_name: patch_sp_levels-linux-amd64
+            artifact_name: scct_coop_enhancer
+            asset_name: scct_coop_enhancer-linux-amd64
 
     steps:
       - name: Checkout code
@@ -50,21 +51,37 @@ jobs:
           else
             CARGO_PATH="public/Cargo.toml"
           fi
-          cargo build --release --target ${{ matrix.target }} --manifest-path "$CARGO_PATH"
+          cargo build --release --target ${{ matrix.target }} --manifest-path "$CARGO_PATH" -p scct_coop_enhancer
 
       - name: Stage release assets
         shell: bash
         run: |
           mkdir -p release_assets
+
+          if [ -f "scct_coop_enhancer/Cargo.toml" ]; then
+            ENHANCER_CARGO="scct_coop_enhancer/Cargo.toml"
+          else
+            ENHANCER_CARGO="public/scct_coop_enhancer/Cargo.toml"
+          fi
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$ENHANCER_CARGO" | head -n 1)
+
           if [ -d "target/${{ matrix.target }}/release" ]; then
             TARGET_DIR="target/${{ matrix.target }}/release"
-          else
+          elif [ -d "public/target/${{ matrix.target }}/release" ]; then
             TARGET_DIR="public/target/${{ matrix.target }}/release"
+          else
+            TARGET_DIR="target/release"
           fi
+
           SRC="$TARGET_DIR/${{ matrix.artifact_name }}"
           cp "$SRC" "release_assets/${{ matrix.asset_name }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "$SRC" "release_assets/${{ matrix.artifact_name }}"
+            cp "$SRC" "release_assets/scct_coop_enhancer-${VERSION}.exe"
+            cp "$SRC" "release_assets/scct_coop_enhancer-v${VERSION}.exe"
+          else
+            cp "$SRC" "release_assets/scct_coop_enhancer-${VERSION}-linux-amd64"
+            cp "$SRC" "release_assets/scct_coop_enhancer-v${VERSION}-linux-amd64"
           fi
 
       - name: Upload artifact
@@ -84,14 +101,14 @@ jobs:
       - name: Extract semver from Cargo.toml
         id: get_version
         run: |
-          if [ -f "Cargo.toml" ]; then
-            CARGO_FILE="Cargo.toml"
+          if [ -f "scct_coop_enhancer/Cargo.toml" ]; then
+            ENHANCER_CARGO="scct_coop_enhancer/Cargo.toml"
           else
-            CARGO_FILE="public/Cargo.toml"
+            ENHANCER_CARGO="public/scct_coop_enhancer/Cargo.toml"
           fi
-          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$CARGO_FILE" | head -n 1)
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$ENHANCER_CARGO" | head -n 1)
           if [ -z "$VERSION" ]; then
-            echo "Failed to extract version from $CARGO_FILE"
+            echo "Failed to extract version from $ENHANCER_CARGO"
             exit 1
           fi
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
@@ -112,11 +129,64 @@ jobs:
           prerelease: false
           files: release_assets/*
           body: |
-            ### Splinter Cell: Chaos Theory — Coop Campaign Mod
-            Automated release build for version `${{ steps.get_version.outputs.VERSION }}`.
+            ### Splinter Cell: Chaos Theory — Coop Mod & Launcher ${{ steps.get_version.outputs.VERSION }}
+            Automated release build for Splinter Cell: Chaos Theory Coop Mod & Online Launcher.
 
             #### Downloads:
-            - **Windows**: `patch_sp_levels.exe` (or `patch_sp_levels-windows-amd64.exe`)
-            - **Linux**: `patch_sp_levels-linux-amd64`
+            - **Windows**: `scct_coop_enhancer-${{ steps.get_version.outputs.VERSION }}.exe` (or `scct_coop_enhancer.exe`)
+            - **Linux**: `scct_coop_enhancer-${{ steps.get_version.outputs.VERSION }}-linux-amd64`
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-server:
+    name: Build & Publish Server Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract server version from Cargo.toml
+        id: get_server_version
+        run: |
+          if [ -f "scct_coop_server/Cargo.toml" ]; then
+            SERVER_CARGO="scct_coop_server/Cargo.toml"
+            ROOT_DIR="."
+          else
+            SERVER_CARGO="public/scct_coop_server/Cargo.toml"
+            ROOT_DIR="public"
+          fi
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$SERVER_CARGO" | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "Failed to extract server version from $SERVER_CARGO"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "ROOT_DIR=$ROOT_DIR" >> $GITHUB_OUTPUT
+          echo "Server version: $VERSION"
+
+      - name: Build and push Docker image
+        shell: bash
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/scct_coop_server"
+          IMAGE_ALT="ghcr.io/${OWNER}/scct-coop-server"
+          VERSION="${{ steps.get_server_version.outputs.VERSION }}"
+          ROOT_DIR="${{ steps.get_server_version.outputs.ROOT_DIR }}"
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          docker build \
+            -f "${ROOT_DIR}/scct_coop_server/Dockerfile" \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE_ALT}:${VERSION}" \
+            -t "${IMAGE_ALT}:latest" \
+            "${ROOT_DIR}"
+
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE_ALT}:${VERSION}"
+          docker push "${IMAGE_ALT}:latest"
