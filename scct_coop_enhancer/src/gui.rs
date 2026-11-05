@@ -1194,11 +1194,53 @@ fn run_join_match(
 }
 
 pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = wgpu_options.wgpu_setup {
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::all();
+        setup.instance_descriptor.flags |=
+            eframe::wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
+        setup.power_preference = eframe::wgpu::PowerPreference::None;
+        setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+            // 1. Try finding a hardware GPU (discrete or integrated) compatible with surface
+            if let Some(surface) = surface
+                && let Some(adapter) = adapters.iter().find(|a| {
+                    a.get_info().device_type != eframe::wgpu::DeviceType::Cpu
+                        && a.is_surface_supported(surface)
+                })
+            {
+                return Ok(adapter.clone());
+            }
+
+            // 2. Try any adapter compatible with surface (including CPU / WARP / llvmpipe)
+            if let Some(surface) = surface
+                && let Some(adapter) = adapters.iter().find(|a| a.is_surface_supported(surface))
+            {
+                return Ok(adapter.clone());
+            }
+
+            // 3. Fallback to any hardware adapter
+            if let Some(adapter) = adapters
+                .iter()
+                .find(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
+            {
+                return Ok(adapter.clone());
+            }
+
+            // 4. Fallback to any adapter at all (CPU / software rasterizer)
+            if let Some(adapter) = adapters.first() {
+                return Ok(adapter.clone());
+            }
+
+            Err("No graphics adapter (hardware or CPU fallback) found on this machine".to_string())
+        }));
+    }
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
             .with_min_inner_size([540.0, 480.0])
             .with_title("SCCT Coop Mod Installer & Online Launcher"),
+        wgpu_options,
         ..Default::default()
     };
 
