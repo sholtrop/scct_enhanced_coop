@@ -75,6 +75,17 @@ fn fetch_ip_from_endpoint(host: &str, port: u16, path: &str) -> Result<Ipv4Addr>
     parse_ip_response(body).context("Could not parse IP from response body")
 }
 
+/// Query the local IPv4 address that routes towards the given target address.
+/// Uses a connected UDP socket to inspect kernel routing without sending network traffic.
+pub fn get_local_ip_to(target: SocketAddr) -> Option<Ipv4Addr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect(target).ok()?;
+    match s.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +112,15 @@ mod tests {
             parse_ip_response(plain),
             Some(Ipv4Addr::new(80, 115, 168, 197))
         );
+    }
+
+    #[test]
+    fn test_get_local_ip_to() {
+        let target: SocketAddr = "8.8.8.8:80".parse().unwrap();
+        let local_ip = get_local_ip_to(target);
+        assert!(local_ip.is_some());
+        let ip = local_ip.unwrap();
+        assert!(!ip.is_unspecified());
     }
 
     #[test]

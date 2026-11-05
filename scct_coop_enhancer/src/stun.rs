@@ -199,6 +199,8 @@ struct ApiRegisterReq {
     friend_code: Option<String>,
     disco_addr: SocketAddr,
     game_addr: SocketAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Deserialize)]
@@ -211,6 +213,8 @@ struct ApiJoinReq {
     friend_code: String,
     disco_addr: SocketAddr,
     game_addr: SocketAddr,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Deserialize)]
@@ -218,6 +222,8 @@ struct ApiJoinResp {
     status: String,
     peer_disco_addr: Option<SocketAddr>,
     peer_game_addr: Option<SocketAddr>,
+    #[serde(default)]
+    peer_local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Deserialize)]
@@ -225,6 +231,8 @@ struct ApiPollResp {
     status: String,
     peer_disco_addr: Option<SocketAddr>,
     peer_game_addr: Option<SocketAddr>,
+    #[serde(default)]
+    peer_local_ip: Option<Ipv4Addr>,
 }
 
 fn http_post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -303,11 +311,13 @@ pub fn register_with_server(
     friend_code: Option<String>,
     disco_addr: SocketAddr,
     game_addr: SocketAddr,
+    local_ip: Option<Ipv4Addr>,
 ) -> Result<String> {
     let req = ApiRegisterReq {
         friend_code,
         disco_addr,
         game_addr,
+        local_ip,
     };
     let resp: ApiRegisterResp = http_post_json(server_host, api_port, "/api/register", &req)?;
     Ok(resp.friend_code)
@@ -319,18 +329,20 @@ pub fn join_with_server(
     friend_code: &str,
     disco_addr: SocketAddr,
     game_addr: SocketAddr,
-) -> Result<(SocketAddr, SocketAddr)> {
+    local_ip: Option<Ipv4Addr>,
+) -> Result<(SocketAddr, SocketAddr, Option<Ipv4Addr>)> {
     let req = ApiJoinReq {
         friend_code: friend_code.to_string(),
         disco_addr,
         game_addr,
+        local_ip,
     };
     let resp: ApiJoinResp = http_post_json(server_host, api_port, "/api/join", &req)?;
     if resp.status == "paired"
         && let Some(disco) = resp.peer_disco_addr
         && let Some(game) = resp.peer_game_addr
     {
-        Ok((disco, game))
+        Ok((disco, game, resp.peer_local_ip))
     } else {
         bail!("Friend code '{}' not found or invalid", friend_code)
     }
@@ -340,14 +352,14 @@ pub fn poll_server_for_peer(
     server_host: &str,
     api_port: u16,
     friend_code: &str,
-) -> Result<Option<(SocketAddr, SocketAddr)>> {
+) -> Result<Option<(SocketAddr, SocketAddr, Option<Ipv4Addr>)>> {
     let path = format!("/api/poll/{}", friend_code);
     let resp: ApiPollResp = http_get_json(server_host, api_port, &path)?;
     if resp.status == "paired"
         && let Some(disco) = resp.peer_disco_addr
         && let Some(game) = resp.peer_game_addr
     {
-        Ok(Some((disco, game)))
+        Ok(Some((disco, game, resp.peer_local_ip)))
     } else {
         Ok(None)
     }

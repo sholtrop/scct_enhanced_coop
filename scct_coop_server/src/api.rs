@@ -1,6 +1,6 @@
 use crate::registry::{ClientEndpoints, FriendCodeRegistry};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -10,6 +10,8 @@ pub struct RegisterRequest {
     pub friend_code: Option<String>,
     pub disco_addr: SocketAddr,
     pub game_addr: SocketAddr,
+    #[serde(default)]
+    pub local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,6 +25,8 @@ pub struct JoinRequest {
     pub friend_code: String,
     pub disco_addr: SocketAddr,
     pub game_addr: SocketAddr,
+    #[serde(default)]
+    pub local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -30,6 +34,8 @@ pub struct JoinResponse {
     pub status: String,
     pub peer_disco_addr: Option<SocketAddr>,
     pub peer_game_addr: Option<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_local_ip: Option<Ipv4Addr>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,6 +43,8 @@ pub struct PollResponse {
     pub status: String,
     pub peer_disco_addr: Option<SocketAddr>,
     pub peer_game_addr: Option<SocketAddr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_local_ip: Option<Ipv4Addr>,
 }
 
 pub async fn run_api_server(bind_addr: &str, registry: FriendCodeRegistry) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,6 +109,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
             let endpoints = ClientEndpoints {
                 disco_addr: req.disco_addr,
                 game_addr: req.game_addr,
+                local_ip: req.local_ip,
             };
 
             let final_code = registry.register(code, endpoints).await;
@@ -124,6 +133,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
             let guest_endpoints = ClientEndpoints {
                 disco_addr: req.disco_addr,
                 game_addr: req.game_addr,
+                local_ip: req.local_ip,
             };
 
             if let Some(host_endpoints) = registry.join(&req.friend_code, guest_endpoints).await {
@@ -131,6 +141,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                     status: "paired".to_string(),
                     peer_disco_addr: Some(host_endpoints.disco_addr),
                     peer_game_addr: Some(host_endpoints.game_addr),
+                    peer_local_ip: host_endpoints.local_ip,
                 };
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
@@ -139,6 +150,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
+                    peer_local_ip: None,
                 };
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 404, "Not Found", "application/json", &json).await?;
@@ -151,6 +163,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                     status: "paired".to_string(),
                     peer_disco_addr: Some(guest_endpoints.disco_addr),
                     peer_game_addr: Some(guest_endpoints.game_addr),
+                    peer_local_ip: guest_endpoints.local_ip,
                 };
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
@@ -159,6 +172,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                     status: "waiting".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
+                    peer_local_ip: None,
                 };
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 200, "OK", "application/json", &json).await?;
@@ -167,6 +181,7 @@ async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegist
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
+                    peer_local_ip: None,
                 };
                 let json = serde_json::to_vec(&resp)?;
                 send_response(&mut stream, 404, "Not Found", "application/json", &json).await?;

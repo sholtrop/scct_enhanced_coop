@@ -1,7 +1,7 @@
 use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -38,6 +38,8 @@ pub fn normalize_friend_code(input: &str) -> String {
 pub struct ClientEndpoints {
     pub disco_addr: SocketAddr,
     pub game_addr: SocketAddr,
+    #[serde(default)]
+    pub local_ip: Option<Ipv4Addr>,
 }
 
 #[allow(dead_code)]
@@ -151,10 +153,12 @@ mod tests {
         let host_ep = ClientEndpoints {
             disco_addr: "1.2.3.4:9100".parse().unwrap(),
             game_addr: "1.2.3.4:9103".parse().unwrap(),
+            local_ip: Some(Ipv4Addr::new(192, 168, 1, 10)),
         };
         let guest_ep = ClientEndpoints {
             disco_addr: "5.6.7.8:9100".parse().unwrap(),
             game_addr: "5.6.7.8:9103".parse().unwrap(),
+            local_ip: Some(Ipv4Addr::new(192, 168, 1, 20)),
         };
 
         let code = registry.register("K7X9B".to_string(), host_ep.clone()).await;
