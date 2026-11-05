@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
+use md5::{Digest, Md5};
 use regex::Regex;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -41,12 +44,13 @@ macro_rules! scct_log {
 }
 
 use crate::levels::{SP_COOP_LEVELS, VANILLA_COOP_STEMS};
-use crate::net::apply_lan_networking_fix;
+use crate::net::{apply_online_coop_fix, load_direct_ip_ini, save_direct_ip_ini};
 use crate::umd::{
     append_missions_to_map_rotation, build_appended_coop_ini, normalize_umd_payload_baseline,
     parse_umd_archive, patch_umd_for_all_sp_levels,
 };
 use crate::upk::patch_sp_map_to_coop;
+use std::net::Ipv4Addr;
 
 /// Find a case-insensitive child in `parent`. If not found, returns `parent.join(child)`.
 pub fn find_child_ci(parent: &Path, child: &str) -> PathBuf {
@@ -65,98 +69,177 @@ pub fn find_child_ci(parent: &Path, child: &str) -> PathBuf {
     direct
 }
 
-/// Resolves the SCCT game root.
-/// Priority:
-/// 1. If explicit `game_dir` is provided:
-///    - If it contains `splintercell3.exe` (directly in `game_dir`), root is `game_dir.parent()`.
-///    - Else if `game_dir/System/splintercell3.exe` exists, root is `game_dir`.
-///    - Else root is `game_dir`.
-/// 2. If running from the current directory:
-///    - Check if current directory contains `splintercell3.exe` or `splintercell3.exe.bak`.
-///      If so, current directory IS `System`, so game root is `current_dir.parent()`.
-///    - Else check if current directory contains `System/splintercell3.exe`.
-///      If so, game root is `current_dir`.
-/// 3. Check next to the current running executable:
-///    - If `exe_dir` contains `splintercell3.exe`, root is `exe_dir.parent()`.
-///    - If `exe_dir/System/splintercell3.exe` exists, root is `exe_dir`.
-/// 4. Fallback default: `current_dir`.
+/// Validate whether `candidate` is a valid game root directory by confirming
+/// that `System/splintercell3.exe` (or `System/splintercell3.exe.bak`) exists.
+///
+/// Returns the canonical / normalized game root path if valid.
+pub fn validate_game_root(candidate: &Path) -> Option<PathBuf> {
+    if !candidate.exists() {
+        return None;
+    }
+
+    // 1. Direct check: candidate contains System/splintercell3.exe
+    let sys = find_child_ci(candidate, "System");
+    if find_child_ci(&sys, "splintercell3.exe").is_file()
+        || find_child_ci(&sys, "splintercell3.exe.bak").is_file()
+    {
+        return Some(candidate.to_path_buf());
+    }
+
+    // 2. Check if candidate itself is the "System" directory
+    if candidate
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        == Some("system".to_string())
+        && (find_child_ci(candidate, "splintercell3.exe").is_file()
+            || find_child_ci(candidate, "splintercell3.exe.bak").is_file())
+        && let Some(parent) = candidate.parent()
+    {
+        return Some(parent.to_path_buf());
+    }
+
+    // 3. Check if candidate contains splintercell3.exe directly
+    if find_child_ci(candidate, "splintercell3.exe").is_file()
+        || find_child_ci(candidate, "splintercell3.exe.bak").is_file()
+    {
+        if let Some(parent) = candidate.parent() {
+            if parent
+                .file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                == Some("system".to_string())
+                && let Some(grandparent) = parent.parent()
+            {
+                return Some(grandparent.to_path_buf());
+            }
+            return Some(parent.to_path_buf());
+        }
+        return Some(candidate.to_path_buf());
+    }
+
+    None
+}
+
+/// Auto-detect common Splinter Cell Chaos Theory installation locations:
+/// - Current working directory and parent directories
+/// - Running executable directory and parent directories
+/// - `<disk>\Program Files (x86)\Steam\steamapps\common\Splintercell Chaos Theory`
+/// - `<disk>\SteamLibrary\steamapps\common\Splintercell Chaos Theory`
+///
+/// Returns all detected valid game root paths (deduplicated).
+pub fn auto_detect_game_roots() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1. Current working directory and immediate neighborhood
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.clone());
+        if let Some(parent) = cwd.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+        candidates.push(cwd.join("scct_game_files").join("Tom Clancy's Splinter Cell Chaos Theory"));
+        candidates.push(cwd.join("clean_scct_files").join("Tom Clancy's Splinter Cell Chaos Theory"));
+    }
+
+    // 2. Running executable directory and parent
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.to_path_buf());
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.to_path_buf());
+        }
+    }
+
+    // Folder naming variations across Steam, Uplay, and retail
+    let game_folder_names = [
+        "Splintercell Chaos Theory",
+        "Tom Clancy's Splinter Cell Chaos Theory",
+        "Splinter Cell Chaos Theory",
+        "Splinter Cell 3",
+        "SCCT",
+    ];
+
+    // 3. Scan all Windows drive letters (C through Z)
+    for drive in b'C'..=b'Z' {
+        let letter = drive as char;
+        let drive_prefixes = [
+            format!(r"{}:\Program Files (x86)\Steam\steamapps\common", letter),
+            format!(r"{}:\Program Files\Steam\steamapps\common", letter),
+            format!(r"{}:\SteamLibrary\steamapps\common", letter),
+            format!(r"{}:\Steam\steamapps\common", letter),
+            format!(r"{}:\Games\Steam\steamapps\common", letter),
+            format!(r"{}:\Games\SteamLibrary\steamapps\common", letter),
+            format!(r"{}:\Games", letter),
+            format!(r"{}:\", letter),
+        ];
+        for prefix in &drive_prefixes {
+            for folder in &game_folder_names {
+                candidates.push(PathBuf::from(format!(r"{}\{}", prefix, folder)));
+            }
+        }
+    }
+
+    // 4. Linux Steam and Wine / Proton paths
+    if let Ok(home) = std::env::var("HOME") {
+        let linux_prefixes = [
+            format!("{}/.local/share/Steam/steamapps/common", home),
+            format!("{}/.steam/steam/steamapps/common", home),
+            format!("{}/.steam/root/steamapps/common", home),
+            format!("{}/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common", home),
+            format!("{}/.wine/drive_c/Program Files (x86)/Steam/steamapps/common", home),
+            format!("{}/.wine/drive_c/SteamLibrary/steamapps/common", home),
+        ];
+        for prefix in &linux_prefixes {
+            for folder in &game_folder_names {
+                candidates.push(PathBuf::from(format!("{}/{}", prefix, folder)));
+            }
+        }
+    }
+
+    let mut detected: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for candidate in candidates {
+        if let Some(valid) = validate_game_root(&candidate) {
+            let key = valid
+                .canonicalize()
+                .unwrap_or_else(|_| valid.clone())
+                .to_string_lossy()
+                .to_lowercase();
+            if seen.insert(key) {
+                detected.push(valid);
+            }
+        }
+    }
+
+    detected
+}
+
 pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
     if let Some(arg) = explicit_arg {
+        if let Some(valid) = validate_game_root(arg) {
+            scct_log!("  [INIT] Using specified game root: {}", valid.display());
+            return Ok(valid);
+        }
         let abs = if arg.is_absolute() {
             arg.to_path_buf()
         } else {
             std::env::current_dir()?.join(arg)
         };
-
-        if abs.join("splintercell3.exe").is_file() || abs.join("splintercell3.exe.bak").is_file() {
-            let root = abs.parent().unwrap_or(&abs).to_path_buf();
-            scct_log!(
-                "  [INIT] Detected splintercell3.exe in specified folder: {}",
-                abs.display()
-            );
-            scct_log!("  [INIT] Using game root: {}", root.display());
-            return Ok(root);
+        if let Some(valid) = validate_game_root(&abs) {
+            scct_log!("  [INIT] Using specified game root: {}", valid.display());
+            return Ok(valid);
         }
-
-        let sys_exe = find_child_ci(&find_child_ci(&abs, "System"), "splintercell3.exe");
-        if sys_exe.is_file() {
-            scct_log!("  [INIT] Using game root: {}", abs.display());
-            return Ok(abs);
-        }
-
-        scct_log!(
-            "  [INIT] Using specified path as game root: {}",
-            abs.display()
-        );
+        scct_log!("  [INIT] Using specified path as game root: {}", abs.display());
         return Ok(abs);
     }
 
-    // Check current working directory first (User requirement: check current folder for splintercell3.exe)
+    let detected = auto_detect_game_roots();
+    if let Some(first) = detected.first() {
+        scct_log!("  [INIT] Auto-detected game root: {}", first.display());
+        return Ok(first.clone());
+    }
+
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
-    if cwd.join("splintercell3.exe").is_file() || cwd.join("splintercell3.exe.bak").is_file() {
-        let root = cwd.parent().unwrap_or(&cwd).to_path_buf();
-        scct_log!(
-            "  [INIT] Detected splintercell3.exe in current folder: {}",
-            cwd.display()
-        );
-        scct_log!("  [INIT] Using game root: {}", root.display());
-        return Ok(root);
-    }
-
-    let cwd_sys = find_child_ci(&cwd, "System");
-    let cwd_sys_exe = find_child_ci(&cwd_sys, "splintercell3.exe");
-    if cwd_sys_exe.is_file() {
-        scct_log!(
-            "  [INIT] Detected System/splintercell3.exe in current folder: {}",
-            cwd.display()
-        );
-        return Ok(cwd);
-    }
-
-    // Check directory of our running executable
-    if let Some(bin_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        if bin_dir.join("splintercell3.exe").is_file()
-            || bin_dir.join("splintercell3.exe.bak").is_file()
-        {
-            let root = bin_dir.parent().unwrap_or(&bin_dir).to_path_buf();
-            scct_log!(
-                "  [INIT] Detected splintercell3.exe next to patcher: {}",
-                bin_dir.display()
-            );
-            scct_log!("  [INIT] Using game root: {}", root.display());
-            return Ok(root);
-        }
-        let bin_sys = find_child_ci(&bin_dir, "System");
-        if find_child_ci(&bin_sys, "splintercell3.exe").is_file() {
-            scct_log!(
-                "  [INIT] Detected System/splintercell3.exe near patcher: {}",
-                bin_dir.display()
-            );
-            return Ok(bin_dir);
-        }
-    }
-
-    // Default fallback to cwd
     Ok(cwd)
 }
 
@@ -254,7 +337,106 @@ pub fn ensure_clean_sp_maps_and_cleanup(
     Ok(())
 }
 
+pub fn compute_md5(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:032x}", hasher.finalize()))
+}
+
+pub const CLEAN_FILE_MD5: &[(&str, &str)] = &[
+    ("System/splintercell3.exe", "46cd0fed7c83269e516767de9f809e76"),
+    ("System/dynamic-pc.umd", "22e79861cc0750f4353d5e8821b2cb1e"),
+    ("Data/Maps/01_Lighthouse.scl", "0ad2d1ac79dbc2e9a5b042b2e23c45e5"),
+    ("Data/Maps/02_CargoShip.scl", "9eb92254487752e6428cec4d91c0a012"),
+    ("Data/Maps/03_Bank.scl", "e0f3e9f5e7060ff6428c7e83c75db999"),
+    ("Data/Maps/04_Penthouse.scl", "d251b6a1941bf29600fa2abee752f8c1"),
+    ("Data/Maps/05_Displace01.scl", "17bb9cef08fad2ac4e21acb2ae90a544"),
+    ("Data/Maps/06_Hokkaido.scl", "5865518ed3f53d57c86cbefe4cbc668c"),
+    ("Data/Maps/07_Battery.scl", "1c71002e9577320faa4b29a8ea3cc0a0"),
+    ("Data/Maps/08_SeoulOne.scl", "99b1771374249d0c8ff578af46743b5a"),
+    ("Data/Maps/09_SeoulTwo.scl", "660a2affa72a68b2142c1a977f8f05d5"),
+    ("Data/Maps/10_Bathhouse.scl", "ee6a6fc91d6ced6f3bdc31750db95d07"),
+    ("Data/Maps/11_KokuboSosho.scl", "13f7914729ca64279d036c45a046d950"),
+];
+
+pub fn verify_clean_files(game_root: &Path) -> Result<()> {
+    for &(rel_path, expected_md5) in CLEAN_FILE_MD5 {
+        let parts: Vec<&str> = rel_path.split('/').collect();
+        let mut curr = game_root.to_path_buf();
+        for part in parts {
+            curr = find_child_ci(&curr, part);
+        }
+
+        // Check file or its .bak
+        let file_to_check = if curr.is_file() {
+            let bak = curr.with_extension(format!(
+                "{}.bak",
+                curr.extension().and_then(|s| s.to_str()).unwrap_or("")
+            ));
+            if bak.is_file() {
+                bak
+            } else {
+                curr
+            }
+        } else {
+            let bak = curr.with_extension(format!(
+                "{}.bak",
+                curr.extension().and_then(|s| s.to_str()).unwrap_or("")
+            ));
+            if bak.is_file() {
+                bak
+            } else {
+                curr
+            }
+        };
+
+        if !file_to_check.is_file() {
+            bail!(
+                "Missing required game file: {}.\nPlease ensure you are using an official / Steam installation of Splinter Cell Chaos Theory.",
+                file_to_check.display()
+            );
+        }
+
+        let actual_md5 = compute_md5(&file_to_check)?;
+        if actual_md5 != expected_md5 {
+            let bak = file_to_check.with_extension(format!(
+                "{}.bak",
+                file_to_check
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+            ));
+            let bak_ok = if bak.is_file() {
+                compute_md5(&bak).map(|h| h == expected_md5).unwrap_or(false)
+            } else {
+                false
+            };
+
+            if !bak_ok {
+                bail!(
+                    "MD5 checksum verification failed for {}:\nExpected official / Steam clean version: {}\nFound: {}\nPlease ensure you have an official or Steam installation of Splinter Cell Chaos Theory.",
+                    rel_path,
+                    expected_md5,
+                    actual_md5
+                );
+            }
+        }
+    }
+    scct_log!("  [MD5] Verified all required game files match official Steam version");
+    Ok(())
+}
+
 pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
+    verify_clean_files(game_root)?;
+
     let system_dir = find_child_ci(game_root, "System");
     let data_dir = find_child_ci(game_root, "Data");
     let maps_dir = find_child_ci(&data_dir, "Maps");
@@ -270,14 +452,16 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
 
-    scct_log!("\n=== Step 1: Multi-NIC LAN Coop Networking Fix (`splintercell3.exe`) ===");
+    scct_log!("\n=== Step 1: Multi-NIC LAN & Online Coop Networking Fix (`splintercell3.exe`) ===");
     if skip_net_fix {
         if exe_bak_path.exists() {
             std::fs::copy(&exe_bak_path, &exe_path)?;
         }
         scct_log!("  [SKIP] Skipped EXE networking fix (--no-net-fix)");
     } else {
-        apply_lan_networking_fix(&exe_path, &exe_bak_path)?;
+        let ini_path = system_dir.join("direct_ip.ini");
+        let target_ip = load_direct_ip_ini(&ini_path);
+        apply_online_coop_fix(&exe_path, &exe_bak_path, target_ip)?;
     }
 
     scct_log!("\n=== Step 2: Patching `System/dynamic-pc.umd` (Coop Dropdown + Localization) ===");
@@ -436,4 +620,38 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
 
     scct_log!("\nVanilla SCCT restoration complete!");
     Ok(())
+}
+
+pub fn apply_online_patch(game_root: &Path, target_ip: Option<Ipv4Addr>) -> Result<()> {
+    let system_dir = find_child_ci(game_root, "System");
+    let exe_path = find_child_ci(&system_dir, "splintercell3.exe");
+    let exe_bak_path = system_dir.join("splintercell3.exe.bak");
+    let ini_path = system_dir.join("direct_ip.ini");
+
+    apply_online_coop_fix(&exe_path, &exe_bak_path, target_ip)?;
+    save_direct_ip_ini(&ini_path, target_ip)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_clean_files_on_clean_dir() {
+        let clean_path = Path::new("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
+        if clean_path.exists() {
+            let res = verify_clean_files(clean_path);
+            assert!(res.is_ok(), "Clean files verification failed: {:?}", res.err());
+        }
+    }
+
+    #[test]
+    fn test_validate_game_root() {
+        let clean_path = Path::new("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
+        if clean_path.exists() {
+            assert!(validate_game_root(clean_path).is_some());
+            assert!(validate_game_root(&clean_path.join("System")).is_some());
+        }
+    }
 }

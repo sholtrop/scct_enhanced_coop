@@ -7,6 +7,7 @@ mod net;
 mod patcher;
 mod umd;
 mod upk;
+mod upnp;
 
 use anyhow::Result;
 use clap::Parser;
