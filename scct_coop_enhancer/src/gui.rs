@@ -1146,6 +1146,19 @@ pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
         setup.instance_descriptor.flags |=
             eframe::wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
         setup.power_preference = eframe::wgpu::PowerPreference::None;
+
+        // Ensure device creation uses limits supported by software rasterizers and low-spec adapters
+        setup.device_descriptor = std::sync::Arc::new(|adapter| {
+            let base_limits = eframe::wgpu::Limits::downlevel_webgl2_defaults()
+                .using_resolution(adapter.limits());
+            eframe::wgpu::DeviceDescriptor {
+                label: Some("scct_enhancer_device"),
+                required_features: eframe::wgpu::Features::default(),
+                required_limits: base_limits,
+                memory_hints: eframe::wgpu::MemoryHints::default(),
+            }
+        });
+
         setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
             // 1. Try finding a hardware GPU (discrete or integrated) compatible with surface
             if let Some(surface) = surface
@@ -1177,7 +1190,13 @@ pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
                 return Ok(adapter.clone());
             }
 
-            Err("No graphics adapter (hardware or CPU fallback) found on this machine".to_string())
+            let err_msg = if adapters.is_empty() {
+                "No graphics adapters found. DirectX 12 / WARP or GPU drivers may be missing.".to_string()
+            } else {
+                let names = adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", ");
+                format!("Found adapters [{names}], but none are compatible with this window.")
+            };
+            Err(err_msg)
         }));
     }
 
