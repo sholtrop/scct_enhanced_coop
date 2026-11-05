@@ -1,0 +1,122 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: patch_sp_levels.exe
+            asset_name: patch_sp_levels-windows-amd64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: patch_sp_levels
+            asset_name: patch_sp_levels-linux-amd64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            CARGO_PATH="Cargo.toml"
+          else
+            CARGO_PATH="public/Cargo.toml"
+          fi
+          cargo build --release --target ${{ matrix.target }} --manifest-path "$CARGO_PATH"
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p release_assets
+          if [ -d "target/${{ matrix.target }}/release" ]; then
+            TARGET_DIR="target/${{ matrix.target }}/release"
+          else
+            TARGET_DIR="public/target/${{ matrix.target }}/release"
+          fi
+          SRC="$TARGET_DIR/${{ matrix.artifact_name }}"
+          cp "$SRC" "release_assets/${{ matrix.asset_name }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "$SRC" "release_assets/${{ matrix.artifact_name }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset_name }}
+          path: release_assets/*
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract semver from Cargo.toml
+        id: get_version
+        run: |
+          if [ -f "Cargo.toml" ]; then
+            CARGO_FILE="Cargo.toml"
+          else
+            CARGO_FILE="public/Cargo.toml"
+          fi
+          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$CARGO_FILE" | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "Failed to extract version from $CARGO_FILE"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release tag will be: $VERSION"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ steps.get_version.outputs.VERSION }}
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          files: release_assets/*
+          body: |
+            ### Splinter Cell: Chaos Theory — Coop Campaign Mod
+            Automated release build for version `${{ steps.get_version.outputs.VERSION }}`.
+
+            #### Downloads:
+            - **Windows**: `patch_sp_levels.exe` (or `patch_sp_levels-windows-amd64.exe`)
+            - **Linux**: `patch_sp_levels-linux-amd64`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
