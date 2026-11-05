@@ -2767,7 +2767,7 @@ dependencies = [
 
 [[package]]
 name = "scct_coop_enhancer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

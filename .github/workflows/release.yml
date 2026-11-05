@@ -172,7 +172,6 @@ jobs:
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${OWNER}/scct_coop_server"
-          IMAGE_ALT="ghcr.io/${OWNER}/scct-coop-server"
           VERSION="${{ steps.get_server_version.outputs.VERSION }}"
           ROOT_DIR="${{ steps.get_server_version.outputs.ROOT_DIR }}"
 
@@ -182,11 +181,7 @@ jobs:
             -f "${ROOT_DIR}/scct_coop_server/Dockerfile" \
             -t "${IMAGE}:${VERSION}" \
             -t "${IMAGE}:latest" \
-            -t "${IMAGE_ALT}:${VERSION}" \
-            -t "${IMAGE_ALT}:latest" \
             "${ROOT_DIR}"
 
           docker push "${IMAGE}:${VERSION}"
           docker push "${IMAGE}:latest"
-          docker push "${IMAGE_ALT}:${VERSION}"
-          docker push "${IMAGE_ALT}:latest"
