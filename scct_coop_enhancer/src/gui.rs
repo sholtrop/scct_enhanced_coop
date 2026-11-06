@@ -14,6 +14,81 @@ enum InstallState {
     Failed,
 }
 
+pub struct KeepaliveHandle {
+    stop_tx: Sender<()>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for KeepaliveHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeepaliveHandle").finish_non_exhaustive()
+    }
+}
+
+impl KeepaliveHandle {
+    pub fn stop_and_wait(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for KeepaliveHandle {
+    fn drop(&mut self) {
+        self.stop_and_wait();
+    }
+}
+
+fn drain_nonblocking_udp(sock: &std::net::UdpSocket) {
+    let mut scratch = [0u8; 256];
+    loop {
+        match sock.recv_from(&mut scratch) {
+            Ok(_) => continue,
+            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+fn spawn_punch_keepalive(
+    sock_disco: std::net::UdpSocket,
+    sock_game: std::net::UdpSocket,
+    peer_disco: std::net::SocketAddr,
+    peer_game: std::net::SocketAddr,
+) -> KeepaliveHandle {
+    let (stop_tx, stop_rx) = channel();
+    let join_handle = thread::spawn(move || {
+        let _ = sock_disco.set_nonblocking(true);
+        let _ = sock_game.set_nonblocking(true);
+        let payload = b"SCCT_PUNCH_V1";
+        loop {
+            drain_nonblocking_udp(&sock_disco);
+            drain_nonblocking_udp(&sock_game);
+
+            match stop_rx.recv_timeout(Duration::from_secs(2)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = sock_disco.send_to(payload, peer_disco);
+                    let _ = sock_game.send_to(payload, peer_game);
+                }
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = sock_disco.send_to(payload, peer_disco);
+                    let _ = sock_game.send_to(payload, peer_game);
+                    drain_nonblocking_udp(&sock_disco);
+                    drain_nonblocking_udp(&sock_game);
+                    drop(sock_disco);
+                    drop(sock_game);
+                    break;
+                }
+            }
+        }
+    });
+    KeepaliveHandle {
+        stop_tx,
+        join_handle: Some(join_handle),
+    }
+}
+
 #[derive(Debug)]
 pub enum MatchState {
     Idle,
@@ -29,6 +104,8 @@ pub enum MatchState {
         code: String,
         is_host: bool,
         peer_ip: Ipv4Addr,
+        peer_disco_port: u16,
+        peer_game_port: u16,
         game_launched: bool,
     },
     Failed {
@@ -46,6 +123,9 @@ pub enum GuiEvent {
         code: String,
         is_host: bool,
         peer_ip: Ipv4Addr,
+        peer_disco_port: u16,
+        peer_game_port: u16,
+        keepalive: Option<KeepaliveHandle>,
     },
     MatchFailed(String),
 }
@@ -65,6 +145,7 @@ pub struct PatcherApp {
     match_state: MatchState,
     guest_code_input: String,
     cancel_tx: Option<Sender<()>>,
+    keepalive: Option<KeepaliveHandle>,
 
     // Advanced Server Settings
     server_host: String,
@@ -89,6 +170,7 @@ impl PatcherApp {
             match_state: MatchState::Idle,
             guest_code_input: String::new(),
             cancel_tx: None,
+            keepalive: None,
             server_host: crate::stun::DEFAULT_SERVER_HOST.to_string(),
             stun_port: crate::stun::DEFAULT_STUN_PORT,
             api_port: crate::stun::DEFAULT_API_PORT,
@@ -159,10 +241,17 @@ impl PatcherApp {
         }
     }
 
+    fn stop_keepalive(&mut self) {
+        if let Some(mut ka) = self.keepalive.take() {
+            ka.stop_and_wait();
+        }
+    }
+
     fn cancel_matching(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());
         }
+        self.stop_keepalive();
         self.match_state = MatchState::Idle;
     }
 
@@ -213,83 +302,32 @@ impl PatcherApp {
     }
 
     fn launch_match_game(&mut self, ctx: &egui::Context) {
-        if let MatchState::Matched {
-            code: _,
-            is_host,
-            peer_ip,
-            ref mut game_launched,
-        } = self.match_state
-        {
-            if *game_launched {
-                self.log_lines
-                    .push("  [LAUNCH] Game already running for this session!".to_string());
-                return;
-            }
-
-            let Some(ref root) = self.resolved_root else {
-                self.log_lines
-                    .push("  [LAUNCH] ERROR: Game folder not selected!".to_string());
-                return;
+        let (is_host, peer_ip, peer_disco_port, peer_game_port, already_launched) =
+            match self.match_state {
+                MatchState::Matched {
+                    is_host,
+                    peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    game_launched,
+                    ..
+                } => (is_host, peer_ip, peer_disco_port, peer_game_port, game_launched),
+                _ => return,
             };
 
-            let sys_dir = crate::patcher::find_child_ci(root, "System");
-            let exe_path = crate::patcher::find_child_ci(&sys_dir, "splintercell3.exe");
-            if !exe_path.exists() {
-                self.log_lines.push(format!(
-                    "  [LAUNCH] ERROR: Executable not found at {}",
-                    exe_path.display()
-                ));
-                return;
-            }
-
-            let ini_path = sys_dir.join("direct_ip.ini");
-            let _ = crate::net::save_direct_ip_ini(&ini_path, Some(peer_ip));
-            let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
-            let _ = crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, Some(peer_ip));
-
-            match crate::launcher::launch_game(
-                &exe_path,
-                root,
-                Some(peer_ip),
-            ) {
-                Ok(pid) => {
-                    *game_launched = true;
-                    self.log_lines.push(format!(
-                        ">>> Chaos Theory Coop launched successfully (PID: {})!",
-                        pid
-                    ));
-                    self.log_lines.push(
-                        ">>> Connected directly to your friend!".to_string(),
-                    );
-                    if is_host {
-                        self.log_lines.push(
-                            ">>> [HOST]: In game, select Coop -> LAN -> Host Game to create your match."
-                                .to_string(),
-                        );
-                    } else {
-                        self.log_lines.push(
-                            ">>> [GUEST]: In game, select Coop -> LAN to find and join your friend's game."
-                                .to_string(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    self.log_lines
-                        .push(format!(">>> [LAUNCH ERROR] Failed to launch game: {:#}", e));
-                }
-            }
-            ctx.request_repaint();
+        if already_launched {
+            self.log_lines
+                .push("  [LAUNCH] Game already running for this session!".to_string());
+            return;
         }
-    }
 
-    fn launch_direct_game(&mut self, ctx: &egui::Context) {
-        let Some(ref root) = self.resolved_root else {
+        let Some(root) = self.resolved_root.clone() else {
             self.log_lines
                 .push("  [LAUNCH] ERROR: Game folder not selected!".to_string());
             return;
         };
 
-        let sys_dir = crate::patcher::find_child_ci(root, "System");
+        let sys_dir = crate::patcher::find_child_ci(&root, "System");
         let exe_path = crate::patcher::find_child_ci(&sys_dir, "splintercell3.exe");
         if !exe_path.exists() {
             self.log_lines.push(format!(
@@ -299,12 +337,110 @@ impl PatcherApp {
             return;
         }
 
+        self.stop_keepalive();
+
+        let ini_path = sys_dir.join("direct_ip.ini");
+        let _ = crate::net::save_direct_target_ini(
+            &ini_path,
+            Some(peer_ip),
+            peer_disco_port,
+            peer_game_port,
+        );
+        let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
+        if let Err(e) = crate::net::update_direct_target_in_exe(
+            &exe_path,
+            &exe_bak_path,
+            Some(peer_ip),
+            peer_disco_port,
+            peer_game_port,
+        ) {
+            self.log_lines.push(format!(
+                ">>> [LAUNCH ERROR] Could not prepare game executable (make sure Chaos Theory is closed first): {:#}",
+                e
+            ));
+            ctx.request_repaint();
+            return;
+        }
+
+        match crate::launcher::launch_game(
+            &exe_path,
+            &root,
+            Some(peer_ip),
+            peer_disco_port,
+            peer_game_port,
+        ) {
+            Ok(pid) => {
+                if let MatchState::Matched {
+                    ref mut game_launched,
+                    ..
+                } = self.match_state
+                {
+                    *game_launched = true;
+                }
+                self.log_lines.push(format!(
+                    ">>> Chaos Theory Coop launched successfully (PID: {})!",
+                    pid
+                ));
+                self.log_lines
+                    .push(">>> Connected directly to your friend!".to_string());
+                if is_host {
+                    self.log_lines.push(
+                        ">>> [HOST]: In game, select Coop -> LAN -> Host Game to create your match."
+                            .to_string(),
+                    );
+                } else {
+                    self.log_lines.push(
+                        ">>> [GUEST]: In game, select Coop -> LAN to find and join your friend's game."
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                self.log_lines
+                    .push(format!(">>> [LAUNCH ERROR] Failed to launch game: {:#}", e));
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn launch_direct_game(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.resolved_root.clone() else {
+            self.log_lines
+                .push("  [LAUNCH] ERROR: Game folder not selected!".to_string());
+            return;
+        };
+
+        let sys_dir = crate::patcher::find_child_ci(&root, "System");
+        let exe_path = crate::patcher::find_child_ci(&sys_dir, "splintercell3.exe");
+        if !exe_path.exists() {
+            self.log_lines.push(format!(
+                "  [LAUNCH] ERROR: Executable not found at {}",
+                exe_path.display()
+            ));
+            return;
+        }
+
+        self.stop_keepalive();
+
         let ini_path = sys_dir.join("direct_ip.ini");
         let _ = crate::net::save_direct_ip_ini(&ini_path, None);
         let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
-        let _ = crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None);
+        if let Err(e) = crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None) {
+            self.log_lines.push(format!(
+                ">>> [LAUNCH ERROR] Could not prepare game executable (make sure Chaos Theory is closed first): {:#}",
+                e
+            ));
+            ctx.request_repaint();
+            return;
+        }
 
-        match crate::launcher::launch_game(&exe_path, root, None) {
+        match crate::launcher::launch_game(
+            &exe_path,
+            &root,
+            None,
+            crate::net::DISCOVERY_PORT,
+            crate::net::GAME_PORT,
+        ) {
             Ok(pid) => {
                 self.log_lines.push(format!(
                     ">>> Chaos Theory launched (PID: {}) in standard LAN mode!",
@@ -375,15 +511,30 @@ impl eframe::App for PatcherApp {
                     code,
                     is_host,
                     peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    mut keepalive,
                 } => {
-                    self.match_state = MatchState::Matched {
-                        code,
-                        is_host,
-                        peer_ip,
-                        game_launched: false,
-                    };
+                    if matches!(
+                        self.match_state,
+                        MatchState::Hosting { .. } | MatchState::Joining { .. }
+                    ) {
+                        self.stop_keepalive();
+                        self.keepalive = keepalive;
+                        self.match_state = MatchState::Matched {
+                            code,
+                            is_host,
+                            peer_ip,
+                            peer_disco_port,
+                            peer_game_port,
+                            game_launched: false,
+                        };
+                    } else if let Some(ref mut ka) = keepalive {
+                        ka.stop_and_wait();
+                    }
                 }
                 GuiEvent::MatchFailed(error) => {
+                    self.stop_keepalive();
                     self.match_state = MatchState::Failed { error };
                 }
             }
@@ -1102,7 +1253,7 @@ fn run_host_match(
     ctx.request_repaint();
 
     // 2. Discover STUN public endpoints
-    let disco_ext = match crate::stun::stun_query(&sock_disco, &server_host, stun_port) {
+    let mut disco_ext = match crate::stun::stun_query(&sock_disco, &server_host, stun_port) {
         Ok(addr) => addr,
         Err(e) => {
             let _ = tx.send(GuiEvent::MatchFailed(format!("Connection failed: {:#}", e)));
@@ -1111,7 +1262,7 @@ fn run_host_match(
         }
     };
 
-    let game_ext = match crate::stun::stun_query(&sock_game, &server_host, stun_port) {
+    let mut game_ext = match crate::stun::stun_query(&sock_game, &server_host, stun_port) {
         Ok(addr) => addr,
         Err(e) => {
             let _ = tx.send(GuiEvent::MatchFailed(format!(
@@ -1134,7 +1285,7 @@ fn run_host_match(
         .ok()
         .and_then(|mut a| a.next())
         .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip = crate::ip::get_local_ip_to(target_sa);
+    let my_local_ip = crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
 
     let code = match crate::stun::register_with_server(
         &server_host,
@@ -1163,6 +1314,7 @@ fn run_host_match(
     ctx.request_repaint();
 
     // 4. Poll for guest connection
+    let mut wait_ticks: u32 = 0;
     loop {
         if cancel_rx.try_recv().is_ok() {
             let _ = tx.send(GuiEvent::Log("  [HOST] Hosting session cancelled.".to_string()));
@@ -1188,34 +1340,25 @@ fn run_host_match(
                 ));
                 ctx.request_repaint();
 
-                // Simultaneous UDP hole punch
-                crate::stun::punch_udp_holes(&sock_disco, &sock_game, peer_disco, peer_game);
-
-                // DROP SOCKETS IMMEDIATELY so ports 9100 and 9103 are released for splintercell3.exe!
-                drop(sock_disco);
-                drop(sock_game);
-
-                // If peer shares identical public IP (both behind same router), connect via LAN IP
-                let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
-                let peer_ip = if is_same_public_ip && let Some(local_ip) = peer_local_ip {
-                    let _ = tx.send(GuiEvent::Log(
-                        "  [HOST] Detected friend on the same local network (LAN)!".to_string(),
-                    ));
-                    local_ip
-                } else {
-                    let _ = tx.send(GuiEvent::Log(
-                        "  [HOST] Connecting to friend across the Internet...".to_string(),
-                    ));
-                    match peer_disco.ip() {
-                        std::net::IpAddr::V4(v4) => v4,
-                        _ => Ipv4Addr::new(127, 0, 0, 1),
-                    }
-                };
+                let (peer_ip, peer_disco_port, peer_game_port, keepalive) = resolve_peer_connection(
+                    "HOST",
+                    &tx,
+                    sock_disco,
+                    sock_game,
+                    disco_ext,
+                    my_local_ip,
+                    peer_disco,
+                    peer_game,
+                    peer_local_ip,
+                );
 
                 let _ = tx.send(GuiEvent::Matched {
                     code,
                     is_host: true,
                     peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    keepalive,
                 });
                 let _ = tx.send(GuiEvent::Log(
                     "  [HOST] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
@@ -1224,7 +1367,25 @@ fn run_host_match(
                 return;
             }
             Ok(None) => {
-                // still waiting
+                wait_ticks = wait_ticks.wrapping_add(1);
+                if wait_ticks.is_multiple_of(10)
+                    && let (Ok(new_disco), Ok(new_game)) = (
+                        crate::stun::stun_query(&sock_disco, &server_host, stun_port),
+                        crate::stun::stun_query(&sock_game, &server_host, stun_port),
+                    )
+                    && (new_disco != disco_ext || new_game != game_ext)
+                {
+                    disco_ext = new_disco;
+                    game_ext = new_game;
+                    let _ = crate::stun::register_with_server(
+                        &server_host,
+                        api_port,
+                        Some(code.clone()),
+                        disco_ext,
+                        game_ext,
+                        my_local_ip,
+                    );
+                }
             }
             Err(e) => {
                 let _ = tx.send(GuiEvent::MatchFailed(format!(
@@ -1236,6 +1397,79 @@ fn run_host_match(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_peer_connection(
+    role_tag: &str,
+    tx: &Sender<GuiEvent>,
+    sock_disco: std::net::UdpSocket,
+    sock_game: std::net::UdpSocket,
+    disco_ext: std::net::SocketAddr,
+    my_local_ip: Option<Ipv4Addr>,
+    peer_disco: std::net::SocketAddr,
+    peer_game: std::net::SocketAddr,
+    peer_local_ip: Option<Ipv4Addr>,
+) -> (Ipv4Addr, u16, u16, Option<KeepaliveHandle>) {
+    // Simultaneous UDP hole punch
+    crate::stun::punch_udp_holes(&sock_disco, &sock_game, peer_disco, peer_game);
+
+    // If peer shares identical public IP (both behind same router), connect via LAN IP
+    let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
+    if is_same_public_ip {
+        let mut resolved_lan = None;
+        if let Some(target_local) = peer_local_ip {
+            if let Some(my_lan) = my_local_ip
+                && crate::ip::is_same_subnet(my_lan, target_local)
+            {
+                resolved_lan = Some(target_local);
+            }
+            if resolved_lan.is_none()
+                && crate::ip::find_matching_subnet_ip(target_local).is_some()
+            {
+                resolved_lan = Some(target_local);
+            }
+        }
+
+        if let Some(lan_ip) = resolved_lan {
+            drop(sock_disco);
+            drop(sock_game);
+            let _ = tx.send(GuiEvent::Log(format!(
+                "  [{}] Detected friend on the same local network (LAN)!",
+                role_tag
+            )));
+            return (
+                lan_ip,
+                crate::net::DISCOVERY_PORT,
+                crate::net::GAME_PORT,
+                None,
+            );
+        } else if let Some(target_local) = peer_local_ip {
+            drop(sock_disco);
+            drop(sock_game);
+            let _ = tx.send(GuiEvent::Log(format!(
+                "  [{}] Friend detected behind same router! Connecting via direct network...",
+                role_tag
+            )));
+            return (
+                target_local,
+                crate::net::DISCOVERY_PORT,
+                crate::net::GAME_PORT,
+                None,
+            );
+        }
+    }
+
+    let _ = tx.send(GuiEvent::Log(format!(
+        "  [{}] Connecting to friend across the Internet...",
+        role_tag
+    )));
+    let ip = match peer_disco.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        _ => Ipv4Addr::new(127, 0, 0, 1),
+    };
+    let keepalive = spawn_punch_keepalive(sock_disco, sock_game, peer_disco, peer_game);
+    (ip, peer_disco.port(), peer_game.port(), Some(keepalive))
 }
 
 fn run_join_match(
@@ -1324,7 +1558,7 @@ fn run_join_match(
         .ok()
         .and_then(|mut a| a.next())
         .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip = crate::ip::get_local_ip_to(target_sa);
+    let my_local_ip = crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
 
     // 3. Connect via rendezvous server
     let (peer_disco, peer_game, peer_local_ip) = match crate::stun::join_with_server(
@@ -1354,33 +1588,26 @@ fn run_join_match(
     ));
     ctx.request_repaint();
 
-    // 4. Simultaneous UDP hole punch
-    crate::stun::punch_udp_holes(&sock_disco, &sock_game, peer_disco, peer_game);
-
-    // DROP SOCKETS IMMEDIATELY so ports 9100 and 9103 are released for splintercell3.exe!
-    drop(sock_disco);
-    drop(sock_game);
-
-    let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
-    let peer_ip = if is_same_public_ip && let Some(local_ip) = peer_local_ip {
-        let _ = tx.send(GuiEvent::Log(
-            "  [JOIN] Detected friend on the same local network (LAN)!".to_string(),
-        ));
-        local_ip
-    } else {
-        let _ = tx.send(GuiEvent::Log(
-            "  [JOIN] Connecting to friend across the Internet...".to_string(),
-        ));
-        match peer_disco.ip() {
-            std::net::IpAddr::V4(v4) => v4,
-            _ => Ipv4Addr::new(127, 0, 0, 1),
-        }
-    };
+    // 4. Simultaneous UDP hole punch + keepalive handoff
+    let (peer_ip, peer_disco_port, peer_game_port, keepalive) = resolve_peer_connection(
+        "JOIN",
+        &tx,
+        sock_disco,
+        sock_game,
+        disco_ext,
+        my_local_ip,
+        peer_disco,
+        peer_game,
+        peer_local_ip,
+    );
 
     let _ = tx.send(GuiEvent::Matched {
         code: target_code,
         is_host: false,
         peer_ip,
+        peer_disco_port,
+        peer_game_port,
+        keepalive,
     });
     let _ = tx.send(GuiEvent::Log(
         "  [JOIN] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
@@ -1389,72 +1616,12 @@ fn run_join_match(
 }
 
 pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
-    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = wgpu_options.wgpu_setup {
-        setup.instance_descriptor.backends = eframe::wgpu::Backends::all();
-        setup.instance_descriptor.flags |=
-            eframe::wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER;
-        setup.power_preference = eframe::wgpu::PowerPreference::None;
-
-        // Ensure device creation uses limits supported by software rasterizers and low-spec adapters
-        setup.device_descriptor = std::sync::Arc::new(|adapter| {
-            let base_limits = eframe::wgpu::Limits::downlevel_webgl2_defaults()
-                .using_resolution(adapter.limits());
-            eframe::wgpu::DeviceDescriptor {
-                label: Some("scct_enhancer_device"),
-                required_features: eframe::wgpu::Features::default(),
-                required_limits: base_limits,
-                memory_hints: eframe::wgpu::MemoryHints::default(),
-            }
-        });
-
-        setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
-            // 1. Try finding a hardware GPU (discrete or integrated) compatible with surface
-            if let Some(surface) = surface
-                && let Some(adapter) = adapters.iter().find(|a| {
-                    a.get_info().device_type != eframe::wgpu::DeviceType::Cpu
-                        && a.is_surface_supported(surface)
-                })
-            {
-                return Ok(adapter.clone());
-            }
-
-            // 2. Try any adapter compatible with surface (including CPU / WARP / llvmpipe)
-            if let Some(surface) = surface
-                && let Some(adapter) = adapters.iter().find(|a| a.is_surface_supported(surface))
-            {
-                return Ok(adapter.clone());
-            }
-
-            // 3. Fallback to any hardware adapter
-            if let Some(adapter) = adapters
-                .iter()
-                .find(|a| a.get_info().device_type != eframe::wgpu::DeviceType::Cpu)
-            {
-                return Ok(adapter.clone());
-            }
-
-            // 4. Fallback to any adapter at all (CPU / software rasterizer)
-            if let Some(adapter) = adapters.first() {
-                return Ok(adapter.clone());
-            }
-
-            let err_msg = if adapters.is_empty() {
-                "No graphics adapters found. DirectX 12 / WARP or GPU drivers may be missing.".to_string()
-            } else {
-                let names = adapters.iter().map(|a| a.get_info().name).collect::<Vec<_>>().join(", ");
-                format!("Found adapters [{names}], but none are compatible with this window.")
-            };
-            Err(err_msg)
-        }));
-    }
-
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
             .with_min_inner_size([540.0, 480.0])
             .with_title("SCCT Coop Mod Installer & Online Launcher"),
-        wgpu_options,
+        hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
 

@@ -10,21 +10,66 @@ pub const CAVE_INHERITED_SOCK_9100: usize = 0x113303D0;
 pub const CAVE_INHERITED_SOCK_9103: usize = 0x113303D4;
 pub const CAVE_INHERITED_PRIMED_9100: usize = 0x113303D8;
 pub const CAVE_INHERITED_PRIMED_9103: usize = 0x113303DC;
+pub const CAVE_LAST_9103_KEEPALIVE_VA: usize = crate::net::G_LAST_9103_KEEPALIVE_VA as usize;
+pub const CAVE_LAST_9100_KEEPALIVE_VA: usize = crate::net::G_LAST_9100_KEEPALIVE_VA as usize;
 
-pub const CAVE_ONLINE_ENABLED_VA: usize = 0x110B6760;
-pub const CAVE_ONLINE_IP_VA: usize = 0x110B678B;
+pub const CAVE_ONLINE_ENABLED_VA: usize = crate::net::CAVE_ONLINE_ENABLED_VA as usize;
+pub const CAVE_ONLINE_IP_VA: usize = crate::net::CAVE_ONLINE_IP_VA as usize;
+pub const CAVE_ONLINE_PORT_VA: usize = crate::net::CAVE_ONLINE_PORT_VA as usize;
+pub const JOIN_GAME_PORT_VA: usize = crate::net::JOIN_GAME_PORT_VA as usize;
 pub const CAVE_LAN_PEER_VA: usize = 0x113303A0;
+
+#[cfg(windows)]
+unsafe fn write_proc_bytes(
+    h_process: windows_sys::Win32::Foundation::HANDLE,
+    addr: usize,
+    bytes: &[u8],
+    in_text: bool,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Memory::{VirtualProtectEx, PAGE_EXECUTE_READWRITE};
+
+    unsafe {
+        let mut old_prot: u32 = 0;
+        let prot_changed = if in_text {
+            VirtualProtectEx(
+                h_process,
+                addr as *const _,
+                bytes.len(),
+                PAGE_EXECUTE_READWRITE,
+                &mut old_prot,
+            ) != 0
+        } else {
+            false
+        };
+
+        let mut written: usize = 0;
+        WriteProcessMemory(
+            h_process,
+            addr as *mut _,
+            bytes.as_ptr() as *const _,
+            bytes.len(),
+            &mut written,
+        );
+
+        if prot_changed {
+            let mut dummy: u32 = 0;
+            VirtualProtectEx(h_process, addr as *const _, bytes.len(), old_prot, &mut dummy);
+        }
+    }
+}
 
 #[cfg(windows)]
 pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
     peer_ip: Option<Ipv4Addr>,
+    peer_disco_port: u16,
+    peer_game_port: u16,
 ) -> Result<u32> {
     use std::ffi::CString;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::{
         CreateProcessA, ResumeThread, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOA,
     };
@@ -32,7 +77,7 @@ pub fn launch_game(
     // Always update direct_ip.ini in System folder
     let sys_dir = crate::patcher::find_child_ci(game_dir, "System");
     let ini_path = sys_dir.join("direct_ip.ini");
-    let _ = crate::net::save_direct_ip_ini(&ini_path, peer_ip);
+    let _ = crate::net::save_direct_target_ini(&ini_path, peer_ip, peer_disco_port, peer_game_port);
 
     let exe_str = CString::new(exe_path.to_string_lossy().as_bytes())?;
     let dir_str = CString::new(game_dir.to_string_lossy().as_bytes())?;
@@ -70,89 +115,58 @@ pub fn launch_game(
     let pid = pi.dwProcessId;
 
     unsafe {
-        let mut written = 0;
-        let zero: u32 = 0;
+        let zero = 0u32.to_le_bytes();
 
-        // 1. Explicitly zero out inherited socket locations so cave hooks ALWAYS
-        // use native Winsock socket() and bind() calls inside splintercell3.exe.
-        WriteProcessMemory(
-            h_process,
-            CAVE_INHERITED_SOCK_9100 as *mut _,
-            &zero as *const _ as *const _,
-            4,
-            &mut written,
-        );
-        WriteProcessMemory(
-            h_process,
-            CAVE_INHERITED_SOCK_9103 as *mut _,
-            &zero as *const _ as *const _,
-            4,
-            &mut written,
-        );
-        WriteProcessMemory(
-            h_process,
-            CAVE_INHERITED_PRIMED_9100 as *mut _,
-            &zero as *const _ as *const _,
-            4,
-            &mut written,
-        );
-        WriteProcessMemory(
-            h_process,
-            CAVE_INHERITED_PRIMED_9103 as *mut _,
-            &zero as *const _ as *const _,
-            4,
-            &mut written,
-        );
+        // 1. Explicitly zero out inherited socket and keepalive tick locations in .data
+        write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9100, &zero, false);
+        write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9103, &zero, false);
+        write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9100, &zero, false);
+        write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9103, &zero, false);
+        write_proc_bytes(h_process, CAVE_LAST_9103_KEEPALIVE_VA, &zero, false);
+        write_proc_bytes(h_process, CAVE_LAST_9100_KEEPALIVE_VA, &zero, false);
 
-        // 2. Configure ONLINE_CAVE for direct IP replication and set CAVE_LAN_PEER_VA if peer_ip is set
+        // 2. Configure ONLINE_CAVE, JOIN_GAME_PORT_VA, and CAVE_LAN_PEER_VA
         if let Some(ip) = peer_ip {
-            let enabled: u8 = 1;
+            let disco_port = if peer_disco_port == 0 {
+                crate::net::DISCOVERY_PORT
+            } else {
+                peer_disco_port
+            };
+            let game_port = if peer_game_port == 0 {
+                crate::net::GAME_PORT
+            } else {
+                peer_game_port
+            };
             let ip_bytes = ip.octets();
-            WriteProcessMemory(
-                h_process,
-                CAVE_ONLINE_ENABLED_VA as *mut _,
-                &enabled as *const _ as *const _,
-                1,
-                &mut written,
-            );
-            WriteProcessMemory(
-                h_process,
-                CAVE_ONLINE_IP_VA as *mut _,
-                ip_bytes.as_ptr() as *const _,
-                4,
-                &mut written,
-            );
-            WriteProcessMemory(
-                h_process,
-                CAVE_LAN_PEER_VA as *mut _,
-                ip_bytes.as_ptr() as *const _,
-                4,
-                &mut written,
-            );
+            let disco_be = disco_port.to_be_bytes();
+            let game_le = (game_port as u32).to_le_bytes();
+
+            write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[1u8], true);
+            write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &ip_bytes, true);
+            write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &disco_be, true);
+            write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &game_le, true);
+
+            // Set CAVE_LAN_PEER_VA for route-matched NIC promotion in splintercell3.exe
+            // If peer_ip is a private address, only set it if our local host shares the subnet.
+            // Otherwise, keep it 0.0.0.0 so the probe defaults to 8.8.8.8 and selects the physical gateway.
+            let oct = ip.octets();
+            let is_private = oct[0] == 10
+                || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+                || (oct[0] == 192 && oct[1] == 168);
+            let is_local_routable = !is_private || crate::ip::find_matching_subnet_ip(ip).is_some();
+            let probe_ip = if is_local_routable { ip_bytes } else { [0u8; 4] };
+
+            write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
         } else {
-            let disabled: u8 = 0;
             let zero_ip = [0u8; 4];
-            WriteProcessMemory(
-                h_process,
-                CAVE_ONLINE_ENABLED_VA as *mut _,
-                &disabled as *const _ as *const _,
-                1,
-                &mut written,
-            );
-            WriteProcessMemory(
-                h_process,
-                CAVE_ONLINE_IP_VA as *mut _,
-                zero_ip.as_ptr() as *const _,
-                4,
-                &mut written,
-            );
-            WriteProcessMemory(
-                h_process,
-                CAVE_LAN_PEER_VA as *mut _,
-                zero_ip.as_ptr() as *const _,
-                4,
-                &mut written,
-            );
+            let default_disco_be = crate::net::DISCOVERY_PORT.to_be_bytes();
+            let default_game_le = (crate::net::GAME_PORT as u32).to_le_bytes();
+
+            write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[0u8], true);
+            write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &zero_ip, true);
+            write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &default_disco_be, true);
+            write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
+            write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
         }
 
         // 3. Resume the game thread
@@ -169,10 +183,12 @@ pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
     peer_ip: Option<Ipv4Addr>,
+    peer_disco_port: u16,
+    peer_game_port: u16,
 ) -> Result<u32> {
     let sys_dir = crate::patcher::find_child_ci(game_dir, "System");
     let ini_path = sys_dir.join("direct_ip.ini");
-    let _ = crate::net::save_direct_ip_ini(&ini_path, peer_ip);
+    let _ = crate::net::save_direct_target_ini(&ini_path, peer_ip, peer_disco_port, peer_game_port);
 
     let child = std::process::Command::new(exe_path)
         .current_dir(game_dir)
@@ -189,6 +205,8 @@ pub fn launch_game_with_inherited_sockets(
     _sock_disco: &std::net::UdpSocket,
     _sock_game: &std::net::UdpSocket,
     peer_ip: Option<Ipv4Addr>,
+    peer_disco_port: u16,
+    peer_game_port: u16,
 ) -> Result<u32> {
-    launch_game(exe_path, game_dir, peer_ip)
+    launch_game(exe_path, game_dir, peer_ip, peer_disco_port, peer_game_port)
 }

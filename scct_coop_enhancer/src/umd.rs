@@ -527,6 +527,13 @@ fn append_virtual_file(
     (entries[ent_idx].path.clone(), new_off, old_sz, new_bytes.len())
 }
 
+pub fn patch_pregame_pc_coop_menu_caption(loc_bytes: &[u8]) -> Vec<u8> {
+    let text: String = loc_bytes.iter().map(|&b| b as char).collect();
+    let re_lan_cap = Regex::new(r"(?im)^LanCaption=[^\r\n]*").unwrap();
+    let new_text = re_lan_cap.replace(&text, "LanCaption=ENHANCED COOP");
+    new_text.chars().map(|c| c as u8).collect()
+}
+
 pub fn patch_umd_for_all_sp_levels(
     umd_path: &Path,
     umd_bak_path: &Path,
@@ -665,10 +672,48 @@ pub fn patch_umd_for_all_sp_levels(
         }
     }
 
+    // Update Coop menu LAN button caption -> ENHANCED COOP in PreGame_PC localization files
+    for lang in LANG_EXTS {
+        let pg_key = format!("data\\system\\localization\\pregame_pc.{}", lang);
+        if let Some(&pg_idx) = index_by_lower.get(&pg_key) {
+            let pg_ent = &entries[pg_idx];
+            let orig_pg = payload[pg_ent.offset..pg_ent.offset + pg_ent.size].to_vec();
+            let new_pg = patch_pregame_pc_coop_menu_caption(&orig_pg);
+            if new_pg != orig_pg {
+                let (lpath, loff, lold, lnew) = append_virtual_file(
+                    &mut payload,
+                    &mut entries,
+                    &index_by_lower,
+                    &pg_key,
+                    &new_pg,
+                );
+                crate::scct_log!(
+                    "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, LanCaption=ENHANCED COOP)",
+                    lpath, loff, lold, lnew
+                );
+            }
+        }
+    }
+
     serialize_umd_toc_and_footer(&mut payload, &entries, footer.tag);
     std::fs::write(umd_path, &payload)?;
     crate::scct_log!("  [UMD] Wrote {} ({} bytes)", umd_path.display(), payload.len());
 
     Ok(extracted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patch_pregame_pc_coop_menu_caption() {
+        let sample = b"[MainMenuCoop]\r\nMainMenuCoopTitle=COOPERATIVO\r\nLanCaption=EN RED\r\nOnlineCaption=ONLINE\r\nSettingsCaption=CONFIGURACI\xD3N\r\n";
+        let patched = patch_pregame_pc_coop_menu_caption(sample);
+        assert_eq!(
+            patched,
+            b"[MainMenuCoop]\r\nMainMenuCoopTitle=COOPERATIVO\r\nLanCaption=ENHANCED COOP\r\nOnlineCaption=ONLINE\r\nSettingsCaption=CONFIGURACI\xD3N\r\n"
+        );
+    }
 }
 
