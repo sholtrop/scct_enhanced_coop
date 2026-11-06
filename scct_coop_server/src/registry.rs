@@ -1,10 +1,9 @@
+use dashmap::DashMap;
 use rand::{rng, Rng};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 
 /// Crockford Base32 alphabet (32 characters, excludes I, L, O, U to avoid ambiguity)
 pub const CROCKFORD_CHARS: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -42,41 +41,80 @@ pub struct ClientEndpoints {
     pub local_ip: Option<Ipv4Addr>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Session {
+    #[allow(dead_code)]
     pub friend_code: String,
     pub host_endpoints: ClientEndpoints,
     pub guest_endpoints: Option<ClientEndpoints>,
+    #[allow(dead_code)]
     pub created_at: Instant,
     pub last_seen: Instant,
 }
 
-#[derive(Debug, Clone)]
-pub struct FriendCodeRegistry {
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterResult {
+    Success(String),
+    AlreadyConnected,
+    CapacityExceeded,
 }
 
-impl Default for FriendCodeRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub enum JoinResult {
+    Success(ClientEndpoints),
+    AlreadyConnected,
+    NotFound,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PollResult {
+    Paired(ClientEndpoints),
+    Waiting,
+    NotFound,
+}
+
+#[derive(Debug, Clone)]
+pub struct FriendCodeRegistry {
+    sessions: Arc<DashMap<String, Session>>,
+    max_sessions: usize,
 }
 
 impl FriendCodeRegistry {
-    pub fn new() -> Self {
+    pub fn new(max_sessions: usize) -> Self {
         Self {
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(DashMap::new()),
+            max_sessions,
         }
     }
 
-    pub async fn register(&self, friend_code: String, host_endpoints: ClientEndpoints) -> String {
+    /// Register a host session.
+    /// If the requested friend code is already active and connected, returns `AlreadyConnected`.
+    /// If total active sessions exceeds `max_sessions`, returns `CapacityExceeded`.
+    pub fn register(&self, friend_code: String, host_endpoints: ClientEndpoints) -> RegisterResult {
         let code = normalize_friend_code(&friend_code);
         let final_code = if code.len() == 5 {
             code
         } else {
-            generate_friend_code()
+            if self.sessions.len() >= self.max_sessions {
+                return RegisterResult::CapacityExceeded;
+            }
+            let mut candidate = generate_friend_code();
+            let mut attempts = 0;
+            while self.sessions.contains_key(&candidate) && attempts < 100 {
+                candidate = generate_friend_code();
+                attempts += 1;
+            }
+            candidate
         };
+
+        // If code already exists, ensure it is not already connected
+        if let Some(existing) = self.sessions.get(&final_code) {
+            if existing.guest_endpoints.is_some() {
+                return RegisterResult::AlreadyConnected;
+            }
+        } else if self.sessions.len() >= self.max_sessions {
+            return RegisterResult::CapacityExceeded;
+        }
 
         let now = Instant::now();
         let session = Session {
@@ -87,64 +125,72 @@ impl FriendCodeRegistry {
             last_seen: now,
         };
 
-        let mut lock = self.sessions.write().await;
-        lock.insert(final_code.clone(), session);
-        final_code
+        self.sessions.insert(final_code.clone(), session);
+        RegisterResult::Success(final_code)
     }
 
-    pub async fn lookup(&self, friend_code: &str) -> Option<Session> {
+    #[allow(dead_code)]
+    pub fn lookup(&self, friend_code: &str) -> Option<Session> {
         let code = normalize_friend_code(friend_code);
-        let lock = self.sessions.read().await;
-        lock.get(&code).cloned()
+        self.sessions.get(&code).map(|s| s.clone())
     }
 
-    pub async fn join(&self, friend_code: &str, guest_endpoints: ClientEndpoints) -> Option<ClientEndpoints> {
+    /// Guest attempts to join a room.
+    /// If session already has a guest connected, returns `AlreadyConnected` to prevent overwriting.
+    pub fn join(&self, friend_code: &str, guest_endpoints: ClientEndpoints) -> JoinResult {
         let code = normalize_friend_code(friend_code);
-        let mut lock = self.sessions.write().await;
-        if let Some(session) = lock.get_mut(&code) {
-            session.guest_endpoints = Some(guest_endpoints);
-            session.last_seen = Instant::now();
-            Some(session.host_endpoints.clone())
+        if let Some(mut session) = self.sessions.get_mut(&code) {
+            if session.guest_endpoints.is_some() {
+                JoinResult::AlreadyConnected
+            } else {
+                session.guest_endpoints = Some(guest_endpoints);
+                session.last_seen = Instant::now();
+                JoinResult::Success(session.host_endpoints.clone())
+            }
         } else {
-            None
+            JoinResult::NotFound
         }
     }
 
-    pub async fn poll(&self, friend_code: &str) -> Option<ClientEndpoints> {
+    /// Host polls for guest arrival.
+    pub fn poll(&self, friend_code: &str) -> PollResult {
         let code = normalize_friend_code(friend_code);
-        let mut lock = self.sessions.write().await;
-        if let Some(session) = lock.get_mut(&code) {
+        if let Some(mut session) = self.sessions.get_mut(&code) {
             session.last_seen = Instant::now();
-            session.guest_endpoints.clone()
+            if let Some(guest) = &session.guest_endpoints {
+                PollResult::Paired(guest.clone())
+            } else {
+                PollResult::Waiting
+            }
         } else {
-            None
+            PollResult::NotFound
         }
     }
 
-    pub async fn cleanup_expired(&self, ttl: Duration) {
+    /// Clean up expired sessions based on last_seen time.
+    pub fn cleanup_expired(&self, ttl: Duration) -> usize {
         let now = Instant::now();
-        let mut lock = self.sessions.write().await;
-        let before = lock.len();
-        lock.retain(|code, s| {
+        let before = self.sessions.len();
+        self.sessions.retain(|code, s| {
             let keep = now.duration_since(s.last_seen) < ttl;
             if !keep {
-                println!(
-                    "  [CLEANUP] [{}] Friend code '{}' expired and removed",
-                    crate::now_str(),
-                    code
-                );
+                log::debug!("Friend code '{}' expired and removed", code);
             }
             keep
         });
-        let removed = before - lock.len();
+        let removed = before - self.sessions.len();
         if removed > 0 {
-            println!(
-                "  [CLEANUP] [{}] Pruned {} expired session(s). Active sessions: {}",
-                crate::now_str(),
+            log::info!(
+                "Pruned {} expired session(s). Active sessions: {}",
                 removed,
-                lock.len()
+                self.sessions.len()
             );
         }
+        removed
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.sessions.len()
     }
 }
 
@@ -167,9 +213,9 @@ mod tests {
         assert_eq!(normalize_friend_code("o1li"), "0111");
     }
 
-    #[tokio::test]
-    async fn test_registry_pairing() {
-        let registry = FriendCodeRegistry::new();
+    #[test]
+    fn test_registry_pairing() {
+        let registry = FriendCodeRegistry::new(100);
         let host_ep = ClientEndpoints {
             disco_addr: "1.2.3.4:9100".parse().unwrap(),
             game_addr: "1.2.3.4:9103".parse().unwrap(),
@@ -181,17 +227,48 @@ mod tests {
             local_ip: Some(Ipv4Addr::new(192, 168, 1, 20)),
         };
 
-        let code = registry.register("K7X9B".to_string(), host_ep.clone()).await;
-        assert_eq!(code, "K7X9B");
+        let res = registry.register("K7X9B".to_string(), host_ep.clone());
+        assert_eq!(res, RegisterResult::Success("K7X9B".to_string()));
 
-        // Before guest joins, poll returns None
-        assert_eq!(registry.poll(&code).await, None);
+        // Before guest joins, poll returns Waiting
+        assert_eq!(registry.poll("K7X9B"), PollResult::Waiting);
 
         // Guest joins with code
-        let host_received = registry.join(&code, guest_ep.clone()).await;
-        assert_eq!(host_received, Some(host_ep));
+        let join_res = registry.join("K7X9B", guest_ep.clone());
+        assert_eq!(join_res, JoinResult::Success(host_ep.clone()));
 
         // After guest joins, host poll returns guest endpoints
-        assert_eq!(registry.poll(&code).await, Some(guest_ep));
+        assert_eq!(registry.poll("K7X9B"), PollResult::Paired(guest_ep.clone()));
+
+        // Second guest attempting to join fails with AlreadyConnected
+        let second_guest = registry.join("K7X9B", guest_ep.clone());
+        assert_eq!(second_guest, JoinResult::AlreadyConnected);
+
+        // Re-registering connected code fails with AlreadyConnected
+        let re_reg = registry.register("K7X9B".to_string(), host_ep.clone());
+        assert_eq!(re_reg, RegisterResult::AlreadyConnected);
+    }
+
+    #[test]
+    fn test_capacity_limit() {
+        let registry = FriendCodeRegistry::new(2);
+        let ep = ClientEndpoints {
+            disco_addr: "1.2.3.4:9100".parse().unwrap(),
+            game_addr: "1.2.3.4:9103".parse().unwrap(),
+            local_ip: None,
+        };
+
+        assert!(matches!(
+            registry.register("AAAAA".to_string(), ep.clone()),
+            RegisterResult::Success(_)
+        ));
+        assert!(matches!(
+            registry.register("BBBBB".to_string(), ep.clone()),
+            RegisterResult::Success(_)
+        ));
+        assert_eq!(
+            registry.register("CCCCC".to_string(), ep.clone()),
+            RegisterResult::CapacityExceeded
+        );
     }
 }

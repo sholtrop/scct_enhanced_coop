@@ -1,9 +1,27 @@
-use crate::registry::{ClientEndpoints, FriendCodeRegistry};
+use axum::{
+    extract::{ConnectInfo, Extension, Path, Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::time::Duration;
+use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
+
+use crate::registry::{
+    ClientEndpoints, FriendCodeRegistry, JoinResult, PollResult, RegisterResult,
+};
+use crate::security::SecurityManager;
+
+pub struct AppState {
+    pub registry: FriendCodeRegistry,
+    pub security: SecurityManager,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -14,7 +32,7 @@ pub struct RegisterRequest {
     pub local_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterResponse {
     pub status: String,
     pub friend_code: String,
@@ -29,7 +47,7 @@ pub struct JoinRequest {
     pub local_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JoinResponse {
     pub status: String,
     pub peer_disco_addr: Option<SocketAddr>,
@@ -38,7 +56,7 @@ pub struct JoinResponse {
     pub peer_local_ip: Option<Ipv4Addr>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PollResponse {
     pub status: String,
     pub peer_disco_addr: Option<SocketAddr>,
@@ -47,256 +65,560 @@ pub struct PollResponse {
     pub peer_local_ip: Option<Ipv4Addr>,
 }
 
-pub async fn run_api_server(bind_addr: &str, registry: FriendCodeRegistry) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind(bind_addr).await?;
-    println!("  [API] Signaling server listening on http://{}", bind_addr);
-
-    let reg = Arc::new(registry);
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("  [API] Accept error: {e}");
-                continue;
-            }
-        };
-
-        let reg_clone = reg.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, reg_clone).await {
-                eprintln!("  [API] Connection error: {e}");
-            }
-        });
+pub fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> IpAddr {
+    // 1. Cloudflare header
+    if let Some(cf) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return cf;
     }
+    // 2. Standard X-Forwarded-For (take the first IP in the chain)
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|xff| xff.split(',').next())
+        .and_then(|first| first.trim().parse::<IpAddr>().ok())
+    {
+        return ip;
+    }
+    // 3. X-Real-IP
+    if let Some(xrip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
+    {
+        return xrip;
+    }
+    // 4. Socket peer address fallback
+    peer_addr
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
 }
 
-async fn handle_connection(mut stream: TcpStream, registry: Arc<FriendCodeRegistry>) -> Result<(), Box<dyn std::error::Error>> {
-    let peer_addr = stream.peer_addr().ok();
-    let peer_str = peer_addr
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+async fn security_middleware(
+    State(state): State<Arc<AppState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let peer_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0);
+    let client_ip = extract_client_ip(req.headers(), peer_addr);
+    req.extensions_mut().insert(client_ip);
 
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
+    // 1. Check if IP is banned
+    if state.security.is_banned(&client_ip) {
+        log::warn!("Rejected request from banned IP: {}", client_ip);
+        return (
+            StatusCode::FORBIDDEN,
+            [("Content-Type", "application/json")],
+            r#"{"error":"IP is temporarily banned due to excessive invalid requests"}"#,
+        )
+            .into_response();
     }
 
-    let req_str = String::from_utf8_lossy(&buf[..n]);
-    let mut lines = req_str.lines();
-    let req_line = lines.next().unwrap_or("");
-    let parts: Vec<&str> = req_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        println!(
-            "  [API] [{}] 400 Bad Request from {}: invalid request line {:?}",
-            crate::now_str(),
-            peer_str,
-            req_line
-        );
-        send_response(&mut stream, 400, "Bad Request", "text/plain", b"Bad Request").await?;
-        return Ok(());
+    // 2. Check rate limit
+    if !state.security.check_rate_limit(&client_ip) {
+        log::debug!("Rate limit exceeded for IP: {}", client_ip);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("Retry-After", "1"),
+                ("Content-Type", "application/json"),
+            ],
+            r#"{"error":"Rate limit exceeded. Maximum 10 requests per second."}"#,
+        )
+            .into_response();
     }
 
-    let method = parts[0];
-    let path = parts[1];
+    // 3. Run inner request handler
+    let resp = next.run(req).await;
 
-    let body = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
+    // 4. Record 404 response if applicable
+    if resp.status() == StatusCode::NOT_FOUND {
+        state.security.record_404(&client_ip);
+    }
 
-    match (method, path) {
-        ("GET", "/health") => {
-            println!(
-                "  [API] [{}] GET /health from {} -> 200 OK",
-                crate::now_str(),
-                peer_str
-            );
-            send_response(&mut stream, 200, "OK", "application/json", b"{\"status\":\"ok\"}").await?;
-        }
-        ("POST", "/api/register") => {
-            println!(
-                "  [API] [{}] POST /api/register from {} | Body: {}",
-                crate::now_str(),
-                peer_str,
-                body.trim()
-            );
-            let req: RegisterRequest = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    println!(
-                        "  [API] [{}] 400 Bad Request in /api/register from {}: {e}",
-                        crate::now_str(),
-                        peer_str
-                    );
-                    let err = format!("{{\"error\":\"{e}\"}}");
-                    send_response(&mut stream, 400, "Bad Request", "application/json", err.as_bytes()).await?;
-                    return Ok(());
-                }
-            };
+    resp
+}
 
-            let code = req.friend_code.unwrap_or_default();
-            let endpoints = ClientEndpoints {
-                disco_addr: req.disco_addr,
-                game_addr: req.game_addr,
-                local_ip: req.local_ip,
-            };
+async fn health_handler() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
+}
 
-            let final_code = registry.register(code, endpoints.clone()).await;
-            println!(
-                "  [API] [{}] Registered Host: Code='{}', Peer WAN: disco={}, game={}, Local LAN: {:?} (from {})",
-                crate::now_str(),
-                final_code,
+async fn register_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(client_ip): Extension<IpAddr>,
+    Json(req): Json<RegisterRequest>,
+) -> Response {
+    let endpoints = ClientEndpoints {
+        disco_addr: req.disco_addr,
+        game_addr: req.game_addr,
+        local_ip: req.local_ip,
+    };
+    let requested_code = req.friend_code.unwrap_or_default();
+
+    match state.registry.register(requested_code, endpoints.clone()) {
+        RegisterResult::Success(code) => {
+            log::info!(
+                "Registered Host: Code='{}', Peer WAN: disco={}, game={}, Local LAN: {:?} (from {})",
+                code,
                 endpoints.disco_addr,
                 endpoints.game_addr,
                 endpoints.local_ip,
-                peer_str
+                client_ip
             );
-            let resp = RegisterResponse {
-                status: "registered".to_string(),
-                friend_code: final_code,
-            };
-            let json = serde_json::to_vec(&resp)?;
-            send_response(&mut stream, 200, "OK", "application/json", &json).await?;
+            (
+                StatusCode::OK,
+                Json(RegisterResponse {
+                    status: "registered".to_string(),
+                    friend_code: code,
+                }),
+            )
+                .into_response()
         }
-        ("POST", "/api/join") => {
-            println!(
-                "  [API] [{}] POST /api/join from {} | Body: {}",
-                crate::now_str(),
-                peer_str,
-                body.trim()
+        RegisterResult::AlreadyConnected => {
+            log::warn!(
+                "Registration rejected for host {}: friend code is already connected",
+                client_ip
             );
-            let req: JoinRequest = match serde_json::from_str(body) {
-                Ok(r) => r,
-                Err(e) => {
-                    println!(
-                        "  [API] [{}] 400 Bad Request in /api/join from {}: {e}",
-                        crate::now_str(),
-                        peer_str
-                    );
-                    let err = format!("{{\"error\":\"{e}\"}}");
-                    send_response(&mut stream, 400, "Bad Request", "application/json", err.as_bytes()).await?;
-                    return Ok(());
-                }
-            };
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "already_connected",
+                    "error": "Session is already connected and cannot be overwritten"
+                })),
+            )
+                .into_response()
+        }
+        RegisterResult::CapacityExceeded => {
+            log::warn!(
+                "Registration rejected for {}: server session capacity reached ({})",
+                client_ip,
+                state.registry.active_count()
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "status": "capacity_exceeded",
+                    "error": "Server has reached maximum active session capacity"
+                })),
+            )
+                .into_response()
+        }
+    }
+}
 
-            let guest_endpoints = ClientEndpoints {
-                disco_addr: req.disco_addr,
-                game_addr: req.game_addr,
-                local_ip: req.local_ip,
-            };
+async fn join_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(client_ip): Extension<IpAddr>,
+    Json(req): Json<JoinRequest>,
+) -> Response {
+    let guest_endpoints = ClientEndpoints {
+        disco_addr: req.disco_addr,
+        game_addr: req.game_addr,
+        local_ip: req.local_ip,
+    };
 
-            if let Some(host_endpoints) = registry.join(&req.friend_code, guest_endpoints.clone()).await {
-                println!(
-                    "  [API] [{}] >>> MATCH PAIRED! Code='{}' <<<\n\
-                     \x20       HOST:  WAN disco={}, game={}, Local LAN={:?}\n\
-                     \x20       GUEST: WAN disco={}, game={}, Local LAN={:?} (Guest from {})",
-                    crate::now_str(),
-                    req.friend_code,
-                    host_endpoints.disco_addr,
-                    host_endpoints.game_addr,
-                    host_endpoints.local_ip,
-                    guest_endpoints.disco_addr,
-                    guest_endpoints.game_addr,
-                    guest_endpoints.local_ip,
-                    peer_str
-                );
-                let resp = JoinResponse {
+    match state
+        .registry
+        .join(&req.friend_code, guest_endpoints.clone())
+    {
+        JoinResult::Success(host_endpoints) => {
+            log::info!(
+                ">>> MATCH PAIRED! Code='{}' <<<\n\
+                 \x20    HOST:  WAN disco={}, game={}, Local LAN={:?}\n\
+                 \x20    GUEST: WAN disco={}, game={}, Local LAN={:?} (Guest from {})",
+                req.friend_code,
+                host_endpoints.disco_addr,
+                host_endpoints.game_addr,
+                host_endpoints.local_ip,
+                guest_endpoints.disco_addr,
+                guest_endpoints.game_addr,
+                guest_endpoints.local_ip,
+                client_ip
+            );
+            (
+                StatusCode::OK,
+                Json(JoinResponse {
                     status: "paired".to_string(),
                     peer_disco_addr: Some(host_endpoints.disco_addr),
                     peer_game_addr: Some(host_endpoints.game_addr),
                     peer_local_ip: host_endpoints.local_ip,
-                };
-                let json = serde_json::to_vec(&resp)?;
-                send_response(&mut stream, 200, "OK", "application/json", &json).await?;
-            } else {
-                println!(
-                    "  [API] [{}] /api/join FAILED for code='{}': not found or expired (from {})",
-                    crate::now_str(),
-                    req.friend_code,
-                    peer_str
-                );
-                let resp = JoinResponse {
+                }),
+            )
+                .into_response()
+        }
+        JoinResult::AlreadyConnected => {
+            log::warn!(
+                "Join rejected for code='{}' from {}: session is already paired/connected",
+                req.friend_code,
+                client_ip
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "already_connected",
+                    "error": "Session is already connected"
+                })),
+            )
+                .into_response()
+        }
+        JoinResult::NotFound => {
+            log::debug!(
+                "/api/join code='{}' not found from {}",
+                req.friend_code,
+                client_ip
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(JoinResponse {
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
                     peer_local_ip: None,
-                };
-                let json = serde_json::to_vec(&resp)?;
-                send_response(&mut stream, 404, "Not Found", "application/json", &json).await?;
-            }
+                }),
+            )
+                .into_response()
         }
-        ("GET", p) if p.starts_with("/api/poll/") => {
-            let code = &p["/api/poll/".len()..];
-            if let Some(guest_endpoints) = registry.poll(code).await {
-                println!(
-                    "  [API] [{}] Host polled code='{}' -> GUEST IS READY! Returning Guest WAN: disco={}, game={}, LAN: {:?} (to host {})",
-                    crate::now_str(),
-                    code,
-                    guest_endpoints.disco_addr,
-                    guest_endpoints.game_addr,
-                    guest_endpoints.local_ip,
-                    peer_str
-                );
-                let resp = PollResponse {
+    }
+}
+
+async fn poll_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(client_ip): Extension<IpAddr>,
+    Path(code): Path<String>,
+) -> Response {
+
+    match state.registry.poll(&code) {
+        PollResult::Paired(guest) => {
+            log::debug!(
+                "Host polled code='{}' -> guest is ready (host {})",
+                code,
+                client_ip
+            );
+            (
+                StatusCode::OK,
+                Json(PollResponse {
                     status: "paired".to_string(),
-                    peer_disco_addr: Some(guest_endpoints.disco_addr),
-                    peer_game_addr: Some(guest_endpoints.game_addr),
-                    peer_local_ip: guest_endpoints.local_ip,
-                };
-                let json = serde_json::to_vec(&resp)?;
-                send_response(&mut stream, 200, "OK", "application/json", &json).await?;
-            } else if registry.lookup(code).await.is_some() {
-                println!(
-                    "  [API] [{}] Host polled code='{}' -> still waiting for guest (host {})",
-                    crate::now_str(),
-                    code,
-                    peer_str
-                );
-                let resp = PollResponse {
+                    peer_disco_addr: Some(guest.disco_addr),
+                    peer_game_addr: Some(guest.game_addr),
+                    peer_local_ip: guest.local_ip,
+                }),
+            )
+                .into_response()
+        }
+        PollResult::Waiting => {
+            log::trace!("Host polled code='{}' -> waiting (host {})", code, client_ip);
+            (
+                StatusCode::OK,
+                Json(PollResponse {
                     status: "waiting".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
                     peer_local_ip: None,
-                };
-                let json = serde_json::to_vec(&resp)?;
-                send_response(&mut stream, 200, "OK", "application/json", &json).await?;
-            } else {
-                println!(
-                    "  [API] [{}] Host polled code='{}' -> code not found / expired (from {})",
-                    crate::now_str(),
-                    code,
-                    peer_str
-                );
-                let resp = PollResponse {
+                }),
+            )
+                .into_response()
+        }
+        PollResult::NotFound => {
+            log::trace!(
+                "Host polled code='{}' -> not found / expired (from {})",
+                code,
+                client_ip
+            );
+            (
+                StatusCode::NOT_FOUND,
+                Json(PollResponse {
                     status: "code_not_found".to_string(),
                     peer_disco_addr: None,
                     peer_game_addr: None,
                     peer_local_ip: None,
-                };
-                let json = serde_json::to_vec(&resp)?;
-                send_response(&mut stream, 404, "Not Found", "application/json", &json).await?;
-            }
-        }
-        _ => {
-            println!(
-                "  [API] [{}] 404 Not Found: {} {} from {}",
-                crate::now_str(),
-                method,
-                path,
-                peer_str
-            );
-            send_response(&mut stream, 404, "Not Found", "text/plain", b"404 Not Found").await?;
+                }),
+            )
+                .into_response()
         }
     }
+}
+
+pub fn create_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/api/register", post(register_handler))
+        .route("/api/join", post(join_handler))
+        .route("/api/poll/{code}", get(poll_handler))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            security_middleware,
+        ))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(15),
+        ))
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}
+
+pub async fn run_api_server(
+    bind_addr: &str,
+    registry: FriendCodeRegistry,
+    security: SecurityManager,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let state = Arc::new(AppState { registry, security });
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    log::info!("Signaling server listening on http://{}", bind_addr);
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
 
-async fn send_response(stream: &mut TcpStream, status_code: u16, status_text: &str, content_type: &str, body: &[u8]) -> Result<(), std::io::Error> {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-        status_code, status_text, content_type, body.len()
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use tower::ServiceExt;
+
+    fn test_app() -> (Router, Arc<AppState>) {
+        let registry = FriendCodeRegistry::new(100);
+        let security = SecurityManager::new(
+            10,
+            5, // lower threshold for 404 test
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let state = Arc::new(AppState { registry, security });
+        (create_router(state.clone()), state)
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint() {
+        let (app, _) = test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_register_and_poll_flow() {
+        let (app, _) = test_app();
+
+        // 1. Register host
+        let reg_payload = serde_json::json!({
+            "friend_code": "MATCH",
+            "disco_addr": "1.2.3.4:9100",
+            "game_addr": "1.2.3.4:9103",
+            "local_ip": "192.168.1.10"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&reg_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let reg_resp: RegisterResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(reg_resp.friend_code, "MATCH");
+
+        // 2. Host poll -> waiting
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/poll/MATCH")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let poll_resp: PollResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(poll_resp.status, "waiting");
+
+        // 3. Guest joins
+        let join_payload = serde_json::json!({
+            "friend_code": "MATCH",
+            "disco_addr": "5.6.7.8:9100",
+            "game_addr": "5.6.7.8:9103",
+            "local_ip": "192.168.1.20"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&join_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let join_resp: JoinResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(join_resp.status, "paired");
+        assert_eq!(
+            join_resp.peer_disco_addr,
+            Some("1.2.3.4:9100".parse().unwrap())
+        );
+
+        // 4. Host poll -> paired
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/poll/MATCH")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let poll_resp: PollResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(poll_resp.status, "paired");
+        assert_eq!(
+            poll_resp.peer_disco_addr,
+            Some("5.6.7.8:9100".parse().unwrap())
+        );
+
+        // 5. Overwrite protection: second guest cannot join connected session
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/join")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&join_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // 6. Overwrite protection: cannot re-register connected session
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&reg_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_and_ban() {
+        let (app, _) = test_app();
+
+        // Send 10 valid requests
+        for _ in 0..10 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .header("x-forwarded-for", "203.0.113.1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // 11th request from same IP within the second -> 429
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-forwarded-for", "203.0.113.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Another IP is not rate-limited
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-forwarded-for", "203.0.113.2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Test 404 accumulation and automatic ban
+        // In test_app, ban_404_threshold is set to 5
+        let scan_ip = "198.51.100.55";
+        for _ in 0..5 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/poll/NONEX")
+                        .header("x-forwarded-for", scan_ip)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        // 6th request from scan_ip -> banned (403 Forbidden)
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-forwarded-for", scan_ip)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
 }

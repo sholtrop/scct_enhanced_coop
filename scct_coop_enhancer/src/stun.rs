@@ -205,7 +205,12 @@ struct ApiRegisterReq {
 
 #[derive(Deserialize)]
 struct ApiRegisterResp {
-    friend_code: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    friend_code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -233,6 +238,29 @@ struct ApiPollResp {
     peer_game_addr: Option<SocketAddr>,
     #[serde(default)]
     peer_local_ip: Option<Ipv4Addr>,
+}
+
+fn parse_http_response<R: for<'de> Deserialize<'de>>(resp: &[u8]) -> Result<R> {
+    let text = String::from_utf8_lossy(resp);
+    let status_line = text.lines().next().unwrap_or("");
+    let status_code: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let json_body = text.split("\r\n\r\n").nth(1).context("Malformed HTTP response")?;
+
+    match status_code {
+        429 => bail!("Rate limit exceeded (10 req/s). Please slow down."),
+        403 => bail!("Access temporarily blocked by server due to repeated invalid requests."),
+        503 => bail!("Server is at maximum capacity (10k sessions). Please try again later."),
+        _ => {}
+    }
+
+    let res: R = serde_json::from_str(json_body)
+        .with_context(|| format!("Failed to parse response (HTTP {}): {}", status_code, json_body.trim()))?;
+    Ok(res)
 }
 
 fn http_post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
@@ -263,12 +291,7 @@ fn http_post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
 
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp)?;
-    let text = String::from_utf8_lossy(&resp);
-
-    let json_body = text.split("\r\n\r\n").nth(1).context("Malformed HTTP response")?;
-    let res: R = serde_json::from_str(json_body)
-        .with_context(|| format!("Failed to parse response: {}", json_body))?;
-    Ok(res)
+    parse_http_response(&resp)
 }
 
 fn http_get_json<R: for<'de> Deserialize<'de>>(
@@ -297,12 +320,7 @@ fn http_get_json<R: for<'de> Deserialize<'de>>(
 
     let mut resp = Vec::new();
     stream.read_to_end(&mut resp)?;
-    let text = String::from_utf8_lossy(&resp);
-
-    let json_body = text.split("\r\n\r\n").nth(1).context("Malformed HTTP response")?;
-    let res: R = serde_json::from_str(json_body)
-        .with_context(|| format!("Failed to parse response: {}", json_body))?;
-    Ok(res)
+    parse_http_response(&resp)
 }
 
 pub fn register_with_server(
@@ -320,7 +338,14 @@ pub fn register_with_server(
         local_ip,
     };
     let resp: ApiRegisterResp = http_post_json(server_host, api_port, "/api/register", &req)?;
-    Ok(resp.friend_code)
+    if let Some(status) = resp.status.as_deref() {
+        if status == "already_connected" {
+            bail!("Room is already in progress with another player");
+        } else if status == "capacity_exceeded" {
+            bail!("Server is at maximum capacity");
+        }
+    }
+    resp.friend_code.context("Server did not return a friend code")
 }
 
 pub fn join_with_server(
@@ -343,8 +368,10 @@ pub fn join_with_server(
         && let Some(game) = resp.peer_game_addr
     {
         Ok((disco, game, resp.peer_local_ip))
+    } else if resp.status == "already_connected" {
+        bail!("Friend code '{}' is already in a match (cannot join)", friend_code)
     } else {
-        bail!("Friend code '{}' not found or invalid", friend_code)
+        bail!("Friend code '{}' not found or expired", friend_code)
     }
 }
 
@@ -360,8 +387,10 @@ pub fn poll_server_for_peer(
         && let Some(game) = resp.peer_game_addr
     {
         Ok(Some((disco, game, resp.peer_local_ip)))
-    } else {
+    } else if resp.status == "waiting" {
         Ok(None)
+    } else {
+        bail!("Session '{}' expired or not found on server", friend_code)
     }
 }
 
