@@ -63,13 +63,6 @@ jobs:
         run: |
           mkdir -p release_assets
 
-          if [ -f "scct_coop_enhancer/Cargo.toml" ]; then
-            ENHANCER_CARGO="scct_coop_enhancer/Cargo.toml"
-          else
-            ENHANCER_CARGO="public/scct_coop_enhancer/Cargo.toml"
-          fi
-          VERSION=$(sed -n 's/^version[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']*\)["'"'"'].*/\1/p' "$ENHANCER_CARGO" | head -n 1)
-
           if [ -d "target/${{ matrix.target }}/release" ]; then
             TARGET_DIR="target/${{ matrix.target }}/release"
           elif [ -d "public/target/${{ matrix.target }}/release" ]; then
@@ -80,20 +73,12 @@ jobs:
 
           SRC="$TARGET_DIR/${{ matrix.artifact_name }}"
           cp "$SRC" "release_assets/${{ matrix.asset_name }}"
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp "$SRC" "release_assets/${{ matrix.artifact_name }}"
-            cp "$SRC" "release_assets/scct_coop_enhancer-${VERSION}.exe"
-            cp "$SRC" "release_assets/scct_coop_enhancer-v${VERSION}.exe"
-          else
-            cp "$SRC" "release_assets/scct_coop_enhancer-${VERSION}-linux-amd64"
-            cp "$SRC" "release_assets/scct_coop_enhancer-v${VERSION}-linux-amd64"
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.asset_name }}
-          path: release_assets/*
+          path: release_assets/${{ matrix.asset_name }}
 
   release:
     name: Create GitHub Release
@@ -134,12 +119,18 @@ jobs:
           prerelease: false
           files: release_assets/*
           body: |
-            ### Splinter Cell: Chaos Theory — Coop Mod & Launcher ${{ steps.get_version.outputs.VERSION }}
+            ### Splinter Cell: Chaos Theory — Coop Mod & Launcher v${{ steps.get_version.outputs.VERSION }}
             Automated release build for Splinter Cell: Chaos Theory Coop Mod & Online Launcher.
 
             #### Downloads:
-            - **Windows**: `scct_coop_enhancer-${{ steps.get_version.outputs.VERSION }}.exe` (or `scct_coop_enhancer.exe`)
-            - **Linux**: `scct_coop_enhancer-${{ steps.get_version.outputs.VERSION }}-linux-amd64`
+            - **Windows**: `scct_coop_enhancer-windows-amd64.exe`
+            - **Linux**: `scct_coop_enhancer-linux-amd64`
+
+            > **Note for Linux**: Make executable after downloading:
+            > ```bash
+            > chmod +x scct_coop_enhancer-linux-amd64
+            > ./scct_coop_enhancer-linux-amd64
+            > ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

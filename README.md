@@ -1,13 +1,45 @@
 # Splinter Cell: Chaos Theory — Enhanced Coop
 
----
+Mod for Splinter Cell: Chaos Theory that let's you:
+
+1. Play all single player levels in coop mode, in addition to standard coop levels.
+2. Play over internet. No longer requires LAN or virtual LANs like Hamachi/ZeroTier. You and your friend join each other with a 5-character friend code.
+
+Mod is 100% free and open source. You must have a valid copy of Splinter Cell Chaos Theory for it to work, e.g. via Steam.
+
+## How to use
+
+1. (Both) download the latest SCCT Coop Enhancer version from [the releases](https://github.com/sholtrop/scct_enhanced_coop/releases). E.g.
+   `scct_coop_enhancer-<version>.exe`.
+
+2. (Both) Run the executable. You will get a Windows Defender warning about this being a trojan. That is expected; Windows Defender is over-eager. If this happens, you will have to exempt this .exe in Windows Defender.
+
+If you do not trust the .exe, upload the it to [VirusTotal](https://www.virustotal.com/gui/home/upload) and you'll see only one vendor (SecureAge) complaining.
+
+3. (Both) You will see this UI: [public/images/coop_mod_ui.png]. Locate your Splinter Cell Chaos Theory installation. Note, the SCCT Coop Enhancer auto-locates common installation locations, such as Steam, but you can find it manually if you want another one.
+
+4. (Both) Click the "Install Mod" button
+
+5. One of you must click "Host Game". That person will get a 5-character friend code.
+
+6. The other person must enter this friend code under "Join a Friend" and click "Join Game". You should now both see that you are connected.
+
+7. (Both) Click "Launch Game"
+
+8. In game, go to Coop -> Enhanced Coop. One of you can create a game (doesn't matter which one) and the other can join.
+
+## FAQ
+
+### Q: Does this work on Linux?
+
+A: Binary releases are available for Linux, but I have **not** tested this on Linux under `wine` or Proton, etc.
 
 ## Technical docs
 
 This _SCCT Enhanced Coop_ mod consists of two parts:
 
 1. **`scct_coop_server`**: A lightweight RFC 5389 STUN server and Axum HTTP signaling rendezvous server. Used for room code pairing and NAT hole-punching.
-2. **`scct_coop_enhancer`**: The cross-platform desktop GUI launcher that handles mod installation, game launch, STUN hole-punching, in-memory runtime hooks.
+2. **`scct_coop_enhancer`**: A desktop GUI launcher that handles mod installation, game launch, STUN hole-punching, in-memory runtime hooks.
 
 ### SCCT Coop Enhancer
 
@@ -49,3 +81,7 @@ designed to be run behind a reverse-proxy that can terminate TLS for you.
 | `BAN_404_WINDOW_SECS`   | `60`          | Time window (in seconds) for tracking 404 responses.                                   |                                                                  |
 | `BAN_DURATION_SECS`     | `900`         | Duration (in seconds) an IP remains banned after exceeding the 404 threshold (15 min). |                                                                  |
 | `RUST_LOG`              | `info`        | Global log filter (`error`, `warn`, `info`, `debug`, `trace`).                         | Use `info` in production; switch to `debug` for troubleshooting. |
+
+## License
+
+MIT
