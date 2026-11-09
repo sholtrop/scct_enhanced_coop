@@ -164,7 +164,9 @@ pub struct ExportEntry {
 
 #[derive(Debug, Clone)]
 pub struct UpkTables {
+    #[allow(dead_code)]
     pub version: u16,
+    #[allow(dead_code)]
     pub lic_mode: u16,
     pub name_count: usize,
     pub name_offset: usize,
@@ -174,7 +176,9 @@ pub struct UpkTables {
     pub import_offset: usize,
     pub imports_end: usize,
     pub imports: Vec<ImportEntry>,
+    #[allow(dead_code)]
     pub export_count: usize,
+    #[allow(dead_code)]
     pub export_offset: usize,
     pub exports_end: usize,
     pub exports: Vec<ExportEntry>,
@@ -315,10 +319,15 @@ pub fn parse_state_frame_end(data: &[u8], offset: usize) -> Result<usize> {
 #[derive(Debug, Clone)]
 pub struct RawProperty {
     pub name: String,
+    #[allow(dead_code)]
     pub name_idx: i32,
+    #[allow(dead_code)]
     pub ptype: u8,
+    #[allow(dead_code)]
     pub struct_name: Option<String>,
+    #[allow(dead_code)]
     pub prop_start: usize,
+    #[allow(dead_code)]
     pub val_end: usize,
     pub raw_full: Vec<u8>,
     pub raw_header: Vec<u8>,
@@ -419,10 +428,13 @@ pub fn parse_tagged_properties_raw(
 #[derive(Debug, Clone)]
 pub struct MapPatchSummary {
     pub size: usize,
+    #[allow(dead_code)]
     pub p1_name: String,
+    #[allow(dead_code)]
     pub p2_name: String,
     pub p1_loc: (f32, f32, f32),
     pub p2_loc: (f32, f32, f32),
+    #[allow(dead_code)]
     pub havok_offset: usize,
 }
 
@@ -464,6 +476,7 @@ pub fn patch_sp_map_to_coop(
     }
 
     let idx_b_multiplayer_map = ensure_name(&mut names, &mut name_to_idx, "bMultiplayerMap", 0x00070010);
+    let idx_use_default_sound_map = ensure_name(&mut names, &mut name_to_idx, "UseDefaultSoundMap", 0x00070010);
     let idx_sam_mesh = ensure_name(&mut names, &mut name_to_idx, "SamMesh", 0x00070010);
     let idx_start_mesh = ensure_name(&mut names, &mut name_to_idx, "StartMesh", 0x00070010);
     let idx_coop_player = ensure_name(&mut names, &mut name_to_idx, "COOP_Player", 0x00070010);
@@ -537,11 +550,12 @@ pub fn patch_sp_map_to_coop(
     let (li_head_props, li_first_none, _) = parse_tagged_properties_raw(&names, &orig_data, li_prop_start, li_end)?;
     let mut filtered_li_head = Vec::new();
     for p in &li_head_props {
-        if p.name != "SamMesh" && p.name != "bMultiplayerMap" {
+        if p.name != "SamMesh" && p.name != "bMultiplayerMap" && p.name != "UseDefaultSoundMap" {
             filtered_li_head.extend_from_slice(&p.raw_full);
         }
     }
     let mut li_coop_props = serialize_bool_property(idx_b_multiplayer_map, true);
+    li_coop_props.extend_from_slice(&serialize_bool_property(idx_use_default_sound_map, false));
     li_coop_props.extend_from_slice(&serialize_object_property(idx_sam_mesh, coop_player_mesh_ref));
 
     let mut patched_levelinfo_bytes = Vec::new();

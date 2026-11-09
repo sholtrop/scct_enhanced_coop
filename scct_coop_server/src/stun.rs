@@ -1,3 +1,4 @@
+#[cfg(test)]
 use rand::{rng, RngCore};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
@@ -33,7 +34,7 @@ pub type Result<T> = std::result::Result<T, StunError>;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TransactionId(pub [u8; 12]);
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl TransactionId {
     pub fn random() -> Self {
         let mut b = [0u8; 12];
@@ -224,7 +225,7 @@ pub struct StunMessage {
 }
 
 impl StunMessage {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn binding_request() -> Self {
         Self {
             msg_type: MessageType::BindingRequest,
@@ -241,7 +242,7 @@ impl StunMessage {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn mapped_address(&self) -> Result<SocketAddr> {
         for attr in &self.attrs {
             if let Attribute::XorMappedAddress(sa) = attr {

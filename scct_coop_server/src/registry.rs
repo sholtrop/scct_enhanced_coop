@@ -43,12 +43,8 @@ pub struct ClientEndpoints {
 
 #[derive(Debug, Clone)]
 pub struct Session {
-    #[allow(dead_code)]
-    pub friend_code: String,
     pub host_endpoints: ClientEndpoints,
     pub guest_endpoints: Option<ClientEndpoints>,
-    #[allow(dead_code)]
-    pub created_at: Instant,
     pub last_seen: Instant,
 }
 
@@ -118,21 +114,13 @@ impl FriendCodeRegistry {
 
         let now = Instant::now();
         let session = Session {
-            friend_code: final_code.clone(),
             host_endpoints,
             guest_endpoints: None,
-            created_at: now,
             last_seen: now,
         };
 
         self.sessions.insert(final_code.clone(), session);
         RegisterResult::Success(final_code)
-    }
-
-    #[allow(dead_code)]
-    pub fn lookup(&self, friend_code: &str) -> Option<Session> {
-        let code = normalize_friend_code(friend_code);
-        self.sessions.get(&code).map(|s| s.clone())
     }
 
     /// Guest attempts to join a room.

@@ -6,17 +6,75 @@ use anyhow::Result;
 use std::net::Ipv4Addr;
 use std::path::Path;
 
+pub struct GameProcess {
+    pub pid: u32,
+    #[cfg(windows)]
+    handle_val: usize,
+    #[cfg(not(windows))]
+    child: std::process::Child,
+}
+
+impl GameProcess {
+    pub fn wait_for_exit(mut self) {
+        #[cfg(windows)]
+        {
+            if self.handle_val != 0 {
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+                    WaitForSingleObject(
+                        self.handle_val as windows_sys::Win32::Foundation::HANDLE,
+                        INFINITE,
+                    );
+                    windows_sys::Win32::Foundation::CloseHandle(
+                        self.handle_val as windows_sys::Win32::Foundation::HANDLE,
+                    );
+                }
+                self.handle_val = 0;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = self.child.wait();
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for GameProcess {
+    fn drop(&mut self) {
+        if self.handle_val != 0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(
+                    self.handle_val as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+            self.handle_val = 0;
+        }
+    }
+}
+
+#[cfg(windows)]
 pub const CAVE_INHERITED_SOCK_9100: usize = 0x113303D0;
+#[cfg(windows)]
 pub const CAVE_INHERITED_SOCK_9103: usize = 0x113303D4;
+#[cfg(windows)]
 pub const CAVE_INHERITED_PRIMED_9100: usize = 0x113303D8;
+#[cfg(windows)]
 pub const CAVE_INHERITED_PRIMED_9103: usize = 0x113303DC;
+#[cfg(windows)]
 pub const CAVE_LAST_9103_KEEPALIVE_VA: usize = crate::net::G_LAST_9103_KEEPALIVE_VA as usize;
+#[cfg(windows)]
 pub const CAVE_LAST_9100_KEEPALIVE_VA: usize = crate::net::G_LAST_9100_KEEPALIVE_VA as usize;
 
+#[cfg(windows)]
 pub const CAVE_ONLINE_ENABLED_VA: usize = crate::net::CAVE_ONLINE_ENABLED_VA as usize;
+#[cfg(windows)]
 pub const CAVE_ONLINE_IP_VA: usize = crate::net::CAVE_ONLINE_IP_VA as usize;
+#[cfg(windows)]
 pub const CAVE_ONLINE_PORT_VA: usize = crate::net::CAVE_ONLINE_PORT_VA as usize;
+#[cfg(windows)]
 pub const JOIN_GAME_PORT_VA: usize = crate::net::JOIN_GAME_PORT_VA as usize;
+#[cfg(windows)]
 pub const CAVE_LAN_PEER_VA: usize = 0x113303A0;
 
 #[cfg(windows)]
@@ -66,18 +124,13 @@ pub fn launch_game(
     peer_ip: Option<Ipv4Addr>,
     peer_disco_port: u16,
     peer_game_port: u16,
-) -> Result<u32> {
+) -> Result<GameProcess> {
     use std::ffi::CString;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
     use windows_sys::Win32::System::Threading::{
         CreateProcessA, ResumeThread, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOA,
     };
-
-    // Always update direct_ip.ini in System folder
-    let sys_dir = crate::patcher::find_child_ci(game_dir, "System");
-    let ini_path = sys_dir.join("direct_ip.ini");
-    let _ = crate::net::save_direct_target_ini(&ini_path, peer_ip, peer_disco_port, peer_game_port);
 
     let exe_str = CString::new(exe_path.to_string_lossy().as_bytes())?;
     let dir_str = CString::new(game_dir.to_string_lossy().as_bytes())?;
@@ -172,41 +225,29 @@ pub fn launch_game(
         // 3. Resume the game thread
         ResumeThread(h_thread);
         CloseHandle(h_thread);
-        CloseHandle(h_process);
     }
 
-    Ok(pid)
+    Ok(GameProcess {
+        pid,
+        handle_val: h_process as usize,
+    })
 }
 
 #[cfg(not(windows))]
 pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
-    peer_ip: Option<Ipv4Addr>,
-    peer_disco_port: u16,
-    peer_game_port: u16,
-) -> Result<u32> {
-    let sys_dir = crate::patcher::find_child_ci(game_dir, "System");
-    let ini_path = sys_dir.join("direct_ip.ini");
-    let _ = crate::net::save_direct_target_ini(&ini_path, peer_ip, peer_disco_port, peer_game_port);
-
+    _peer_ip: Option<Ipv4Addr>,
+    _peer_disco_port: u16,
+    _peer_game_port: u16,
+) -> Result<GameProcess> {
     let child = std::process::Command::new(exe_path)
         .current_dir(game_dir)
         .spawn()
         .with_context(|| format!("Launching {}", exe_path.display()))?;
 
-    Ok(child.id())
-}
-
-#[allow(dead_code)]
-pub fn launch_game_with_inherited_sockets(
-    exe_path: &Path,
-    game_dir: &Path,
-    _sock_disco: &std::net::UdpSocket,
-    _sock_game: &std::net::UdpSocket,
-    peer_ip: Option<Ipv4Addr>,
-    peer_disco_port: u16,
-    peer_game_port: u16,
-) -> Result<u32> {
-    launch_game(exe_path, game_dir, peer_ip, peer_disco_port, peer_game_port)
+    Ok(GameProcess {
+        pid: child.id(),
+        child,
+    })
 }

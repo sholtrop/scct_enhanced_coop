@@ -13,8 +13,11 @@ pub const UMD_VERSION: u32 = 1;
 pub struct UmdFooter {
     pub tag: u32,
     pub toc_offset: u32,
+    #[allow(dead_code)]
     pub total_size: u32,
+    #[allow(dead_code)]
     pub version: u32,
+    #[allow(dead_code)]
     pub magic: u32,
 }
 
@@ -527,6 +530,37 @@ fn append_virtual_file(
     (entries[ent_idx].path.clone(), new_off, old_sz, new_bytes.len())
 }
 
+fn upsert_virtual_file(
+    payload: &mut Vec<u8>,
+    entries: &mut Vec<UmdEntry>,
+    index_by_lower: &mut HashMap<String, usize>,
+    vpath_canonical: &str,
+    new_bytes: &[u8],
+) -> (String, usize, usize, usize) {
+    let vpath_lower = vpath_canonical.to_lowercase();
+    if index_by_lower.contains_key(&vpath_lower) {
+        return append_virtual_file(payload, entries, index_by_lower, &vpath_lower, new_bytes);
+    }
+    let pad = (-(payload.len() as isize) & 3) as usize;
+    if pad > 0 {
+        payload.resize(payload.len() + pad, 0);
+    }
+    let new_off = payload.len();
+    payload.extend_from_slice(new_bytes);
+    let mut raw_name = vpath_canonical.as_bytes().to_vec();
+    raw_name.push(0);
+    let new_idx = entries.len();
+    entries.push(UmdEntry {
+        raw_name,
+        path: vpath_canonical.to_string(),
+        offset: new_off,
+        size: new_bytes.len(),
+        flags: 0,
+    });
+    index_by_lower.insert(vpath_lower, new_idx);
+    (vpath_canonical.to_string(), new_off, 0, new_bytes.len())
+}
+
 pub fn patch_pregame_pc_coop_menu_caption(loc_bytes: &[u8]) -> Vec<u8> {
     let text: String = loc_bytes.iter().map(|&b| b as char).collect();
     let re_lan_cap = Regex::new(r"(?im)^LanCaption=[^\r\n]*").unwrap();
@@ -548,7 +582,7 @@ pub fn patch_umd_for_all_sp_levels(
     }
 
     let raw_umd = std::fs::read(umd_bak_path)?;
-    let (footer, mut entries, index_by_lower) = parse_umd_archive(&raw_umd)?;
+    let (footer, mut entries, mut index_by_lower) = parse_umd_archive(&raw_umd)?;
     let mut payload = raw_umd[..footer.toc_offset as usize].to_vec();
 
     normalize_umd_payload_baseline(&mut payload, &entries, &index_by_lower);
@@ -672,6 +706,38 @@ pub fn patch_umd_for_all_sp_levels(
         }
     }
 
+    // Clone level localization files (Data\System\Localization\<canonical_src>.<lang> -> <coop_map>.<lang>)
+    // so AEComputer ([Computer]/[Email]) and ECustomObjectiveInteraction ([Interaction]) resolve in-game text.
+    let mut cloned_loc_count = 0usize;
+    for spec in levels {
+        let coop_map = spec.coop_map;
+        let Some(info) = extracted.get(coop_map) else {
+            continue;
+        };
+        let src_stem_lower = info.canonical_src.to_lowercase();
+        for lang in LANG_EXTS {
+            let src_loc_key = format!("data\\system\\localization\\{}.{}", src_stem_lower, lang);
+            let Some(&src_idx) = index_by_lower.get(&src_loc_key) else {
+                continue;
+            };
+            let src_ent = &entries[src_idx];
+            let src_bytes = payload[src_ent.offset..src_ent.offset + src_ent.size].to_vec();
+            let dst_canonical = format!("Data\\System\\Localization\\{}.{}", coop_map, lang);
+            upsert_virtual_file(
+                &mut payload,
+                &mut entries,
+                &mut index_by_lower,
+                &dst_canonical,
+                &src_bytes,
+            );
+            cloned_loc_count += 1;
+        }
+    }
+    crate::scct_log!(
+        "  [UMD] Added {} Data\\System\\Localization\\*_COOP.<lang> entries for computers, emails, and interactions",
+        cloned_loc_count
+    );
+
     // Update Coop menu LAN button caption -> ENHANCED COOP in PreGame_PC localization files
     for lang in LANG_EXTS {
         let pg_key = format!("data\\system\\localization\\pregame_pc.{}", lang);
@@ -714,6 +780,39 @@ mod tests {
             patched,
             b"[MainMenuCoop]\r\nMainMenuCoopTitle=COOPERATIVO\r\nLanCaption=ENHANCED COOP\r\nOnlineCaption=ONLINE\r\nSettingsCaption=CONFIGURACI\xD3N\r\n"
         );
+    }
+
+    #[test]
+    fn test_upsert_virtual_file_inserts_and_updates() {
+        let mut payload = vec![1, 2, 3];
+        let mut entries = Vec::new();
+        let mut index_by_lower = HashMap::new();
+
+        let (p1, off1, old1, new1) = upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\System\\Localization\\01_Lighthouse_COOP.int",
+            b"[Email]\r\nEmail0101=Hello\r\n",
+        );
+        assert_eq!(p1, "Data\\System\\Localization\\01_Lighthouse_COOP.int");
+        assert_eq!(off1, 4);
+        assert_eq!(old1, 0);
+        assert_eq!(new1, 26);
+        assert_eq!(entries.len(), 1);
+
+        // Updating existing entry in-place in TOC without duplicating entry
+        let (_p2, off2, old2, new2) = upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\System\\Localization\\01_Lighthouse_COOP.int",
+            b"[Email]\r\nEmail0101=Updated\r\n",
+        );
+        assert_eq!(entries.len(), 1);
+        assert!(off2 > off1);
+        assert_eq!(old2, 26);
+        assert_eq!(new2, 28);
     }
 }
 

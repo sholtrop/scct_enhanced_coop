@@ -11,14 +11,10 @@ pub const PE_TEXT_RAW_SIZE: u32 = 0x007B6000;
 pub const PE_TEXT_PATCHED_VSIZE: u32 = 0x007B6000;
 pub const PE_DATA_PATCHED_VSIZE: u32 = 0x001A2400;
 pub const G_LAN_PEER_VA: u32 = 0x113303A0;
-pub const G_DIRECT_IP_U32_VA: u32 = 0x113303A4;
-pub const G_DIRECT_IP_ENABLED_VA: u32 = 0x113303A8;
 
-pub const G_INHERITED_SOCK_9100_VA: u32 = 0x113303D0;
-pub const G_INHERITED_SOCK_9103_VA: u32 = 0x113303D4;
-pub const G_INHERITED_PRIMED_9100_VA: u32 = 0x113303D8;
-pub const G_INHERITED_PRIMED_9103_VA: u32 = 0x113303DC;
+#[allow(dead_code)]
 pub const G_LAST_9103_KEEPALIVE_VA: u32 = 0x113303E0;
+#[allow(dead_code)]
 pub const G_LAST_9100_KEEPALIVE_VA: u32 = 0x113303E4;
 
 pub const NET_CAVE_VA: u32 = 0x110B6450;
@@ -62,10 +58,9 @@ pub const HOOK_QUAZAL_BIND: u32 = 0x110B6820;
 /// Discovery bind implementation: checks UDP port 9100, disables `SIO_UDP_CONNRESET`,
 /// handles primed sockets, and forces `INADDR_ANY` (`0.0.0.0`) so multi-NIC / WSL machines
 /// route and receive on all interfaces.
+#[cfg(test)]
 pub const HOOK_DISCOVERY_BIND_ANY: u32 = 0x110B6850;
-/// Port-aware Quazal `SocketDriver::Bind` implementation (`0x110B6892`):
-/// inspects bound `sin_port` at `[driver + 0x0A]` (`9100` vs `9103`) so Online Co-op punches
-/// `peer_disco_port` from `:9100` and `peer_game_port` from `:9103`.
+#[cfg(test)]
 pub const HOOK_QUAZAL_BIND_IMPL: u32 = 0x110B6892;
 /// Port-aware Quazal UDP poll hook (`SocketDriver::HasRecvCompleted` @ `0x10DE53B0`):
 /// sends a 3s keepalive from `:9100` -> `peer_disco_port` and `:9103` -> `peer_game_port`
@@ -197,8 +192,11 @@ pub const ONLINE_CAVE_ENABLED_OFFSET: usize = 0x20;
 pub const ONLINE_CAVE_IP_OFFSET: usize = 0x43;
 /// Big-endian (network order) destination port for the unicast copy. Defaults to 9100.
 pub const ONLINE_CAVE_PORT_OFFSET: usize = 0x4E;
+#[allow(dead_code)]
 pub const CAVE_ONLINE_ENABLED_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_ENABLED_OFFSET as u32;
+#[allow(dead_code)]
 pub const CAVE_ONLINE_IP_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_IP_OFFSET as u32;
+#[allow(dead_code)]
 pub const CAVE_ONLINE_PORT_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_PORT_OFFSET as u32;
 pub const DISCOVERY_PORT: u16 = 9100;
 pub const GAME_PORT: u16 = 9103;
@@ -224,6 +222,7 @@ pub struct PatchSite {
     pub va: u32,
     pub orig: Vec<u8>,
     pub new: Vec<u8>,
+    #[allow(dead_code)]
     pub desc: &'static str,
 }
 
@@ -657,30 +656,6 @@ pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
     true
 }
 
-pub fn get_direct_ip_from_exe(pe_bytes: &[u8]) -> Option<Ipv4Addr> {
-    if !is_online_coop_fix_applied(pe_bytes) {
-        return None;
-    }
-    let o = va_to_text_off(ONLINE_CAVE_VA).ok()?;
-    let enabled = pe_bytes[o + ONLINE_CAVE_ENABLED_OFFSET] == 1;
-    if !enabled {
-        return None;
-    }
-    let ip_bytes: [u8; 4] = pe_bytes[o + ONLINE_CAVE_IP_OFFSET..o + ONLINE_CAVE_IP_OFFSET + 4]
-        .try_into()
-        .ok()?;
-    let ip = Ipv4Addr::from(ip_bytes);
-    if ip.is_unspecified() {
-        None
-    } else {
-        Some(ip)
-    }
-}
-
-pub fn set_direct_ip_in_exe(pe_bytes: &mut [u8], ip: Option<Ipv4Addr>) -> Result<()> {
-    set_direct_target_in_exe(pe_bytes, ip, DISCOVERY_PORT, GAME_PORT)
-}
-
 /// Write the peer IP, discovery port, and gameplay port into the patched executable.
 pub fn set_direct_target_in_exe(
     pe_bytes: &mut [u8],
@@ -819,43 +794,6 @@ pub fn update_direct_target_in_exe(
     apply_online_coop_fix_with_ports(exe_path, exe_bak_path, target_ip, disco_port, game_port)
 }
 
-pub fn save_direct_target_ini(
-    ini_path: &Path,
-    ip: Option<Ipv4Addr>,
-    disco_port: u16,
-    game_port: u16,
-) -> Result<()> {
-    let content = match ip {
-        Some(addr) => format!(
-            "[Online]\nEnabled = 1\nHostIP = {}\nHostPort = {}\nHostGamePort = {}\n",
-            addr, disco_port, game_port
-        ),
-        None => "[Online]\nEnabled = 0\nHostIP = \nHostPort = \nHostGamePort = \n".to_string(),
-    };
-    fs::write(ini_path, content)?;
-    Ok(())
-}
-
-pub fn save_direct_ip_ini(ini_path: &Path, ip: Option<Ipv4Addr>) -> Result<()> {
-    save_direct_target_ini(ini_path, ip, DISCOVERY_PORT, GAME_PORT)
-}
-
-pub fn load_direct_ip_ini(ini_path: &Path) -> Option<Ipv4Addr> {
-    let content = fs::read_to_string(ini_path).ok()?;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("HostIP") {
-            let val = rest.trim().trim_start_matches('=').trim();
-            if let Ok(ip) = val.parse::<Ipv4Addr>()
-                && !ip.is_unspecified()
-            {
-                return Some(ip);
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,23 +911,6 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_ip_ini() {
-        let dir = std::env::temp_dir();
-        let ini_path = dir.join("test_direct_ip.ini");
-
-        let test_ip = Ipv4Addr::new(82, 165, 45, 112);
-        save_direct_target_ini(&ini_path, Some(test_ip), 2380, 2383).unwrap();
-        let loaded = load_direct_ip_ini(&ini_path);
-        assert_eq!(loaded, Some(test_ip));
-
-        save_direct_ip_ini(&ini_path, None).unwrap();
-        let cleared = load_direct_ip_ini(&ini_path);
-        assert_eq!(cleared, None);
-
-        let _ = fs::remove_file(ini_path);
-    }
-
-    #[test]
     fn test_apply_online_coop_fix() {
         let p1 = Path::new("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe");
         let p2 = Path::new("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe");
@@ -1012,7 +933,8 @@ mod tests {
 
         let buf = fs::read(&test_exe).unwrap();
         assert!(is_online_coop_fix_applied(&buf));
-        assert_eq!(get_direct_ip_from_exe(&buf), Some(test_ip));
+        let ip_off = va_to_text_off(CAVE_ONLINE_IP_VA).unwrap();
+        assert_eq!(&buf[ip_off..ip_off + 4], &test_ip.octets());
         let jp_off = va_to_text_off(JOIN_GAME_PORT_VA).unwrap();
         assert_eq!(&buf[jp_off..jp_off + 4], &2383u32.to_le_bytes());
         let dp_off = va_to_text_off(CAVE_ONLINE_PORT_VA).unwrap();
@@ -1035,7 +957,8 @@ mod tests {
         apply_online_coop_fix(&test_exe, &test_bak, None).unwrap();
         let buf2 = fs::read(&test_exe).unwrap();
         assert!(is_online_coop_fix_applied(&buf2));
-        assert_eq!(get_direct_ip_from_exe(&buf2), None);
+        let en_off = va_to_text_off(CAVE_ONLINE_ENABLED_VA).unwrap();
+        assert_eq!(buf2[en_off], 0);
         assert_eq!(&buf2[jp_off..jp_off + 4], &(GAME_PORT as u32).to_le_bytes());
         assert_eq!(&buf2[dp_off..dp_off + 2], &DISCOVERY_PORT.to_be_bytes());
 

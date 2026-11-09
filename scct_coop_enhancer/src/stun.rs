@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rand::{rng, Rng, RngCore};
+use rand::{rng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -16,16 +16,6 @@ pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 pub const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
 pub const CROCKFORD_CHARS: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-pub fn generate_friend_code() -> String {
-    let mut code = String::with_capacity(5);
-    let mut r = rng();
-    for _ in 0..5 {
-        let idx = r.random_range(0..CROCKFORD_CHARS.len());
-        code.push(CROCKFORD_CHARS[idx] as char);
-    }
-    code
-}
 
 pub fn normalize_friend_code(input: &str) -> String {
     input
@@ -53,9 +43,7 @@ impl TransactionId {
     }
 }
 
-pub struct StunMessage {
-    pub txn_id: TransactionId,
-}
+pub struct StunMessage;
 
 impl StunMessage {
     pub fn build_binding_request() -> (TransactionId, Vec<u8>) {
@@ -209,8 +197,6 @@ struct ApiRegisterResp {
     status: Option<String>,
     #[serde(default)]
     friend_code: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -411,15 +397,6 @@ pub fn punch_udp_holes(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_friend_code_generator() {
-        let code = generate_friend_code();
-        assert_eq!(code.len(), 5);
-        for b in code.bytes() {
-            assert!(CROCKFORD_CHARS.contains(&b));
-        }
-    }
 
     #[test]
     fn test_normalize_code() {

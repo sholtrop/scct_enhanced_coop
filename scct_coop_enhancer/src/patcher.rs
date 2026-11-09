@@ -41,13 +41,12 @@ macro_rules! scct_log {
 }
 
 use crate::levels::{SP_COOP_LEVELS, VANILLA_COOP_STEMS};
-use crate::net::{apply_online_coop_fix, save_direct_ip_ini};
+use crate::net::apply_online_coop_fix;
 use crate::umd::{
     append_missions_to_map_rotation, build_appended_coop_ini, normalize_umd_payload_baseline,
     parse_umd_archive, patch_umd_for_all_sp_levels,
 };
 use crate::upk::patch_sp_map_to_coop;
-use std::net::Ipv4Addr;
 
 pub const MOD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_FILENAME: &str = "scct_coop_version.txt";
@@ -400,6 +399,57 @@ pub fn ensure_clean_sp_maps_and_cleanup(
     Ok(())
 }
 
+/// Bytecode pattern in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008):
+/// `ClassName = "EchelonPattern.V" $ temp;` (`00 40 02` = local `temp`, export 128).
+const ENGINE_U_VAR_OBJECT_ORIG: &[u8] =
+    b"\x0f\x00\x7b\x08\x70\x1fEchelonPattern.V\x00\x00\x40\x02\x16";
+
+/// Patched bytecode in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008):
+/// `ClassName = "EchelonPattern.V" $ SoundMapName;` (`01 7a 16` = `self.SoundMapName`, export 1466).
+const ENGINE_U_VAR_OBJECT_PATCHED: &[u8] =
+    b"\x0f\x00\x7b\x08\x70\x1fEchelonPattern.V\x00\x01\x7a\x16\x16";
+
+pub fn patch_engine_u_var_object_bytes(data: &mut [u8]) -> Result<usize> {
+    assert_eq!(
+        ENGINE_U_VAR_OBJECT_ORIG.len(),
+        ENGINE_U_VAR_OBJECT_PATCHED.len()
+    );
+    let nlen = ENGINE_U_VAR_OBJECT_ORIG.len();
+    if let Some(pos) = data.windows(nlen).position(|w| w == ENGINE_U_VAR_OBJECT_ORIG) {
+        data[pos..pos + nlen].copy_from_slice(ENGINE_U_VAR_OBJECT_PATCHED);
+        return Ok(pos);
+    }
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_VAR_OBJECT_PATCHED)
+    {
+        return Ok(pos);
+    }
+    bail!("Could not locate LevelInfo.PostBeginPlay VarObject bytecode pattern in Engine.u");
+}
+
+pub fn patch_engine_u_var_object(engine_u_path: &Path, engine_u_bak_path: &Path) -> Result<()> {
+    if !engine_u_bak_path.exists() {
+        if !engine_u_path.exists() {
+            bail!("Missing System/Engine.u: {}", engine_u_path.display());
+        }
+        scct_log!(
+            "  [BAK] Creating clean Engine.u backup -> {} ...",
+            engine_u_bak_path.display()
+        );
+        std::fs::copy(engine_u_path, engine_u_bak_path)?;
+    }
+
+    let mut data = std::fs::read(engine_u_bak_path)?;
+    let offset = patch_engine_u_var_object_bytes(&mut data)?;
+    std::fs::write(engine_u_path, &data)?;
+    scct_log!(
+        "  [UPK] Patched System/Engine.u LevelInfo.PostBeginPlay @ 0x{:06X} (VarObject uses SoundMapName)",
+        offset
+    );
+    Ok(())
+}
+
 pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     let system_dir = find_child_ci(game_root, "System");
     let data_dir = find_child_ci(game_root, "Data");
@@ -416,6 +466,9 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
 
+    let engine_u_path = find_child_ci(&system_dir, "Engine.u");
+    let engine_u_bak_path = system_dir.join("Engine.u.bak");
+
     scct_log!("\n=== Step 1: Multi-NIC LAN & Online Coop Networking Fix (`splintercell3.exe`) ===");
     if skip_net_fix {
         if exe_bak_path.exists() {
@@ -426,8 +479,11 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         apply_online_coop_fix(&exe_path, &exe_bak_path, None)?;
     }
 
-    scct_log!("\n=== Step 2: Patching `System/dynamic-pc.umd` (Coop Dropdown + Localization) ===");
+    scct_log!("\n=== Step 2: Patching `System/dynamic-pc.umd` & `System/Engine.u` (Coop Dropdown, Localization, & Voice Lines) ===");
     let extracted = patch_umd_for_all_sp_levels(&umd_path, &umd_bak_path, SP_COOP_LEVELS)?;
+    if engine_u_path.exists() || engine_u_bak_path.exists() {
+        patch_engine_u_var_object(&engine_u_path, &engine_u_bak_path)?;
+    }
 
     scct_log!("\n=== Step 3: Building All 11 Coop-Patched SP Maps (`Data/Maps/*_COOP.scl`) ===");
     let active_stems: HashSet<String> = SP_COOP_LEVELS
@@ -550,10 +606,18 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
 
+    let engine_u_path = find_child_ci(&system_dir, "Engine.u");
+    let engine_u_bak_path = system_dir.join("Engine.u.bak");
+
     scct_log!("=== Restoring 100% Vanilla Splinter Cell: Chaos Theory ===");
     if exe_bak_path.exists() {
         std::fs::copy(&exe_bak_path, &exe_path)?;
         scct_log!("  [EXE] Restored vanilla System/splintercell3.exe");
+    }
+
+    if engine_u_bak_path.exists() {
+        std::fs::copy(&engine_u_bak_path, &engine_u_path)?;
+        scct_log!("  [UPK] Restored vanilla System/Engine.u");
     }
 
     if umd_bak_path.exists() {
@@ -589,17 +653,6 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn apply_online_patch(game_root: &Path, target_ip: Option<Ipv4Addr>) -> Result<()> {
-    let system_dir = find_child_ci(game_root, "System");
-    let exe_path = find_child_ci(&system_dir, "splintercell3.exe");
-    let exe_bak_path = system_dir.join("splintercell3.exe.bak");
-    let ini_path = system_dir.join("direct_ip.ini");
-
-    apply_online_coop_fix(&exe_path, &exe_bak_path, target_ip)?;
-    save_direct_ip_ini(&ini_path, target_ip)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +679,23 @@ mod tests {
         assert_eq!(get_installed_version(&dir), None);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_patch_engine_u_var_object_bytes() {
+        let mut buf = vec![0xAA; 64];
+        buf.extend_from_slice(ENGINE_U_VAR_OBJECT_ORIG);
+        buf.extend_from_slice(&[0xBB; 32]);
+
+        let off1 = patch_engine_u_var_object_bytes(&mut buf).unwrap();
+        assert_eq!(off1, 64);
+        assert_eq!(
+            &buf[64..64 + ENGINE_U_VAR_OBJECT_PATCHED.len()],
+            ENGINE_U_VAR_OBJECT_PATCHED
+        );
+
+        // Idempotent second call
+        let off2 = patch_engine_u_var_object_bytes(&mut buf).unwrap();
+        assert_eq!(off2, 64);
     }
 }

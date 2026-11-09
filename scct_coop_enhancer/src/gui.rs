@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
 use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::Duration;
 
@@ -128,6 +128,7 @@ pub enum GuiEvent {
         keepalive: Option<KeepaliveHandle>,
     },
     MatchFailed(String),
+    GameExited(u32),
 }
 
 pub struct PatcherApp {
@@ -140,6 +141,9 @@ pub struct PatcherApp {
     log_lines: Vec<String>,
     receiver: Receiver<GuiEvent>,
     sender: Sender<GuiEvent>,
+
+    // Running game process
+    running_game_pid: Option<u32>,
 
     // Friend Code Matchmaking
     match_state: MatchState,
@@ -154,7 +158,15 @@ pub struct PatcherApp {
 }
 
 impl PatcherApp {
-    pub fn new(_cc: &eframe::CreationContext, explicit_dir: Option<PathBuf>) -> Self {
+    pub fn new(cc: &eframe::CreationContext, explicit_dir: Option<PathBuf>) -> Self {
+        // Force dark mode regardless of OS light/dark theme preference
+        let mut dark_visuals = egui::Visuals::dark();
+        dark_visuals.panel_fill = Color32::from_rgb(18, 20, 24);
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, dark_visuals.clone());
+        cc.egui_ctx.set_visuals_of(egui::Theme::Light, dark_visuals.clone());
+        cc.egui_ctx.set_visuals(dark_visuals);
+
         let (sender, receiver) = channel();
 
         let mut app = Self {
@@ -167,6 +179,7 @@ impl PatcherApp {
             log_lines: Vec::new(),
             receiver,
             sender,
+            running_game_pid: None,
             match_state: MatchState::Idle,
             guest_code_input: String::new(),
             cancel_tx: None,
@@ -211,7 +224,11 @@ impl PatcherApp {
         self.game_dir_input = root.display().to_string();
         self.installed_version = crate::patcher::get_installed_version(&root);
         if let Some(ref ver) = self.installed_version {
-            self.detection_msg = format!("Game detected: {} (Co-op Mod v{} installed)", root.display(), ver);
+            self.detection_msg = format!(
+                "Game detected: {} (Co-op Mod v{} installed)",
+                root.display(),
+                ver
+            );
         } else {
             self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
         }
@@ -311,7 +328,13 @@ impl PatcherApp {
                     peer_game_port,
                     game_launched,
                     ..
-                } => (is_host, peer_ip, peer_disco_port, peer_game_port, game_launched),
+                } => (
+                    is_host,
+                    peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    game_launched,
+                ),
                 _ => return,
             };
 
@@ -339,13 +362,6 @@ impl PatcherApp {
 
         self.stop_keepalive();
 
-        let ini_path = sys_dir.join("direct_ip.ini");
-        let _ = crate::net::save_direct_target_ini(
-            &ini_path,
-            Some(peer_ip),
-            peer_disco_port,
-            peer_game_port,
-        );
         let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
         if let Err(e) = crate::net::update_direct_target_in_exe(
             &exe_path,
@@ -369,7 +385,9 @@ impl PatcherApp {
             peer_disco_port,
             peer_game_port,
         ) {
-            Ok(pid) => {
+            Ok(proc) => {
+                let pid = proc.pid;
+                self.running_game_pid = Some(pid);
                 if let MatchState::Matched {
                     ref mut game_launched,
                     ..
@@ -377,6 +395,13 @@ impl PatcherApp {
                 {
                     *game_launched = true;
                 }
+                let tx = self.sender.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    proc.wait_for_exit();
+                    let _ = tx.send(GuiEvent::GameExited(pid));
+                    ctx_clone.request_repaint();
+                });
                 self.log_lines.push(format!(
                     ">>> Chaos Theory Coop launched successfully (PID: {})!",
                     pid
@@ -385,12 +410,12 @@ impl PatcherApp {
                     .push(">>> Connected directly to your friend!".to_string());
                 if is_host {
                     self.log_lines.push(
-                        ">>> [HOST]: In game, select Coop -> LAN -> Host Game to create your match."
+                        ">>> [HOST]: In game, select Coop -> Enhanced Coop -> Host Game to create your match."
                             .to_string(),
                     );
                 } else {
                     self.log_lines.push(
-                        ">>> [GUEST]: In game, select Coop -> LAN to find and join your friend's game."
+                        ">>> [GUEST]: In game, select Coop -> Enhanced Coop to find and join your friend's game."
                             .to_string(),
                     );
                 }
@@ -422,8 +447,6 @@ impl PatcherApp {
 
         self.stop_keepalive();
 
-        let ini_path = sys_dir.join("direct_ip.ini");
-        let _ = crate::net::save_direct_ip_ini(&ini_path, None);
         let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
         if let Err(e) = crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None) {
             self.log_lines.push(format!(
@@ -441,13 +464,22 @@ impl PatcherApp {
             crate::net::DISCOVERY_PORT,
             crate::net::GAME_PORT,
         ) {
-            Ok(pid) => {
+            Ok(proc) => {
+                let pid = proc.pid;
+                self.running_game_pid = Some(pid);
+                let tx = self.sender.clone();
+                let ctx_clone = ctx.clone();
+                thread::spawn(move || {
+                    proc.wait_for_exit();
+                    let _ = tx.send(GuiEvent::GameExited(pid));
+                    ctx_clone.request_repaint();
+                });
                 self.log_lines.push(format!(
                     ">>> Chaos Theory launched (PID: {}) in standard LAN mode!",
                     pid
                 ));
                 self.log_lines.push(
-                    ">>> In game, select Coop -> LAN to host or join on your local network."
+                    ">>> In game, select Coop -> Enhanced Coop to host or join on your local network."
                         .to_string(),
                 );
             }
@@ -477,7 +509,9 @@ impl eframe::App for PatcherApp {
                         self.detection_msg = format!(
                             "Game detected: {} (Co-op Mod v{} installed)",
                             root.display(),
-                            self.installed_version.as_deref().unwrap_or(crate::patcher::MOD_VERSION)
+                            self.installed_version
+                                .as_deref()
+                                .unwrap_or(crate::patcher::MOD_VERSION)
                         );
                     }
                 }
@@ -490,7 +524,8 @@ impl eframe::App for PatcherApp {
                     if ok {
                         self.installed_version = None;
                         if let Some(ref root) = self.resolved_root {
-                            self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
+                            self.detection_msg =
+                                format!("Game detected: {} (Vanilla)", root.display());
                         }
                     }
                 }
@@ -537,10 +572,28 @@ impl eframe::App for PatcherApp {
                     self.stop_keepalive();
                     self.match_state = MatchState::Failed { error };
                 }
+                GuiEvent::GameExited(pid) => {
+                    if self.running_game_pid == Some(pid) {
+                        self.running_game_pid = None;
+                    }
+                    if let MatchState::Matched {
+                        ref mut game_launched,
+                        ..
+                    } = self.match_state
+                    {
+                        *game_launched = false;
+                    }
+                    self.log_lines.push(format!(
+                        ">>> Splinter Cell Chaos Theory (PID: {}) has exited.",
+                        pid
+                    ));
+                }
             }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        let central_frame = egui::Frame::central_panel(&ctx.style())
+            .fill(Color32::from_rgb(18, 20, 24));
+        egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             ui.add_space(4.0);
 
             // Title
@@ -854,16 +907,16 @@ impl eframe::App for PatcherApp {
             // =================================================================
             let online_frame = egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(20, 24, 30))
-                .inner_margin(10.0);
+                .inner_margin(12.0);
 
             online_frame.show(ui, |ui| {
                 ui.heading(
                     RichText::new("🌐 Online Co-op with Friends")
-                        .size(14.0)
+                        .size(15.0)
                         .strong(),
                 );
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
 
                 let mut action_cancel = false;
                 let mut action_launch = false;
@@ -873,49 +926,55 @@ impl eframe::App for PatcherApp {
                         ui.columns(2, |cols| {
                             // Left Column: Host a Session
                             let left_frame = egui::Frame::group(cols[0].style())
-                                .fill(Color32::from_rgb(26, 32, 40))
-                                .inner_margin(8.0);
+                                .fill(Color32::from_rgb(26, 33, 44))
+                                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 62, 80)))
+                                .inner_margin(14.0);
                             left_frame.show(&mut cols[0], |ui| {
-                                ui.label(RichText::new("Host a Game").strong().size(13.0));
+                                ui.label(RichText::new("Host a Game").strong().size(15.0).color(Color32::WHITE));
                                 ui.label(
                                     RichText::new(
                                         "Generates a 5-letter code to give to your friend to connect.",
                                     )
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(180, 180, 180)),
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(180, 190, 205)),
                                 );
-                                ui.add_space(6.0);
-                                if ui
-                                    .button(
-                                        RichText::new("🎮 Host Game")
-                                            .size(12.5)
-                                            .strong()
-                                            .color(Color32::WHITE),
-                                    )
-                                    .clicked()
-                                {
+                                ui.add_space(10.0);
+                                let host_btn = egui::Button::new(
+                                    RichText::new("🎮 Host Game")
+                                        .size(14.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(35, 100, 180))
+                                .min_size(Vec2::new(ui.available_width(), 38.0));
+
+                                if ui.add(host_btn).clicked() {
                                     self.start_hosting(ctx);
                                 }
                             });
 
                             // Right Column: Join a Friend
                             let right_frame = egui::Frame::group(cols[1].style())
-                                .fill(Color32::from_rgb(26, 32, 40))
-                                .inner_margin(8.0);
+                                .fill(Color32::from_rgb(26, 33, 44))
+                                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(50, 62, 80)))
+                                .inner_margin(14.0);
                             right_frame.show(&mut cols[1], |ui| {
-                                ui.label(RichText::new("Join a Friend").strong().size(13.0));
+                                ui.label(RichText::new("Join a Friend").strong().size(15.0).color(Color32::WHITE));
                                 ui.label(
                                     RichText::new(
                                         "Enter your friend's 5-letter code to connect directly.",
                                     )
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(180, 180, 180)),
+                                    .size(12.0)
+                                    .color(Color32::from_rgb(180, 190, 205)),
                                 );
-                                ui.add_space(4.0);
+                                ui.add_space(10.0);
                                 ui.horizontal(|ui| {
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(&mut self.guest_code_input)
-                                            .desired_width(75.0)
+                                            .char_limit(5)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(100.0)
+                                            .min_size(Vec2::new(100.0, 38.0))
                                             .hint_text("K7X9B"),
                                     );
                                     if resp.changed() {
@@ -924,17 +983,24 @@ impl eframe::App for PatcherApp {
                                     }
 
                                     let can_join = self.guest_code_input.len() == 5;
-                                    if ui
-                                        .add_enabled(
-                                            can_join,
-                                            egui::Button::new(
-                                                RichText::new("🔗 Join Game")
-                                                    .size(12.0)
-                                                    .strong(),
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
+                                    let join_btn = egui::Button::new(
+                                        RichText::new("🔗 Join Game")
+                                            .size(14.5)
+                                            .strong()
+                                            .color(if can_join {
+                                                Color32::WHITE
+                                            } else {
+                                                Color32::from_rgb(160, 165, 175)
+                                            }),
+                                    )
+                                    .fill(if can_join {
+                                        Color32::from_rgb(35, 100, 180)
+                                    } else {
+                                        Color32::from_rgb(45, 55, 68)
+                                    })
+                                    .min_size(Vec2::new(ui.available_width(), 38.0));
+
+                                    if ui.add_enabled(can_join, join_btn).clicked() {
                                         self.start_joining(ctx);
                                     }
                                 });
@@ -946,7 +1012,7 @@ impl eframe::App for PatcherApp {
                         let host_box = egui::Frame::group(ui.style())
                             .fill(Color32::from_rgb(24, 34, 46))
                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 120, 200)))
-                            .inner_margin(10.0);
+                            .inner_margin(14.0);
                         let cur_code = code.clone();
                         let cur_status = status_text.clone();
                         host_box.show(ui, |ui| {
@@ -990,7 +1056,7 @@ impl eframe::App for PatcherApp {
                         let join_box = egui::Frame::group(ui.style())
                             .fill(Color32::from_rgb(24, 34, 46))
                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(60, 120, 200)))
-                            .inner_margin(10.0);
+                            .inner_margin(14.0);
                         let cur_target = target_code.clone();
                         let cur_status = status_text.clone();
                         join_box.show(ui, |ui| {
@@ -1033,7 +1099,7 @@ impl eframe::App for PatcherApp {
                         let matched_box = egui::Frame::group(ui.style())
                             .fill(Color32::from_rgb(18, 38, 28))
                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(80, 200, 120)))
-                            .inner_margin(10.0);
+                            .inner_margin(14.0);
                         let info_text = format!(
                             "(Code: {}, Role: {})",
                             code,
@@ -1045,44 +1111,47 @@ impl eframe::App for PatcherApp {
                                 ui.label(
                                     RichText::new("✔ Connected to Friend!")
                                         .strong()
-                                        .size(14.0)
+                                        .size(15.0)
                                         .color(Color32::from_rgb(100, 240, 140)),
                                 );
                                 ui.label(
                                     RichText::new(info_text)
-                                        .size(11.5)
+                                        .size(12.5)
                                         .color(Color32::from_rgb(180, 220, 200)),
                                 );
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.button(RichText::new("❌ Disconnect").size(11.5)).clicked() {
+                                    if ui.button(RichText::new("❌ Disconnect").size(12.0)).clicked() {
                                         action_cancel = true;
                                     }
                                 });
                             });
 
-                            ui.add_space(6.0);
+                            ui.add_space(8.0);
 
                             if !is_launched {
                                 let launch_btn = egui::Button::new(
                                     RichText::new("🚀 Launch Game (Co-op)")
-                                        .size(14.0)
+                                        .size(14.5)
                                         .strong()
                                         .color(Color32::WHITE),
                                 )
                                 .fill(Color32::from_rgb(32, 140, 60))
-                                .min_size(Vec2::new(ui.available_width(), 32.0));
+                                .min_size(Vec2::new(ui.available_width(), 38.0));
 
                                 if ui.add(launch_btn).clicked() {
                                     action_launch = true;
                                 }
                             } else {
-                                ui.label(
-                                    RichText::new("✔ Game is running! Enter the in-game co-op lobby.")
-                                        .size(12.5)
-                                        .strong()
-                                        .color(Color32::from_rgb(120, 230, 140)),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(
+                                        RichText::new("✔ Game is running! Enter the in-game co-op lobby.")
+                                            .size(13.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(120, 230, 140)),
+                                    );
+                                });
                             }
                         });
                     }
@@ -1212,7 +1281,9 @@ fn run_host_match(
     cancel_rx: Receiver<()>,
     ctx: egui::Context,
 ) {
-    let _ = tx.send(GuiEvent::Log("  [HOST] Initializing network session...".to_string()));
+    let _ = tx.send(GuiEvent::Log(
+        "  [HOST] Initializing network session...".to_string(),
+    ));
     ctx.request_repaint();
 
     // 1. Bind UDP sockets
@@ -1285,7 +1356,8 @@ fn run_host_match(
         .ok()
         .and_then(|mut a| a.next())
         .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip = crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
+    let my_local_ip =
+        crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
 
     let code = match crate::stun::register_with_server(
         &server_host,
@@ -1317,7 +1389,9 @@ fn run_host_match(
     let mut wait_ticks: u32 = 0;
     loop {
         if cancel_rx.try_recv().is_ok() {
-            let _ = tx.send(GuiEvent::Log("  [HOST] Hosting session cancelled.".to_string()));
+            let _ = tx.send(GuiEvent::Log(
+                "  [HOST] Hosting session cancelled.".to_string(),
+            ));
             ctx.request_repaint();
             return;
         }
@@ -1325,7 +1399,9 @@ fn run_host_match(
         thread::sleep(Duration::from_millis(1000));
 
         if cancel_rx.try_recv().is_ok() {
-            let _ = tx.send(GuiEvent::Log("  [HOST] Hosting session cancelled.".to_string()));
+            let _ = tx.send(GuiEvent::Log(
+                "  [HOST] Hosting session cancelled.".to_string(),
+            ));
             ctx.request_repaint();
             return;
         }
@@ -1361,7 +1437,8 @@ fn run_host_match(
                     keepalive,
                 });
                 let _ = tx.send(GuiEvent::Log(
-                    "  [HOST] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
+                    "  [HOST] Direct connection ready! Click 'Launch Game (Co-op)' below."
+                        .to_string(),
                 ));
                 ctx.request_repaint();
                 return;
@@ -1424,8 +1501,7 @@ fn resolve_peer_connection(
             {
                 resolved_lan = Some(target_local);
             }
-            if resolved_lan.is_none()
-                && crate::ip::find_matching_subnet_ip(target_local).is_some()
+            if resolved_lan.is_none() && crate::ip::find_matching_subnet_ip(target_local).is_some()
             {
                 resolved_lan = Some(target_local);
             }
@@ -1558,7 +1634,8 @@ fn run_join_match(
         .ok()
         .and_then(|mut a| a.next())
         .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip = crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
+    let my_local_ip =
+        crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
 
     // 3. Connect via rendezvous server
     let (peer_disco, peer_game, peer_local_ip) = match crate::stun::join_with_server(
