@@ -881,8 +881,14 @@ pub fn apply_all(
             std::fs::write(dds_out, dds_bytes)?;
         }
 
+        let detached_info = if summary.detached_speakers.is_empty() {
+            String::new()
+        } else {
+            format!(" | Detached: {}", summary.detached_speakers.join(", "))
+        };
+
         scct_log!(
-            "  [COOP] {:22} (ID={:3}): {:9} B | P1=({:.1}, {:.1}, {:.1}) -> P2=({:.1}, {:.1}, {:.1})",
+            "  [COOP] {:22} (ID={:3}): {:9} B | P1=({:.1}, {:.1}, {:.1}) -> P2=({:.1}, {:.1}, {:.1}){}",
             coop_map,
             identity,
             summary.size,
@@ -891,7 +897,8 @@ pub fn apply_all(
             summary.p1_loc.2,
             summary.p2_loc.0,
             summary.p2_loc.1,
-            summary.p2_loc.2
+            summary.p2_loc.2,
+            detached_info,
         );
     }
 

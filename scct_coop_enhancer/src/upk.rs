@@ -436,6 +436,7 @@ pub struct MapPatchSummary {
     pub p2_loc: (f32, f32, f32),
     #[allow(dead_code)]
     pub havok_offset: usize,
+    pub detached_speakers: Vec<String>,
 }
 
 pub fn patch_sp_map_to_coop(
@@ -732,7 +733,102 @@ pub fn patch_sp_map_to_coop(
     patched_mylevel_bytes.extend_from_slice(&write_compact_index(new_pstart2_exp_idx));
     patched_mylevel_bytes.extend_from_slice(&ml_raw[insert_pos_in_ml..]);
 
-    // 5. Build output stream
+    // 5. Detach HQ/Lambert speaker pawns from their AI zones.
+    // In retail SP, speaker pawns (Lambert, Grim, Redding) on certain maps (Bank, Displace,
+    // CargoShip, Penthouse, Battery, SeoulOne, KokuboSosho) were assigned to off-map dummy
+    // HQ zones. In multiplayer, off-map zones never wake up, preventing APawn::PreBeginPlay()
+    // from enabling the pawn and spawning its AIController. In maps where radio dialogue
+    // worked natively (Lighthouse, Bathhouse, Training, Hokkaido), CurrentEAIZone is None,
+    // which triggers immediate controller spawning at startup identically on Host and Guest.
+    // Stripping CurrentEAIZone brings all maps to parity cleanly without any binary hacks.
+    let mut detached_speakers = Vec::new();
+    let mut patched_speakers: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    for (pos, e) in exports.iter().enumerate() {
+        if e.serial_size <= 0 {
+            continue;
+        }
+        let oname = &names[e.obj_name as usize].0;
+        let cname = resolve_class_name(&names, &imports, &exports, e.class_idx);
+
+        let is_lambert_class = cname.eq_ignore_ascii_case("ELambert");
+        let is_lambert_name = oname.to_ascii_lowercase().starts_with("elambert");
+        let is_candidate = is_lambert_class
+            || is_lambert_name
+            || cname.eq_ignore_ascii_case("EAIGenericNPC")
+            || cname.to_ascii_lowercase().contains("pawn");
+
+        if !is_candidate {
+            continue;
+        }
+
+        let exp_start = e.serial_offset as usize;
+        let exp_end = exp_start + (e.serial_size as usize);
+        if exp_end > orig_data.len() {
+            continue;
+        }
+
+        let prop_start = match parse_state_frame_end(&orig_data, exp_start) {
+            Ok(off) => off,
+            Err(_) => continue,
+        };
+
+        let (props, first_none, _) =
+            match parse_tagged_properties_raw(&names, &orig_data, prop_start, exp_end) {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+
+        let has_zone = props.iter().any(|p| p.name == "CurrentEAIZone");
+        if !has_zone {
+            continue;
+        }
+
+        let mut is_speaker = is_lambert_class || is_lambert_name;
+        if !is_speaker {
+            for p in &props {
+                if p.name == "Tag" && p.ptype == 6 && !p.raw_val.is_empty() {
+                    let mut tag_off = 0;
+                    if let Ok(tag_name_idx) = read_compact_index(&p.raw_val, &mut tag_off) {
+                        if (tag_name_idx as usize) < names.len() {
+                            let tag_str = &names[tag_name_idx as usize].0;
+                            if tag_str.eq_ignore_ascii_case("lambert")
+                                || tag_str.eq_ignore_ascii_case("elambert")
+                                || tag_str.eq_ignore_ascii_case("hq")
+                                || tag_str.eq_ignore_ascii_case("headquarters")
+                                || tag_str.eq_ignore_ascii_case("grim")
+                                || tag_str.eq_ignore_ascii_case("redding")
+                            {
+                                is_speaker = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if oname.eq_ignore_ascii_case("EAIGenericNPC20")
+                || oname.eq_ignore_ascii_case("EAIGenericNPC29")
+                || oname.eq_ignore_ascii_case("EAIGenericNPC43")
+            {
+                is_speaker = true;
+            }
+        }
+
+        if is_speaker {
+            let mut patched_bytes = Vec::new();
+            patched_bytes.extend_from_slice(&orig_data[exp_start..prop_start]);
+            for p in &props {
+                if p.name != "CurrentEAIZone" {
+                    patched_bytes.extend_from_slice(&p.raw_full);
+                }
+            }
+            patched_bytes.extend_from_slice(&orig_data[first_none..exp_end]);
+            patched_speakers.push((pos, patched_bytes));
+            detached_speakers.push(format!("{}({})", oname, cname));
+        }
+    }
+
+    // 6. Build output stream
     let mut out_stream = Vec::from(&orig_data[..upk.import_offset]);
 
     exports[ml_idx].serial_offset = out_stream.len() as i32;
@@ -746,6 +842,12 @@ pub fn patch_sp_map_to_coop(
     exports[ps1_idx].serial_offset = out_stream.len() as i32;
     exports[ps1_idx].serial_size = patched_ps1_bytes.len() as i32;
     out_stream.extend_from_slice(&patched_ps1_bytes);
+
+    for (spk_pos, spk_bytes) in &patched_speakers {
+        exports[*spk_pos].serial_offset = out_stream.len() as i32;
+        exports[*spk_pos].serial_size = spk_bytes.len() as i32;
+        out_stream.extend_from_slice(spk_bytes);
+    }
 
     let pstart2_exp = ExportEntry {
         index: new_pstart2_exp_idx as usize,
@@ -827,5 +929,79 @@ pub fn patch_sp_map_to_coop(
         p1_loc,
         p2_loc,
         havok_offset: new_exports_end,
+        detached_speakers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_patch_sp_map_detaches_speaker_pawn() {
+        let candidates = [
+            PathBuf::from("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
+            PathBuf::from("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
+        ];
+        let bank_src = candidates.into_iter().find(|p| p.exists());
+        let Some(bank_src) = bank_src else {
+            eprintln!("Skipping test_patch_sp_map_detaches_speaker_pawn (clean 03_Bank.scl not found)");
+            return;
+        };
+
+        let temp_dir = std::env::temp_dir().join(format!("scct_upk_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let out_map = temp_dir.join("03_Bank_COOP.scl");
+
+        let summary = patch_sp_map_to_coop(
+            &bank_src,
+            &out_map,
+            (0.0, 0.0, 0.0),
+            (-55.0, -65.0, 8.0),
+        )
+        .expect("patch_sp_map_to_coop failed");
+
+        assert!(
+            summary
+                .detached_speakers
+                .iter()
+                .any(|s| s.contains("EAIGenericNPC20")),
+            "Expected EAIGenericNPC20 to be detached, got: {:?}",
+            summary.detached_speakers
+        );
+
+        let patched_data = std::fs::read(&out_map).expect("read patched map");
+        let upk = parse_upk_tables(&patched_data).expect("parse upk tables");
+
+        // Verify EAIGenericNPC20 has NO CurrentEAIZone in patched map
+        let mut found_speaker = false;
+        for exp in &upk.exports {
+            let oname = &upk.names[exp.obj_name as usize].0;
+            if oname == "EAIGenericNPC20" {
+                found_speaker = true;
+                let exp_start = exp.serial_offset as usize;
+                let exp_end = exp_start + (exp.serial_size as usize);
+                let prop_start = parse_state_frame_end(&patched_data, exp_start).expect("parse state frame");
+                let (props, _, _) = parse_tagged_properties_raw(&upk.names, &patched_data, prop_start, exp_end)
+                    .expect("parse properties");
+
+                assert!(
+                    !props.iter().any(|p| p.name == "CurrentEAIZone"),
+                    "CurrentEAIZone must be stripped from EAIGenericNPC20"
+                );
+                assert!(
+                    props.iter().any(|p| p.name == "Tag"),
+                    "Tag property should be preserved"
+                );
+                assert!(
+                    props.iter().any(|p| p.name == "Location"),
+                    "Location property should be preserved"
+                );
+            }
+        }
+        assert!(found_speaker, "EAIGenericNPC20 not found in exports");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }
