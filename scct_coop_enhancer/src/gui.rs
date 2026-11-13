@@ -1247,7 +1247,7 @@ impl eframe::App for PatcherApp {
             }
 
             // Optional Patch Flags & Gameplay Tweaks (List of Checkboxes)
-            if self.resolved_root.is_some() {
+            if self.resolved_root.is_some() && !self.flags.is_empty() {
                 ui.add_space(8.0);
                 egui::Frame::NONE
                     .fill(Color32::from_rgb(26, 30, 38))

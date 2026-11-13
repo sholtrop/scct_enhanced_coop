@@ -277,6 +277,14 @@ pub const JOIN_GAME_PORT_VA: u32 = 0x10B57ED6;
 pub const HOOK_SETPAUSE_LOBBY_UNREADY: u32 = 0x10A3D58B;
 pub const SETPAUSE_LOBBY_UNREADY_ORIG_HEX: &str = "6a016a00e88c04f2ff83c408";
 pub const SETPAUSE_LOBBY_UNREADY_NOP_LEN: usize = 12;
+/// Co-op pause menu `IsPlayerReady(bool remote)` (`0x109639E0`): returns `[player + 0x8F]` (ready flag)
+/// of the local (`arg = 0`) or remote (`arg = 1`) player. Its only 6 callers are in the in-game ESC
+/// pause menu (`0x10B2934A`/`0x10B29448` gate QuickSave/QuickLoad behind "WaitRemote" popups;
+/// `0x10B29D61..0x10B29E7C` enable `B_ResumeGame` only when both are ready). Replaced with
+/// `mov eax, 1; ret` so both players always count as ready.
+pub const HOOK_PAUSE_IS_PLAYER_READY: u32 = 0x109639E0;
+pub const PAUSE_IS_PLAYER_READY_ORIG_HEX: &str = "a19c551f1183ec28";
+pub const PAUSE_IS_PLAYER_READY_NEW_HEX: &str = "b801000000c39090";
 
 pub struct PatchSite {
     pub va: u32,
@@ -503,6 +511,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
             crate::scct_log!(
                 "  [NET] Multi-NIC LAN & STUN fix is already present in splintercell3.exe"
             );
+            crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
             return Ok(());
         }
         fs::copy(exe_path, exe_bak_path).with_context(|| {
@@ -529,6 +538,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
             )
         })?;
         crate::scct_log!("  [NET] Applied multi-NIC LAN & STUN fix to splintercell3.exe");
+        crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
         return Ok(());
     }
 
@@ -719,6 +729,7 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         NET_CAVE_VA,
         sites.len()
     );
+    crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
     Ok(())
 }
 
@@ -753,6 +764,12 @@ pub fn get_online_sites() -> Vec<PatchSite> {
             orig: decode_hex(SETPAUSE_LOBBY_UNREADY_ORIG_HEX),
             new: vec![0x90; SETPAUSE_LOBBY_UNREADY_NOP_LEN],
             desc: "UGameEngine::SetPause: prevent coop lobby client unreadying on Alt-Tab",
+        },
+        PatchSite {
+            va: HOOK_PAUSE_IS_PLAYER_READY,
+            orig: decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX),
+            new: decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX),
+            desc: "Coop pause menu IsPlayerReady: both players always ready (resume/quicksave/quickload)",
         },
     ]
 }
@@ -932,6 +949,7 @@ pub fn apply_online_coop_fix_with_ports(
 
     fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
     crate::scct_log!("  [NET] Applied Online Coop fix to System/splintercell3.exe");
+    crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
     Ok(())
 }
 
@@ -1174,12 +1192,23 @@ mod tests {
 
         let buf = fs::read(&test_exe).unwrap();
         assert!(is_online_coop_fix_applied(&buf));
+        assert!(crate::patcher::is_camera_alarm_patched(&buf));
+        assert!(crate::patcher::is_nonlethal_gameover_patched(&buf));
         assert_eq!(
             &buf[unready_off..unready_off + SETPAUSE_LOBBY_UNREADY_NOP_LEN],
             &[0x90; SETPAUSE_LOBBY_UNREADY_NOP_LEN]
         );
         let ip_off = va_to_text_off(CAVE_ONLINE_IP_VA).unwrap();
         assert_eq!(&buf[ip_off..ip_off + 4], &test_ip.octets());
+        let ready_off = va_to_text_off(HOOK_PAUSE_IS_PLAYER_READY).unwrap();
+        assert_eq!(
+            &clean_bytes[ready_off..ready_off + 8],
+            decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX).as_slice()
+        );
+        assert_eq!(
+            &buf[ready_off..ready_off + 8],
+            decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX).as_slice()
+        );
         let jp_off = va_to_text_off(JOIN_GAME_PORT_VA).unwrap();
         assert_eq!(&buf[jp_off..jp_off + 4], &2383u32.to_le_bytes());
         let dp_off = va_to_text_off(CAVE_ONLINE_PORT_VA).unwrap();
@@ -1256,6 +1285,25 @@ mod tests {
     }
 
     #[test]
+    fn test_pause_is_player_ready_site_integrity() {
+        let orig = decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX);
+        let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
+        assert_eq!(orig.len(), new.len());
+        // mov eax, [0x111F559C]; sub esp, 0x28
+        assert_eq!(&orig[0..5], &[0xA1, 0x9C, 0x55, 0x1F, 0x11]);
+        // mov eax, 1; ret
+        assert_eq!(&new[0..6], &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
+
+        let sites = get_online_sites();
+        let site = sites
+            .iter()
+            .find(|s| s.va == HOOK_PAUSE_IS_PLAYER_READY)
+            .expect("pause IsPlayerReady patch site registered in get_online_sites");
+        assert_eq!(site.orig, orig);
+        assert_eq!(site.new, new);
+    }
+
+    #[test]
     fn test_multi_nic_lan_patch_on_clean_exe() {
         let p1 = Path::new(
             "../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
@@ -1284,6 +1332,8 @@ mod tests {
         apply_lan_networking_fix(&test_exe, &test_bak).unwrap();
         let patched = fs::read(&test_exe).unwrap();
         assert!(is_lan_and_zerotier_fix_applied(&patched));
+        assert!(crate::patcher::is_camera_alarm_patched(&patched));
+        assert!(crate::patcher::is_nonlethal_gameover_patched(&patched));
 
         let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
         let multi_off = va_to_text_off(MULTI_NIC_LAN_CAVE_VA).unwrap();

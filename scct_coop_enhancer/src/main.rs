@@ -92,23 +92,27 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.list_flags {
-        println!("Available patch flags:");
-        for def in flags::ALL_FLAGS {
-            let exp = if def.experimental {
-                " [EXPERIMENTAL]"
-            } else {
-                ""
-            };
-            let def_status = if def.default_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            };
-            println!(
-                "  {:<20} {}{} (default: {})",
-                def.id, def.name, exp, def_status
-            );
-            println!("                       {}", def.description);
+        if flags::ALL_FLAGS.is_empty() {
+            println!("No optional patch flags configured (all fixes, including security camera alarms and non-lethal mission Game Over, are included in the standard installation).");
+        } else {
+            println!("Available patch flags:");
+            for def in flags::ALL_FLAGS {
+                let exp = if def.experimental {
+                    " [EXPERIMENTAL]"
+                } else {
+                    ""
+                };
+                let def_status = if def.default_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+                println!(
+                    "  {:<20} {}{} (default: {})",
+                    def.id, def.name, exp, def_status
+                );
+                println!("                       {}", def.description);
+            }
         }
         return Ok(());
     }
@@ -149,6 +153,15 @@ fn main() -> Result<()> {
             }
         }
         for id in &args.enable_flags {
+            if id.eq_ignore_ascii_case("camera_alarms")
+                || id.eq_ignore_ascii_case("nonlethal_gameover")
+            {
+                println!(
+                    "Note: '{}' is now included in the standard installation and is always enabled.",
+                    id
+                );
+                continue;
+            }
             if let Some(f) = flag_states
                 .iter_mut()
                 .find(|f| flags::flag_matches_id(f.def.id, id))
@@ -162,6 +175,15 @@ fn main() -> Result<()> {
             }
         }
         for id in &args.disable_flags {
+            if id.eq_ignore_ascii_case("camera_alarms")
+                || id.eq_ignore_ascii_case("nonlethal_gameover")
+            {
+                println!(
+                    "Note: '{}' is now a standard fix and cannot be disabled.",
+                    id
+                );
+                continue;
+            }
             if let Some(f) = flag_states
                 .iter_mut()
                 .find(|f| flags::flag_matches_id(f.def.id, id))
