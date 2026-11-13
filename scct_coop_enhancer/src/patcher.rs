@@ -603,10 +603,6 @@ pub fn patch_nonlethal_gameover_bytes(data: &mut [u8]) -> Result<usize> {
         NONLETHAL_GAMEOVER_PATCHED.len()
     );
     assert_eq!(
-        COOP_AIZONE_ENABLE_ORIG.len(),
-        COOP_AIZONE_ENABLE_PATCHED.len()
-    );
-    assert_eq!(
         COOP_ENDMISSION_DISPATCH_ORIG.len(),
         COOP_ENDMISSION_DISPATCH_PATCHED.len()
     );
@@ -627,11 +623,11 @@ pub fn patch_nonlethal_gameover_bytes(data: &mut [u8]) -> Result<usize> {
         bail!("Could not locate ThrowMenuEvent(0) non-lethal game over pattern in splintercell3.exe");
     };
 
-    let aizone_len = COOP_AIZONE_ENABLE_ORIG.len();
-    if let Some(pos) = data.windows(aizone_len).position(|w| w == COOP_AIZONE_ENABLE_ORIG) {
-        data[pos..pos + aizone_len].copy_from_slice(COOP_AIZONE_ENABLE_PATCHED);
-    } else if !data.windows(aizone_len).any(|w| w == COOP_AIZONE_ENABLE_PATCHED) {
-        bail!("Could not locate EchelonGameInfo::AddPlayerInZones AI zone enable pattern in splintercell3.exe");
+    // If COOP_AIZONE_ENABLE was previously patched, revert it back to vanilla retail (74 33)
+    // so that lockstep simulation does not desync on map startup.
+    let aizone_len = COOP_AIZONE_ENABLE_PATCHED.len();
+    if let Some(pos) = data.windows(aizone_len).position(|w| w == COOP_AIZONE_ENABLE_PATCHED) {
+        data[pos..pos + aizone_len].copy_from_slice(COOP_AIZONE_ENABLE_ORIG);
     }
 
     let endm_len = COOP_ENDMISSION_DISPATCH_ORIG.len();
@@ -655,10 +651,8 @@ pub fn is_camera_alarm_patched(data: &[u8]) -> bool {
 
 pub fn is_nonlethal_gameover_patched(data: &[u8]) -> bool {
     let nlen = NONLETHAL_GAMEOVER_PATCHED.len();
-    let aizone_len = COOP_AIZONE_ENABLE_PATCHED.len();
     let endm_len = COOP_ENDMISSION_DISPATCH_PATCHED.len();
     data.windows(nlen).any(|w| w == NONLETHAL_GAMEOVER_PATCHED)
-        && data.windows(aizone_len).any(|w| w == COOP_AIZONE_ENABLE_PATCHED)
         && data.windows(endm_len).any(|w| w == COOP_ENDMISSION_DISPATCH_PATCHED)
 }
 

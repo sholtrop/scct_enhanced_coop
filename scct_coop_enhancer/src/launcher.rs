@@ -147,7 +147,17 @@ impl GameProcess {
     }
 
     pub fn is_desync_flagged(&self) -> bool {
-        self.read_u8(CAVE_DESYNC_FLAG_VA).unwrap_or(0) != 0
+        if self.read_u8(CAVE_DESYNC_FLAG_VA).unwrap_or(0) != 0 {
+            return true;
+        }
+        let sync_engine_ptr = self.read_u32(VA_SYNC_ENGINE).unwrap_or(0);
+        if sync_engine_ptr != 0 {
+            let status = self.read_i32(sync_engine_ptr as usize + 0x68).unwrap_or(0);
+            if status == 6 {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn dump_desync_state(&self, game_root: &Path) -> Result<PathBuf> {
@@ -172,8 +182,18 @@ impl GameProcess {
         let gnames_count = self.read_u32(VA_GNAMES_COUNT).unwrap_or(0);
 
         let gengine_ptr = self.read_u32(VA_GENGINE).unwrap_or(0);
-        let level_ptr = if gengine_ptr != 0 {
+        let level_context = if gengine_ptr != 0 {
             self.read_u32(gengine_ptr as usize + 0x44).unwrap_or(0)
+        } else {
+            0
+        };
+        let level_ptr_ptr = if level_context != 0 {
+            self.read_u32(level_context as usize + 0x2C).unwrap_or(0)
+        } else {
+            0
+        };
+        let level_ptr = if level_ptr_ptr != 0 {
+            self.read_u32(level_ptr_ptr as usize).unwrap_or(0)
         } else {
             0
         };
@@ -188,6 +208,7 @@ impl GameProcess {
         lines.push(format!("UserChecksum0:          0x{:08X}", user_checksum));
         lines.push(format!("WarmupFlag (0x111F55E0): {}", warmup_flag));
         lines.push(format!("GEngine VA:             0x{:08X}", gengine_ptr));
+        lines.push(format!("LevelContext VA:        0x{:08X}", level_context));
         lines.push(format!("GLevel VA:              0x{:08X}", level_ptr));
         lines.push(format!("GNames VA:              0x{:08X} (Count: {})", gnames_ptr, gnames_count));
         lines.push("--------------------------------------------------------------------------------".to_string());

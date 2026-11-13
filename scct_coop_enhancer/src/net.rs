@@ -400,12 +400,6 @@ pub fn get_net_sites() -> Vec<PatchSite> {
             new: make_call(HOOK_SITE_BROWSE_REPLY_URL, HOOK_BROWSE_REPLY_URL, 5),
             desc: "Quazal HandleBrowseReply: rewrite SessionDescriptor StationURL IP/port",
         },
-        PatchSite {
-            va: HOOK_SITE_CHECK_SIM_CHECKSUM,
-            orig: SIM_CHECKSUM_ORIG.to_vec(),
-            new: SIM_CHECKSUM_HOOK_BYTES.to_vec(),
-            desc: "SimStation::CheckSimulationChecksum: gated warmup bypass + gameplay desync detection",
-        },
     ]
 }
 
@@ -488,14 +482,11 @@ pub fn is_lan_and_zerotier_fix_applied(pe_bytes: &[u8]) -> bool {
         return false;
     }
 
-    let sim_cave_off = match va_to_text_off(SIM_CHECKSUM_CAVE_VA) {
+    let sim_chk_off = match va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) {
         Ok(off) => off,
         Err(_) => return false,
     };
-    if pe_bytes.len() < sim_cave_off + SIM_CHECKSUM_CAVE_BYTES.len()
-        || &pe_bytes[sim_cave_off..sim_cave_off + SIM_CHECKSUM_CAVE_BYTES.len()]
-            != &SIM_CHECKSUM_CAVE_BYTES
-    {
+    if pe_bytes.len() < sim_chk_off + 8 || &pe_bytes[sim_chk_off..sim_chk_off + 8] != SIM_CHECKSUM_ORIG {
         return false;
     }
 
@@ -710,20 +701,6 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         );
     }
 
-    let sim_cave = SIM_CHECKSUM_CAVE_BYTES;
-    let sim_cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA)?;
-    if &buf[sim_cave_off..sim_cave_off + sim_cave.len()] != sim_cave.as_slice()
-        && buf[sim_cave_off..sim_cave_off + sim_cave.len()]
-            .iter()
-            .any(|&b| b != 0)
-    {
-        bail!(
-            "Code cave at 0x{:08X} is non-zero in {}",
-            SIM_CHECKSUM_CAVE_VA,
-            exe_bak_path.display()
-        );
-    }
-
     let sites = get_net_sites();
     for site in &sites {
         let so = va_to_text_off(site.va)?;
@@ -737,7 +714,6 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
                 || ((site.va == 0x10EFC62C || site.va == 0x10EFC7AC)
                     && (cur == old_recv_wrap.as_slice() || cur == old_disc_rf_v3.as_slice()))
                 || (site.va == HOOK_SITE_QUAZAL_POLL && cur == old_poll_v3.as_slice())
-                || (site.va == HOOK_SITE_CHECK_SIM_CHECKSUM && cur == SIM_CHECKSUM_PATCHED)
             {
                 // allow upgrading older hook versions cleanly
             } else {
@@ -755,7 +731,19 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     buf[cave_off..cave_off + cave.len()].copy_from_slice(&cave);
     buf[sock_cave_off..sock_cave_off + sock_cave.len()].copy_from_slice(&sock_cave);
     buf[multi_cave_off..multi_cave_off + multi_cave.len()].copy_from_slice(&multi_cave);
-    buf[sim_cave_off..sim_cave_off + sim_cave.len()].copy_from_slice(&sim_cave);
+
+    // Restore SIM_CHECKSUM to vanilla retail (push 5; call 0x10DF8620; ret) if previously patched
+    let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
+    if buf.len() >= sim_chk_off + 8
+        && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
+            || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
+    {
+        buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
+    }
+    let sim_cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA)?;
+    if buf.len() >= sim_cave_off + 32 && &buf[sim_cave_off..sim_cave_off + 32] == &SIM_CHECKSUM_CAVE_BYTES {
+        buf[sim_cave_off..sim_cave_off + 32].fill(0);
+    }
     for site in &sites {
         let so = va_to_text_off(site.va)?;
         buf[so..so + site.new.len()].copy_from_slice(&site.new);
@@ -877,7 +865,7 @@ pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
         Ok(off) => off,
         Err(_) => return false,
     };
-    if pe_bytes.len() < sim_chk_off + 8 || &pe_bytes[sim_chk_off..sim_chk_off + 8] != SIM_CHECKSUM_HOOK_BYTES {
+    if pe_bytes.len() < sim_chk_off + 8 || &pe_bytes[sim_chk_off..sim_chk_off + 8] != SIM_CHECKSUM_ORIG {
         return false;
     }
     true
@@ -999,7 +987,10 @@ pub fn apply_online_coop_fix_with_ports(
     }
 
     let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
-    if buf.len() >= sim_chk_off + 8 && &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED {
+    if buf.len() >= sim_chk_off + 8
+        && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
+            || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
+    {
         buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
     }
 
@@ -1409,13 +1400,7 @@ mod tests {
         );
         assert_eq!(
             &patched[sim_chk_off..sim_chk_off + 8],
-            SIM_CHECKSUM_HOOK_BYTES
-        );
-
-        let sim_cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA).unwrap();
-        assert_eq!(
-            &patched[sim_cave_off..sim_cave_off + 32],
-            &SIM_CHECKSUM_CAVE_BYTES
+            SIM_CHECKSUM_ORIG
         );
 
         // Idempotent when re-applied
@@ -1430,17 +1415,5 @@ mod tests {
 
         let _ = fs::remove_file(&test_exe);
         let _ = fs::remove_file(&test_bak);
-    }
-
-    #[test]
-    fn test_sim_checksum_hook_bytes() {
-        assert_eq!(
-            make_jmp(HOOK_SITE_CHECK_SIM_CHECKSUM, SIM_CHECKSUM_CAVE_VA, 8).as_slice(),
-            SIM_CHECKSUM_HOOK_BYTES
-        );
-        assert_eq!(SIM_CHECKSUM_CAVE_BYTES.len(), 32);
-        assert!(SIM_CHECKSUM_CAVE_VA + 32 <= 0x110B7000);
-        let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
-        assert!(MULTI_NIC_LAN_CAVE_VA + (multi_cave.len() as u32) <= SIM_CHECKSUM_CAVE_VA);
     }
 }
