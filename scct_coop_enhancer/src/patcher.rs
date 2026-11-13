@@ -197,8 +197,14 @@ pub fn auto_detect_game_roots() -> Vec<PathBuf> {
         if let Some(parent) = cwd.parent() {
             candidates.push(parent.to_path_buf());
         }
-        candidates.push(cwd.join("scct_game_files").join("Tom Clancy's Splinter Cell Chaos Theory"));
-        candidates.push(cwd.join("clean_scct_files").join("Tom Clancy's Splinter Cell Chaos Theory"));
+        candidates.push(
+            cwd.join("scct_game_files")
+                .join("Tom Clancy's Splinter Cell Chaos Theory"),
+        );
+        candidates.push(
+            cwd.join("clean_scct_files")
+                .join("Tom Clancy's Splinter Cell Chaos Theory"),
+        );
     }
 
     // 2. Running executable directory and parent
@@ -246,8 +252,14 @@ pub fn auto_detect_game_roots() -> Vec<PathBuf> {
             format!("{}/.local/share/Steam/steamapps/common", home),
             format!("{}/.steam/steam/steamapps/common", home),
             format!("{}/.steam/root/steamapps/common", home),
-            format!("{}/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common", home),
-            format!("{}/.wine/drive_c/Program Files (x86)/Steam/steamapps/common", home),
+            format!(
+                "{}/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common",
+                home
+            ),
+            format!(
+                "{}/.wine/drive_c/Program Files (x86)/Steam/steamapps/common",
+                home
+            ),
             format!("{}/.wine/drive_c/SteamLibrary/steamapps/common", home),
         ];
         for prefix in &linux_prefixes {
@@ -291,7 +303,10 @@ pub fn resolve_game_root(explicit_arg: Option<&Path>) -> Result<PathBuf> {
             scct_log!("  [INIT] Using specified game root: {}", valid.display());
             return Ok(valid);
         }
-        scct_log!("  [INIT] Using specified path as game root: {}", abs.display());
+        scct_log!(
+            "  [INIT] Using specified path as game root: {}",
+            abs.display()
+        );
         return Ok(abs);
     }
 
@@ -400,35 +415,77 @@ pub fn ensure_clean_sp_maps_and_cleanup(
 }
 
 /// Bytecode pattern in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008):
-/// `ClassName = "EchelonPattern.V" $ temp;` (`00 40 02` = local `temp`, export 128).
-const ENGINE_U_VAR_OBJECT_ORIG: &[u8] =
-    b"\x0f\x00\x7b\x08\x70\x1fEchelonPattern.V\x00\x00\x40\x02\x16";
+/// In single-player, map name is e.g. "04_Penthouse.scl" -> Left(temp, InStr(temp, '.')) -> "04_Penthouse".
+/// In co-op, map name is e.g. "04_Penthouse_COOP.scl" -> "04_Penthouse_COOP".
+/// DynamicLoadObject("EchelonPattern.V" $ temp) fails because V04_Penthouse_COOP does not exist in EchelonPattern.u.
+/// This causes Level.VarObject to remain None, crashing/aborting maps whose initial pattern logic (e.g. Penthouse PO1 -> BP01)
+/// calls ChangeVariableValue(out int Variable) with Level.VarObject on tick 0.
+///
+/// Patch:
+/// If SoundMapName != "", use SoundMapName directly ("04_Penthouse"), so VarObject is loaded and spawned cleanly.
+/// If SoundMapName == "", falls back to GetCurrentMapName() (preserving 00_Training_COOP and custom maps).
+pub const ENGINE_U_LEVELINFO_ORIG: &[u8] = &[
+    0x0f, 0x00, 0x40, 0x02, 0x65, 0x8b, 0x16, 0x07, 0x36, 0x00, 0x97, 0x7e, 0x00, 0x40, 0x02, 0x1f,
+    0x2e, 0x00, 0x16, 0x25, 0x16, 0x0f, 0x00, 0x40, 0x02, 0x80, 0x00, 0x40, 0x02, 0x7e, 0x00, 0x40,
+    0x02, 0x1f, 0x2e, 0x00, 0x16, 0x16, 0x07, 0x4a, 0x00, 0x2d, 0x01, 0x79, 0x16, 0x0f, 0x01, 0x7a,
+    0x16, 0x00, 0x40, 0x02,
+];
 
-/// Patched bytecode in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008):
-/// `ClassName = "EchelonPattern.V" $ SoundMapName;` (`01 7a 16` = `self.SoundMapName`, export 1466).
-const ENGINE_U_VAR_OBJECT_PATCHED: &[u8] =
-    b"\x0f\x00\x7b\x08\x70\x1fEchelonPattern.V\x00\x01\x7a\x16\x16";
+pub const ENGINE_U_LEVELINFO_PATCHED: &[u8] = &[
+    // temp = SoundMapName; (7 bytes)
+    0x0f, 0x00, 0x40, 0x02, 0x01, 0x7a, 0x16,
+    // if (!(temp == "")) goto 0x004a; (10 bytes)
+    0x07, 0x4a, 0x00, 0x7a, 0x00, 0x40, 0x02, 0x1f, 0x00, 0x16,
+    // temp = GetCurrentMapName(); (7 bytes)
+    0x0f, 0x00, 0x40, 0x02, 0x65, 0x8b, 0x16,
+    // temp = Left(temp, InStr(temp, '.')); (17 bytes)
+    0x0f, 0x00, 0x40, 0x02, 0x80, 0x00, 0x40, 0x02, 0x7e, 0x00, 0x40, 0x02, 0x1f, 0x2e, 0x00, 0x16,
+    0x16, // 11 x EX_Nothing (NOPs) to pad out to 52 bytes:
+    0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+];
 
-pub fn patch_engine_u_var_object_bytes(data: &mut [u8]) -> Result<usize> {
+pub fn patch_engine_u_levelinfo_bytes(data: &mut [u8]) -> Result<usize> {
     assert_eq!(
-        ENGINE_U_VAR_OBJECT_ORIG.len(),
-        ENGINE_U_VAR_OBJECT_PATCHED.len()
+        ENGINE_U_LEVELINFO_ORIG.len(),
+        ENGINE_U_LEVELINFO_PATCHED.len()
     );
-    let nlen = ENGINE_U_VAR_OBJECT_ORIG.len();
-    if let Some(pos) = data.windows(nlen).position(|w| w == ENGINE_U_VAR_OBJECT_ORIG) {
-        data[pos..pos + nlen].copy_from_slice(ENGINE_U_VAR_OBJECT_PATCHED);
+    let nlen = ENGINE_U_LEVELINFO_ORIG.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_LEVELINFO_ORIG)
+    {
+        data[pos..pos + nlen].copy_from_slice(ENGINE_U_LEVELINFO_PATCHED);
         return Ok(pos);
     }
     if let Some(pos) = data
         .windows(nlen)
-        .position(|w| w == ENGINE_U_VAR_OBJECT_PATCHED)
+        .position(|w| w == ENGINE_U_LEVELINFO_PATCHED)
     {
         return Ok(pos);
     }
-    bail!("Could not locate LevelInfo.PostBeginPlay VarObject bytecode pattern in Engine.u");
+    bail!("Could not locate LevelInfo.PostBeginPlay bytecode pattern in Engine.u");
 }
 
-pub fn patch_engine_u_var_object(engine_u_path: &Path, engine_u_bak_path: &Path) -> Result<()> {
+pub fn is_engine_u_levelinfo_patched(data: &[u8]) -> bool {
+    let nlen = ENGINE_U_LEVELINFO_PATCHED.len();
+    data.windows(nlen).any(|w| w == ENGINE_U_LEVELINFO_PATCHED)
+}
+
+pub fn revert_engine_u_levelinfo_bytes(data: &mut [u8]) -> bool {
+    let nlen = ENGINE_U_LEVELINFO_PATCHED.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_LEVELINFO_PATCHED)
+    {
+        data[pos..pos + nlen].copy_from_slice(ENGINE_U_LEVELINFO_ORIG);
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(dead_code)]
+pub fn patch_engine_u(engine_u_path: &Path, engine_u_bak_path: &Path) -> Result<()> {
     if !engine_u_bak_path.exists() {
         if !engine_u_path.exists() {
             bail!("Missing System/Engine.u: {}", engine_u_path.display());
@@ -441,16 +498,246 @@ pub fn patch_engine_u_var_object(engine_u_path: &Path, engine_u_bak_path: &Path)
     }
 
     let mut data = std::fs::read(engine_u_bak_path)?;
-    let offset = patch_engine_u_var_object_bytes(&mut data)?;
+    let offset = patch_engine_u_levelinfo_bytes(&mut data)?;
+    if let Ok(mut perms) = std::fs::metadata(engine_u_path).map(|m| m.permissions()) {
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = std::fs::set_permissions(engine_u_path, perms);
+        }
+    }
     std::fs::write(engine_u_path, &data)?;
     scct_log!(
-        "  [UPK] Patched System/Engine.u LevelInfo.PostBeginPlay @ 0x{:06X} (VarObject uses SoundMapName)",
+        "  [UPK] Patched System/Engine.u LevelInfo.PostBeginPlay @ 0x{:06X} (Coop VarObject & SoundMap fix)",
         offset
     );
     Ok(())
 }
 
-pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
+/// Bytecode pattern in `System/Echelon.u` (`EPlayerController.SwitchEEV`, export 6827):
+/// `if (!(Level.bMultiplayerMap)) goto 0x0014; return;`
+/// Token: 07 14 00 19 01 90 06 00 04 2d 01 d3 01 [04 0b]
+const ECHELON_U_EEV_GATE_ORIG: &[u8] = &[
+    0x07, 0x14, 0x00, 0x19, 0x01, 0x90, 0x06, 0x00, 0x04, 0x2d, 0x01, 0xd3, 0x01, 0x04, 0x0b,
+];
+
+/// Patched bytecode in `System/Echelon.u` (`EPlayerController.SwitchEEV`, export 6827):
+/// Replaces `return;` (0x04 0x0b) at mem 0x0012 with two EX_Nothing opcodes (0x0b 0x0b).
+/// If `Level.bMultiplayerMap` is True, it falls through the NOPs to mem 0x0014 and calls ProcessEEV().
+const ECHELON_U_EEV_GATE_PATCHED: &[u8] = &[
+    0x07, 0x14, 0x00, 0x19, 0x01, 0x90, 0x06, 0x00, 0x04, 0x2d, 0x01, 0xd3, 0x01, 0x0b, 0x0b,
+];
+
+pub fn patch_echelon_u_eev_bytes(data: &mut [u8]) -> Result<usize> {
+    assert_eq!(
+        ECHELON_U_EEV_GATE_ORIG.len(),
+        ECHELON_U_EEV_GATE_PATCHED.len()
+    );
+    let nlen = ECHELON_U_EEV_GATE_ORIG.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ECHELON_U_EEV_GATE_ORIG)
+    {
+        data[pos..pos + nlen].copy_from_slice(ECHELON_U_EEV_GATE_PATCHED);
+        return Ok(pos);
+    }
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ECHELON_U_EEV_GATE_PATCHED)
+    {
+        return Ok(pos);
+    }
+    bail!("Could not locate EPlayerController.SwitchEEV gate bytecode pattern in Echelon.u");
+}
+
+pub fn patch_echelon_u_eev(echelon_u_path: &Path, echelon_u_bak_path: &Path) -> Result<()> {
+    if !echelon_u_bak_path.exists() {
+        if !echelon_u_path.exists() {
+            bail!("Missing System/Echelon.u: {}", echelon_u_path.display());
+        }
+        scct_log!(
+            "  [BAK] Creating clean Echelon.u backup -> {} ...",
+            echelon_u_bak_path.display()
+        );
+        std::fs::copy(echelon_u_path, echelon_u_bak_path)?;
+    }
+
+    let mut data = std::fs::read(echelon_u_bak_path)?;
+    let offset = patch_echelon_u_eev_bytes(&mut data)?;
+    std::fs::write(echelon_u_path, &data)?;
+    scct_log!(
+        "  [UPK] Patched System/Echelon.u EPlayerController.SwitchEEV @ 0x{:06X} (EEV distance hacking enabled in Co-op)",
+        offset
+    );
+    Ok(())
+}
+
+/// Security camera alarm check in `splintercell3.exe` (`EAIZone::StartAlarm`, VA 0x1099BCA4):
+/// In multiplayer (`Level->bMultiplayerMap == 1`), `jne 0x1099bccc` (75 1c) skips `TriggerAlarm`.
+/// Patch: `75 1c` -> `90 90` (nop; nop).
+pub const CAMERA_ALARM_GATE_ORIG: &[u8] = &[
+    0x8B, 0x45, 0x78, 0xF6, 0x80, 0xCC, 0x05, 0x00, 0x00, 0x01, 0x75, 0x1C, 0x8B, 0x91, 0xB4, 0x02,
+    0x00, 0x00,
+];
+pub const CAMERA_ALARM_GATE_PATCHED: &[u8] = &[
+    0x8B, 0x45, 0x78, 0xF6, 0x80, 0xCC, 0x05, 0x00, 0x00, 0x01, 0x90, 0x90, 0x8B, 0x91, 0xB4, 0x02,
+    0x00, 0x00,
+];
+
+pub fn patch_camera_alarm_bytes(data: &mut [u8]) -> Result<usize> {
+    assert_eq!(
+        CAMERA_ALARM_GATE_ORIG.len(),
+        CAMERA_ALARM_GATE_PATCHED.len()
+    );
+    let nlen = CAMERA_ALARM_GATE_ORIG.len();
+    if let Some(pos) = data.windows(nlen).position(|w| w == CAMERA_ALARM_GATE_ORIG) {
+        data[pos..pos + nlen].copy_from_slice(CAMERA_ALARM_GATE_PATCHED);
+        return Ok(pos);
+    }
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == CAMERA_ALARM_GATE_PATCHED)
+    {
+        return Ok(pos);
+    }
+    bail!("Could not locate EAIZone::StartAlarm camera alarm pattern in splintercell3.exe");
+}
+
+/// Non-lethal mission failure Game Over menu in `splintercell3.exe` (`CInGameMenusManager::ThrowMenuEvent(0)`, VA 0x10B25809):
+/// When `EndMission(False, 0)` is called in multiplayer, `ThrowMenuEvent(0)` checks viewport and exits
+/// without displaying any UI or ending the mission.
+/// Patch: Replace the 40 dead bytes with `OpenPauseMenu(0, 0)` call, which displays the multiplayer Game Over screen.
+pub const NONLETHAL_GAMEOVER_ORIG: &[u8] = &[
+    0x8B, 0x7E, 0x04, 0x85, 0xFF, 0x74, 0x09, 0x8B, 0xCF, 0xE8, 0xC9, 0x84, 0xEE, 0xFF, 0xEB, 0x02,
+    0x33, 0xC0, 0x8B, 0x48, 0x44, 0x8B, 0x69, 0x2C, 0x8B, 0xCF, 0xE8, 0xF8, 0x89, 0xEE, 0xFF, 0x3B,
+    0x45, 0x00, 0x0F, 0x85, 0xDD, 0x0F, 0x00, 0x00,
+];
+pub const NONLETHAL_GAMEOVER_PATCHED: &[u8] = &[
+    0x6A, 0x00, 0x6A, 0x00, 0x8B, 0xCE, 0xE8, 0x3C, 0xC7, 0xFF, 0xFF, 0xEB, 0x25, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+];
+
+pub fn patch_nonlethal_gameover_bytes(data: &mut [u8]) -> Result<usize> {
+    assert_eq!(
+        NONLETHAL_GAMEOVER_ORIG.len(),
+        NONLETHAL_GAMEOVER_PATCHED.len()
+    );
+    let nlen = NONLETHAL_GAMEOVER_ORIG.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == NONLETHAL_GAMEOVER_ORIG)
+    {
+        data[pos..pos + nlen].copy_from_slice(NONLETHAL_GAMEOVER_PATCHED);
+        return Ok(pos);
+    }
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == NONLETHAL_GAMEOVER_PATCHED)
+    {
+        return Ok(pos);
+    }
+    bail!("Could not locate ThrowMenuEvent(0) non-lethal game over pattern in splintercell3.exe");
+}
+
+pub fn is_camera_alarm_patched(data: &[u8]) -> bool {
+    let nlen = CAMERA_ALARM_GATE_PATCHED.len();
+    data.windows(nlen).any(|w| w == CAMERA_ALARM_GATE_PATCHED)
+}
+
+pub fn is_nonlethal_gameover_patched(data: &[u8]) -> bool {
+    let nlen = NONLETHAL_GAMEOVER_PATCHED.len();
+    data.windows(nlen).any(|w| w == NONLETHAL_GAMEOVER_PATCHED)
+}
+
+pub fn revert_camera_alarm_bytes(data: &mut [u8]) -> bool {
+    let nlen = CAMERA_ALARM_GATE_PATCHED.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == CAMERA_ALARM_GATE_PATCHED)
+    {
+        data[pos..pos + nlen].copy_from_slice(CAMERA_ALARM_GATE_ORIG);
+        true
+    } else {
+        false
+    }
+}
+
+pub fn revert_nonlethal_gameover_bytes(data: &mut [u8]) -> bool {
+    let nlen = NONLETHAL_GAMEOVER_PATCHED.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == NONLETHAL_GAMEOVER_PATCHED)
+    {
+        data[pos..pos + nlen].copy_from_slice(NONLETHAL_GAMEOVER_ORIG);
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(dead_code)]
+pub fn are_gameplay_fixes_applied(exe_path: &Path) -> bool {
+    if let Ok(data) = std::fs::read(exe_path) {
+        is_camera_alarm_patched(&data) && is_nonlethal_gameover_patched(&data)
+    } else {
+        false
+    }
+}
+
+#[allow(dead_code)]
+pub fn revert_exe_fixes(exe_path: &Path) -> Result<bool> {
+    if !exe_path.exists() {
+        return Ok(false);
+    }
+    let mut data = std::fs::read(exe_path)?;
+    let mut changed = false;
+
+    if revert_camera_alarm_bytes(&mut data) {
+        scct_log!("  [EXE] Reverted security camera alarm patch");
+        changed = true;
+    }
+
+    if revert_nonlethal_gameover_bytes(&mut data) {
+        scct_log!("  [EXE] Reverted non-lethal game over patch");
+        changed = true;
+    }
+
+    if changed {
+        std::fs::write(exe_path, &data)?;
+    }
+    Ok(changed)
+}
+
+#[allow(dead_code)]
+pub fn patch_exe_fixes(exe_path: &Path, exe_bak_path: &Path) -> Result<()> {
+    if !exe_bak_path.exists() {
+        if !exe_path.exists() {
+            bail!("Missing System/splintercell3.exe: {}", exe_path.display());
+        }
+        scct_log!(
+            "  [BAK] Creating clean splintercell3.exe backup -> {} ...",
+            exe_bak_path.display()
+        );
+        std::fs::copy(exe_path, exe_bak_path)?;
+    }
+
+    let mut data = std::fs::read(exe_path)?;
+    let cam_off = patch_camera_alarm_bytes(&mut data)?;
+    scct_log!("  [EXE] Patched security camera alarms @ 0x{:06X}", cam_off);
+    let go_off = patch_nonlethal_gameover_bytes(&mut data)?;
+    scct_log!(
+        "  [EXE] Patched non-lethal mission Game Over @ 0x{:06X}",
+        go_off
+    );
+    std::fs::write(exe_path, &data)?;
+    Ok(())
+}
+
+pub fn apply_all(
+    game_root: &Path,
+    skip_net_fix: bool,
+    flags: &[crate::flags::FlagState],
+) -> Result<()> {
     let system_dir = find_child_ci(game_root, "System");
     let data_dir = find_child_ci(game_root, "Data");
     let maps_dir = find_child_ci(&data_dir, "Maps");
@@ -466,8 +753,8 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
     let umd_bak_path = system_dir.join("dynamic-pc.umd.bak");
 
-    let engine_u_path = find_child_ci(&system_dir, "Engine.u");
-    let engine_u_bak_path = system_dir.join("Engine.u.bak");
+    let echelon_u_path = find_child_ci(&system_dir, "Echelon.u");
+    let echelon_u_bak_path = system_dir.join("Echelon.u.bak");
 
     scct_log!("\n=== Step 1: Multi-NIC LAN & Online Coop Networking Fix (`splintercell3.exe`) ===");
     if skip_net_fix {
@@ -478,11 +765,14 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
     } else {
         apply_online_coop_fix(&exe_path, &exe_bak_path, None)?;
     }
+    crate::flags::sync_all_flags(game_root, flags)?;
 
-    scct_log!("\n=== Step 2: Patching `System/dynamic-pc.umd` & `System/Engine.u` (Coop Dropdown, Localization, & Voice Lines) ===");
+    scct_log!(
+        "\n=== Step 2: Patching `System/dynamic-pc.umd` & `System/Echelon.u` (Coop Dropdown & Remote Hacking) ==="
+    );
     let extracted = patch_umd_for_all_sp_levels(&umd_path, &umd_bak_path, SP_COOP_LEVELS)?;
-    if engine_u_path.exists() || engine_u_bak_path.exists() {
-        patch_engine_u_var_object(&engine_u_path, &engine_u_bak_path)?;
+    if echelon_u_path.exists() || echelon_u_bak_path.exists() {
+        patch_echelon_u_eev(&echelon_u_path, &echelon_u_bak_path)?;
     }
 
     scct_log!("\n=== Step 3: Building All 11 Coop-Patched SP Maps (`Data/Maps/*_COOP.scl`) ===");
@@ -524,7 +814,8 @@ pub fn apply_all(game_root: &Path, skip_net_fix: bool) -> Result<()> {
         };
 
         let dst_scl_path = maps_dir.join(format!("{}.scl", coop_map));
-        let summary = patch_sp_map_to_coop(&src_scl_path, &dst_scl_path, spawn_offset)?;
+        let summary =
+            patch_sp_map_to_coop(&src_scl_path, &dst_scl_path, spec.p1_offset, spawn_offset)?;
 
         // Copy matching sound files
         for sfx_ext in &["_sound.occ", "_sound.uns"] {
@@ -609,6 +900,9 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
     let engine_u_path = find_child_ci(&system_dir, "Engine.u");
     let engine_u_bak_path = system_dir.join("Engine.u.bak");
 
+    let echelon_u_path = find_child_ci(&system_dir, "Echelon.u");
+    let echelon_u_bak_path = system_dir.join("Echelon.u.bak");
+
     scct_log!("=== Restoring 100% Vanilla Splinter Cell: Chaos Theory ===");
     if exe_bak_path.exists() {
         std::fs::copy(&exe_bak_path, &exe_path)?;
@@ -618,6 +912,11 @@ pub fn restore_vanilla(game_root: &Path) -> Result<()> {
     if engine_u_bak_path.exists() {
         std::fs::copy(&engine_u_bak_path, &engine_u_path)?;
         scct_log!("  [UPK] Restored vanilla System/Engine.u");
+    }
+
+    if echelon_u_bak_path.exists() {
+        std::fs::copy(&echelon_u_bak_path, &echelon_u_path)?;
+        scct_log!("  [UPK] Restored vanilla System/Echelon.u");
     }
 
     if umd_bak_path.exists() {
@@ -682,20 +981,89 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_engine_u_var_object_bytes() {
+    fn test_patch_echelon_u_eev_bytes() {
         let mut buf = vec![0xAA; 64];
-        buf.extend_from_slice(ENGINE_U_VAR_OBJECT_ORIG);
+        buf.extend_from_slice(ECHELON_U_EEV_GATE_ORIG);
         buf.extend_from_slice(&[0xBB; 32]);
 
-        let off1 = patch_engine_u_var_object_bytes(&mut buf).unwrap();
+        let off1 = patch_echelon_u_eev_bytes(&mut buf).unwrap();
         assert_eq!(off1, 64);
         assert_eq!(
-            &buf[64..64 + ENGINE_U_VAR_OBJECT_PATCHED.len()],
-            ENGINE_U_VAR_OBJECT_PATCHED
+            &buf[64..64 + ECHELON_U_EEV_GATE_PATCHED.len()],
+            ECHELON_U_EEV_GATE_PATCHED
         );
 
         // Idempotent second call
-        let off2 = patch_engine_u_var_object_bytes(&mut buf).unwrap();
+        let off2 = patch_echelon_u_eev_bytes(&mut buf).unwrap();
         assert_eq!(off2, 64);
+    }
+
+    #[test]
+    fn test_patch_camera_alarm_bytes() {
+        let mut buf = vec![0xCC; 48];
+        buf.extend_from_slice(CAMERA_ALARM_GATE_ORIG);
+        buf.extend_from_slice(&[0xDD; 32]);
+
+        let off1 = patch_camera_alarm_bytes(&mut buf).unwrap();
+        assert_eq!(off1, 48);
+        assert_eq!(
+            &buf[48..48 + CAMERA_ALARM_GATE_PATCHED.len()],
+            CAMERA_ALARM_GATE_PATCHED
+        );
+
+        // Idempotent second call
+        let off2 = patch_camera_alarm_bytes(&mut buf).unwrap();
+        assert_eq!(off2, 48);
+        assert!(is_camera_alarm_patched(&buf));
+    }
+
+    #[test]
+    fn test_patch_nonlethal_gameover_bytes() {
+        let mut buf = vec![0xEE; 36];
+        buf.extend_from_slice(NONLETHAL_GAMEOVER_ORIG);
+        buf.extend_from_slice(&[0xFF; 24]);
+
+        let off1 = patch_nonlethal_gameover_bytes(&mut buf).unwrap();
+        assert_eq!(off1, 36);
+        assert_eq!(
+            &buf[36..36 + NONLETHAL_GAMEOVER_PATCHED.len()],
+            NONLETHAL_GAMEOVER_PATCHED
+        );
+
+        // Idempotent second call
+        let off2 = patch_nonlethal_gameover_bytes(&mut buf).unwrap();
+        assert_eq!(off2, 36);
+        assert!(is_nonlethal_gameover_patched(&buf));
+    }
+
+    #[test]
+    fn test_patch_engine_u_levelinfo_bytes() {
+        let mut buf = vec![0x12; 40];
+        buf.extend_from_slice(ENGINE_U_LEVELINFO_ORIG);
+        buf.extend_from_slice(&[0x34; 20]);
+
+        assert!(!is_engine_u_levelinfo_patched(&buf));
+
+        let off1 = patch_engine_u_levelinfo_bytes(&mut buf).unwrap();
+        assert_eq!(off1, 40);
+        assert_eq!(
+            &buf[40..40 + ENGINE_U_LEVELINFO_PATCHED.len()],
+            ENGINE_U_LEVELINFO_PATCHED
+        );
+        assert!(is_engine_u_levelinfo_patched(&buf));
+
+        // Idempotent second call
+        let off2 = patch_engine_u_levelinfo_bytes(&mut buf).unwrap();
+        assert_eq!(off2, 40);
+        assert!(is_engine_u_levelinfo_patched(&buf));
+
+        // Revert test
+        assert!(revert_engine_u_levelinfo_bytes(&mut buf));
+        assert!(!is_engine_u_levelinfo_patched(&buf));
+        assert_eq!(
+            &buf[40..40 + ENGINE_U_LEVELINFO_ORIG.len()],
+            ENGINE_U_LEVELINFO_ORIG
+        );
+        assert!(!revert_engine_u_levelinfo_bytes(&mut buf));
     }
 }

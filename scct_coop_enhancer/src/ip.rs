@@ -212,6 +212,55 @@ pub fn is_same_subnet(ip1: Ipv4Addr, ip2: Ipv4Addr) -> bool {
     o1[0] == o2[0] && o1[1] == o2[1] && o1[2] == o2[2]
 }
 
+fn bind_udp_with_fallback(
+    bind_ip: Ipv4Addr,
+    preferred_port: u16,
+    label: &str,
+) -> anyhow::Result<std::net::UdpSocket> {
+    let primary = SocketAddr::V4(std::net::SocketAddrV4::new(bind_ip, preferred_port));
+    match std::net::UdpSocket::bind(primary) {
+        Ok(s) => Ok(s),
+        Err(_) => {
+            let fallback = SocketAddr::V4(std::net::SocketAddrV4::new(bind_ip, 0));
+            std::net::UdpSocket::bind(fallback).map_err(|e| {
+                anyhow::anyhow!("Failed to bind {} UDP socket on {}: {}", label, bind_ip, e)
+            })
+        }
+    }
+}
+
+/// Bind discovery (9100) and gameplay (9103) UDP sockets on `bind_ip` (or `0.0.0.0` when `None`),
+/// falling back to an ephemeral port on that same adapter IP if the preferred port is occupied.
+pub fn bind_coop_udp_sockets(
+    bind_ip: Option<Ipv4Addr>,
+) -> anyhow::Result<(std::net::UdpSocket, std::net::UdpSocket)> {
+    let ip = bind_ip
+        .filter(|a| !a.is_unspecified())
+        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+    let sock_disco = bind_udp_with_fallback(ip, crate::net::DISCOVERY_PORT, "discovery")?;
+    let sock_game = bind_udp_with_fallback(ip, crate::net::GAME_PORT, "gameplay")?;
+    Ok((sock_disco, sock_game))
+}
+
+/// Choose the local LAN IPv4 address to advertise to a co-op peer.
+/// Honors an explicit adapter `bind_ip` when set; otherwise picks the best detected local NIC.
+pub fn resolve_local_ip_for_coop(
+    bind_ip: Option<Ipv4Addr>,
+    server_host: &str,
+    api_port: u16,
+) -> Option<Ipv4Addr> {
+    if let Some(ip) = bind_ip.filter(|a| !a.is_unspecified()) {
+        return Some(ip);
+    }
+    use std::net::ToSocketAddrs;
+    let target_sa: SocketAddr = format!("{}:{}", server_host, api_port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .unwrap_or_else(|| SocketAddr::from(([8, 8, 8, 8], 80)));
+    get_best_local_ip().or_else(|| get_local_ip_to(target_sa))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +294,29 @@ mod tests {
         let ip = best.unwrap();
         assert!(!ip.is_loopback());
         assert!(!ip.is_unspecified());
+    }
+
+    #[test]
+    fn test_bind_coop_udp_sockets_loopback_and_auto() {
+        let (s_disco, s_game) =
+            bind_coop_udp_sockets(Some(Ipv4Addr::LOCALHOST)).expect("loopback bind");
+        assert_eq!(s_disco.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(s_game.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+
+        let (a_disco, a_game) = bind_coop_udp_sockets(None).expect("auto bind");
+        assert!(a_disco.local_addr().is_ok());
+        assert!(a_game.local_addr().is_ok());
+    }
+
+    #[test]
+    fn test_resolve_local_ip_for_coop() {
+        let forced = Ipv4Addr::new(192, 168, 178, 203);
+        assert_eq!(
+            resolve_local_ip_for_coop(Some(forced), "127.0.0.1", 8080),
+            Some(forced)
+        );
+        let auto = resolve_local_ip_for_coop(Some(Ipv4Addr::UNSPECIFIED), "8.8.8.8", 80);
+        assert!(auto.is_some());
+        assert!(!auto.unwrap().is_unspecified());
     }
 }

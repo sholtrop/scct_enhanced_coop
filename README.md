@@ -38,12 +38,33 @@ A: Binary releases are available for Linux, but I have **not** tested this on Li
 
 This _SCCT Enhanced Coop_ mod consists of two parts:
 
-1. **`scct_coop_server`**: A lightweight RFC 5389 STUN server and Axum HTTP signaling rendezvous server. Used for room code pairing and NAT hole-punching.
+1. **`scct_coop_server`**: A small STUN server and Axum HTTP signaling rendezvous server. Used only for room code pairing and NAT hole-punching.
 2. **`scct_coop_enhancer`**: A desktop GUI launcher that handles mod installation, game launch, STUN hole-punching, in-memory runtime hooks.
 
 ### SCCT Coop Enhancer
 
-...
+The `scct_coop_enhancer` can be launched in GUI mode (default) or used headlessly from the command line:
+
+```bash
+# Host a match headlessly (generates a Friend Code, waits for partner, and launches game)
+scct_coop_enhancer --host
+
+# Join a match headlessly using your partner's Friend Code
+scct_coop_enhancer --join <CODE>
+
+# Configure peer target without auto-launching game (e.g. for Proton / Wine / Steam custom launch)
+scct_coop_enhancer --host --no-launch
+scct_coop_enhancer --join <CODE> --no-launch
+
+# List all modular patch flags
+scct_coop_enhancer --list-flags
+
+# Apply mod patches headlessly without opening the GUI
+scct_coop_enhancer --cli
+
+# Restore 100% vanilla game files
+scct_coop_enhancer --restore
+```
 
 ### SCCT Coop Server
 

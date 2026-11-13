@@ -1,5 +1,6 @@
+use crate::quicksave_persistence::PersistentQuickSaveHandle;
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -14,8 +15,14 @@ enum InstallState {
     Failed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeepaliveCommand {
+    Stop,
+    Disconnect,
+}
+
 pub struct KeepaliveHandle {
-    stop_tx: Sender<()>,
+    cmd_tx: Sender<KeepaliveCommand>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -27,7 +34,14 @@ impl std::fmt::Debug for KeepaliveHandle {
 
 impl KeepaliveHandle {
     pub fn stop_and_wait(&mut self) {
-        let _ = self.stop_tx.send(());
+        let _ = self.cmd_tx.send(KeepaliveCommand::Stop);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    pub fn disconnect_and_wait(&mut self) {
+        let _ = self.cmd_tx.send(KeepaliveCommand::Disconnect);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
@@ -36,18 +50,88 @@ impl KeepaliveHandle {
 
 impl Drop for KeepaliveHandle {
     fn drop(&mut self) {
-        self.stop_and_wait();
+        self.disconnect_and_wait();
     }
 }
 
-fn drain_nonblocking_udp(sock: &std::net::UdpSocket) {
-    let mut scratch = [0u8; 256];
-    loop {
-        match sock.recv_from(&mut scratch) {
-            Ok(_) => continue,
-            Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
-            Err(_) => break,
+pub struct SessionMonitorHandle {
+    stop_tx: Sender<()>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for SessionMonitorHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionMonitorHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SessionMonitorHandle {
+    pub fn stop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
         }
+    }
+}
+
+impl Drop for SessionMonitorHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn spawn_session_monitor(
+    server_host: String,
+    api_port: u16,
+    code: String,
+    role: String,
+    tx: Sender<GuiEvent>,
+    ctx: egui::Context,
+) -> SessionMonitorHandle {
+    let (stop_tx, stop_rx) = channel();
+    let join_handle = thread::spawn(move || {
+        loop {
+            match stop_rx.recv_timeout(Duration::from_millis(2000)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    match crate::stun::poll_server_for_peer(
+                        &server_host,
+                        api_port,
+                        &code,
+                        Some(&role),
+                    ) {
+                        Ok(crate::stun::PollPeerResult::Disconnected(reason)) => {
+                            let _ = tx.send(GuiEvent::PeerDisconnected(format!(
+                                "Friend disconnected ({})",
+                                reason
+                            )));
+                            ctx.request_repaint();
+                            break;
+                        }
+                        Ok(crate::stun::PollPeerResult::Paired(..)) => {}
+                        Ok(crate::stun::PollPeerResult::Waiting) => {}
+                        Err(e) => {
+                            let err_msg = format!("{:#}", e);
+                            if err_msg.contains("code_not_found")
+                                || err_msg.contains("expired or not found")
+                                || err_msg.contains("404")
+                            {
+                                let _ = tx.send(GuiEvent::PeerDisconnected(
+                                    "Friend disconnected (session ended).".to_string(),
+                                ));
+                                ctx.request_repaint();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    SessionMonitorHandle {
+        stop_tx,
+        join_handle: Some(join_handle),
     }
 }
 
@@ -56,35 +140,94 @@ fn spawn_punch_keepalive(
     sock_game: std::net::UdpSocket,
     peer_disco: std::net::SocketAddr,
     peer_game: std::net::SocketAddr,
+    tx: Sender<GuiEvent>,
+    ctx: egui::Context,
 ) -> KeepaliveHandle {
-    let (stop_tx, stop_rx) = channel();
+    let (cmd_tx, cmd_rx) = channel();
     let join_handle = thread::spawn(move || {
         let _ = sock_disco.set_nonblocking(true);
         let _ = sock_game.set_nonblocking(true);
-        let payload = b"SCCT_PUNCH_V1";
-        loop {
-            drain_nonblocking_udp(&sock_disco);
-            drain_nonblocking_udp(&sock_game);
+        let mut buf = [0u8; 512];
 
-            match stop_rx.recv_timeout(Duration::from_secs(2)) {
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = sock_disco.send_to(payload, peer_disco);
-                    let _ = sock_game.send_to(payload, peer_game);
+        loop {
+            // 1. Drain and handle incoming packets on discovery socket
+            loop {
+                match sock_disco.recv_from(&mut buf) {
+                    Ok((len, src)) => {
+                        let data = &buf[..len];
+                        if data.starts_with(crate::stun::SCCT_DISCONNECT_PAYLOAD) {
+                            let _ = tx.send(GuiEvent::PeerDisconnected(
+                                "Friend disconnected from session.".to_string(),
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        } else if data.starts_with(crate::stun::SCCT_PING_PAYLOAD) {
+                            let _ = sock_disco.send_to(crate::stun::SCCT_PONG_PAYLOAD, src);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => break,
                 }
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = sock_disco.send_to(payload, peer_disco);
-                    let _ = sock_game.send_to(payload, peer_game);
-                    drain_nonblocking_udp(&sock_disco);
-                    drain_nonblocking_udp(&sock_game);
-                    drop(sock_disco);
-                    drop(sock_game);
+            }
+
+            // 2. Drain and handle incoming packets on gameplay socket
+            loop {
+                match sock_game.recv_from(&mut buf) {
+                    Ok((len, src)) => {
+                        let data = &buf[..len];
+                        if data.starts_with(crate::stun::SCCT_DISCONNECT_PAYLOAD) {
+                            let _ = tx.send(GuiEvent::PeerDisconnected(
+                                "Friend disconnected from session.".to_string(),
+                            ));
+                            ctx.request_repaint();
+                            return;
+                        } else if data.starts_with(crate::stun::SCCT_PING_PAYLOAD) {
+                            let _ = sock_game.send_to(crate::stun::SCCT_PONG_PAYLOAD, src);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => break,
+                }
+            }
+
+            // 3. Check for stop/disconnect commands with timeout
+            match cmd_rx.recv_timeout(Duration::from_millis(1000)) {
+                Ok(KeepaliveCommand::Disconnect) => {
+                    crate::stun::send_udp_disconnect(
+                        &sock_disco,
+                        &sock_game,
+                        peer_disco,
+                        peer_game,
+                    );
                     break;
+                }
+                Ok(KeepaliveCommand::Stop) => {
+                    // Silent stop (e.g. launching game)
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::stun::send_udp_disconnect(
+                        &sock_disco,
+                        &sock_game,
+                        peer_disco,
+                        peer_game,
+                    );
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Send ping + punch packets to keep NAT mappings refreshed
+                    let _ = sock_disco.send_to(crate::stun::SCCT_PING_PAYLOAD, peer_disco);
+                    let _ = sock_game.send_to(crate::stun::SCCT_PING_PAYLOAD, peer_game);
+                    let _ = sock_disco.send_to(crate::stun::SCCT_PUNCH_PAYLOAD, peer_disco);
+                    let _ = sock_game.send_to(crate::stun::SCCT_PUNCH_PAYLOAD, peer_game);
                 }
             }
         }
     });
     KeepaliveHandle {
-        stop_tx,
+        cmd_tx,
         join_handle: Some(join_handle),
     }
 }
@@ -128,6 +271,7 @@ pub enum GuiEvent {
         keepalive: Option<KeepaliveHandle>,
     },
     MatchFailed(String),
+    PeerDisconnected(String),
     GameExited(u32),
 }
 
@@ -150,24 +294,41 @@ pub struct PatcherApp {
     guest_code_input: String,
     cancel_tx: Option<Sender<()>>,
     keepalive: Option<KeepaliveHandle>,
+    session_monitor: Option<SessionMonitorHandle>,
+    persistent_quick_saves: Option<PersistentQuickSaveHandle>,
+    disconnect_notice: Option<String>,
 
     // Advanced Server Settings
     server_host: String,
     stun_port: u16,
     api_port: u16,
+
+    // Multi-NIC adapter binding (None = Auto / All Adapters)
+    available_local_ips: Vec<std::net::Ipv4Addr>,
+    selected_bind_ip: Option<std::net::Ipv4Addr>,
+
+    // Modular patch flags & optional gameplay tweaks
+    pub flags: Vec<crate::flags::FlagState>,
 }
 
 impl PatcherApp {
-    pub fn new(cc: &eframe::CreationContext, explicit_dir: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext,
+        explicit_dir: Option<PathBuf>,
+        initial_bind_ip: Option<std::net::Ipv4Addr>,
+    ) -> Self {
         // Force dark mode regardless of OS light/dark theme preference
         let mut dark_visuals = egui::Visuals::dark();
         dark_visuals.panel_fill = Color32::from_rgb(18, 20, 24);
         cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
-        cc.egui_ctx.set_visuals_of(egui::Theme::Dark, dark_visuals.clone());
-        cc.egui_ctx.set_visuals_of(egui::Theme::Light, dark_visuals.clone());
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Dark, dark_visuals.clone());
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Light, dark_visuals.clone());
         cc.egui_ctx.set_visuals(dark_visuals);
 
         let (sender, receiver) = channel();
+        let initial_bind_ip = initial_bind_ip.filter(|ip| !ip.is_unspecified());
 
         let mut app = Self {
             game_dir_input: String::new(),
@@ -184,9 +345,15 @@ impl PatcherApp {
             guest_code_input: String::new(),
             cancel_tx: None,
             keepalive: None,
+            session_monitor: None,
+            persistent_quick_saves: None,
+            disconnect_notice: None,
             server_host: crate::stun::DEFAULT_SERVER_HOST.to_string(),
             stun_port: crate::stun::DEFAULT_STUN_PORT,
             api_port: crate::stun::DEFAULT_API_PORT,
+            available_local_ips: crate::ip::get_all_local_ips(),
+            selected_bind_ip: initial_bind_ip,
+            flags: crate::flags::default_flag_states(),
         };
 
         let detected = crate::patcher::auto_detect_game_roots();
@@ -223,6 +390,8 @@ impl PatcherApp {
     pub fn set_game_root(&mut self, root: PathBuf) {
         self.game_dir_input = root.display().to_string();
         self.installed_version = crate::patcher::get_installed_version(&root);
+        self.flags = crate::flags::load_flag_states(&root);
+
         if let Some(ref ver) = self.installed_version {
             self.detection_msg = format!(
                 "Game detected: {} (Co-op Mod v{} installed)",
@@ -232,7 +401,13 @@ impl PatcherApp {
         } else {
             self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
         }
-        self.resolved_root = Some(root);
+        self.resolved_root = Some(root.clone());
+
+        if self.persistent_quick_saves.is_none() {
+            self.persistent_quick_saves = Some(
+                crate::quicksave_persistence::spawn_quicksave_persistence(root),
+            );
+        }
     }
 
     fn check_manual_path_input(&mut self) {
@@ -264,16 +439,77 @@ impl PatcherApp {
         }
     }
 
+    fn disconnect_keepalive(&mut self) {
+        if let Some(mut ka) = self.keepalive.take() {
+            ka.disconnect_and_wait();
+        }
+    }
+
+    fn stop_session_monitor(&mut self) {
+        if let Some(mut mon) = self.session_monitor.take() {
+            mon.stop();
+        }
+    }
+
+    fn stop_persistent_quick_saves(&mut self) {
+        if let Some(mut quicksaves) = self.persistent_quick_saves.take() {
+            quicksaves.stop();
+        }
+    }
+
+    fn restore_quick_saves_before_launch(&mut self, game_root: &Path) {
+        if let Err(error) = crate::quicksave_persistence::restore_latest_quick_saves(game_root) {
+            self.log_lines.push(format!(
+                ">>> [QUICKSAVE] Could not restore previous co-op quick saves: {:#}",
+                error
+            ));
+        }
+    }
+
     fn cancel_matching(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());
         }
-        self.stop_keepalive();
+
+        // Notify server of session disconnection if a room was registered/matched
+        match &self.match_state {
+            MatchState::Hosting { code, .. } => {
+                let code_clone = code.clone();
+                let host = self.server_host.clone();
+                let port = self.api_port;
+                thread::spawn(move || {
+                    let _ = crate::stun::notify_server_disconnect(
+                        &host,
+                        port,
+                        &code_clone,
+                        Some("Host cancelled session"),
+                    );
+                });
+            }
+            MatchState::Matched { code, .. } => {
+                let code_clone = code.clone();
+                let host = self.server_host.clone();
+                let port = self.api_port;
+                thread::spawn(move || {
+                    let _ = crate::stun::notify_server_disconnect(
+                        &host,
+                        port,
+                        &code_clone,
+                        Some("Player disconnected"),
+                    );
+                });
+            }
+            _ => {}
+        }
+
+        self.disconnect_keepalive();
+        self.stop_session_monitor();
         self.match_state = MatchState::Idle;
     }
 
     fn start_hosting(&mut self, ctx: &egui::Context) {
         self.cancel_matching();
+        self.disconnect_notice = None;
         let (cancel_tx, cancel_rx) = channel();
         self.cancel_tx = Some(cancel_tx);
         self.match_state = MatchState::Hosting {
@@ -284,11 +520,20 @@ impl PatcherApp {
         let server_host = self.server_host.clone();
         let stun_port = self.stun_port;
         let api_port = self.api_port;
+        let bind_ip = self.selected_bind_ip;
         let tx = self.sender.clone();
         let ctx_clone = ctx.clone();
 
         thread::spawn(move || {
-            run_host_match(server_host, stun_port, api_port, tx, cancel_rx, ctx_clone);
+            run_host_match(
+                server_host,
+                stun_port,
+                api_port,
+                bind_ip,
+                tx,
+                cancel_rx,
+                ctx_clone,
+            );
         });
     }
 
@@ -302,6 +547,7 @@ impl PatcherApp {
         }
         self.guest_code_input = code.clone();
         self.cancel_matching();
+        self.disconnect_notice = None;
         self.match_state = MatchState::Joining {
             target_code: code.clone(),
             status_text: format!("Contacting server to match code '{}'...", code),
@@ -310,11 +556,12 @@ impl PatcherApp {
         let server_host = self.server_host.clone();
         let stun_port = self.stun_port;
         let api_port = self.api_port;
+        let bind_ip = self.selected_bind_ip;
         let tx = self.sender.clone();
         let ctx_clone = ctx.clone();
 
         thread::spawn(move || {
-            run_join_match(server_host, stun_port, api_port, code, tx, ctx_clone);
+            run_join_match(server_host, stun_port, api_port, bind_ip, code, tx, ctx_clone);
         });
     }
 
@@ -378,12 +625,20 @@ impl PatcherApp {
             return;
         }
 
+        if let Err(e) = crate::flags::sync_all_flags(&root, &self.flags) {
+            self.log_lines
+                .push(format!(">>> [WARNING] Could not sync patch flags: {:#}", e));
+        }
+
+        self.restore_quick_saves_before_launch(&root);
+
         match crate::launcher::launch_game(
             &exe_path,
             &root,
             Some(peer_ip),
             peer_disco_port,
             peer_game_port,
+            self.selected_bind_ip,
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
@@ -457,12 +712,20 @@ impl PatcherApp {
             return;
         }
 
+        if let Err(e) = crate::flags::sync_all_flags(&root, &self.flags) {
+            self.log_lines
+                .push(format!(">>> [WARNING] Could not sync patch flags: {:#}", e));
+        }
+
+        self.restore_quick_saves_before_launch(&root);
+
         match crate::launcher::launch_game(
             &exe_path,
             &root,
             None,
             crate::net::DISCOVERY_PORT,
             crate::net::GAME_PORT,
+            self.selected_bind_ip,
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
@@ -474,9 +737,13 @@ impl PatcherApp {
                     let _ = tx.send(GuiEvent::GameExited(pid));
                     ctx_clone.request_repaint();
                 });
+                let adapter_desc = match self.selected_bind_ip {
+                    Some(ip) => format!("bound to adapter {}", ip),
+                    None => "all local adapters (Auto)".to_string(),
+                };
                 self.log_lines.push(format!(
-                    ">>> Chaos Theory launched (PID: {}) in standard LAN mode!",
-                    pid
+                    ">>> Chaos Theory launched (PID: {}) in LAN mode ({})!",
+                    pid, adapter_desc
                 ));
                 self.log_lines.push(
                     ">>> In game, select Coop -> Enhanced Coop to host or join on your local network."
@@ -555,7 +822,20 @@ impl eframe::App for PatcherApp {
                         MatchState::Hosting { .. } | MatchState::Joining { .. }
                     ) {
                         self.stop_keepalive();
+                        self.stop_session_monitor();
                         self.keepalive = keepalive;
+                        self.session_monitor = Some(spawn_session_monitor(
+                            self.server_host.clone(),
+                            self.api_port,
+                            code.clone(),
+                            if is_host {
+                                "host".to_string()
+                            } else {
+                                "guest".to_string()
+                            },
+                            self.sender.clone(),
+                            ctx.clone(),
+                        ));
                         self.match_state = MatchState::Matched {
                             code,
                             is_host,
@@ -570,29 +850,52 @@ impl eframe::App for PatcherApp {
                 }
                 GuiEvent::MatchFailed(error) => {
                     self.stop_keepalive();
+                    self.stop_session_monitor();
                     self.match_state = MatchState::Failed { error };
+                }
+                GuiEvent::PeerDisconnected(reason) => {
+                    self.stop_keepalive();
+                    self.stop_session_monitor();
+                    self.log_lines.push(format!(">>> [DISCONNECT] {}", reason));
+                    self.disconnect_notice = Some(reason);
+                    self.match_state = MatchState::Idle;
                 }
                 GuiEvent::GameExited(pid) => {
                     if self.running_game_pid == Some(pid) {
                         self.running_game_pid = None;
                     }
-                    if let MatchState::Matched {
-                        ref mut game_launched,
-                        ..
-                    } = self.match_state
-                    {
-                        *game_launched = false;
-                    }
                     self.log_lines.push(format!(
                         ">>> Splinter Cell Chaos Theory (PID: {}) has exited.",
                         pid
                     ));
+                    if let MatchState::Matched { ref code, .. } = self.match_state {
+                        let code_clone = code.clone();
+                        let host = self.server_host.clone();
+                        let port = self.api_port;
+                        thread::spawn(move || {
+                            let _ = crate::stun::notify_server_disconnect(
+                                &host,
+                                port,
+                                &code_clone,
+                                Some("Game closed"),
+                            );
+                        });
+                        self.disconnect_keepalive();
+                        self.stop_session_monitor();
+                        self.match_state = MatchState::Idle;
+                        self.disconnect_notice = Some(
+                            "Session ended because game was closed. If you're using the Steam version, make sure Steam is running first."
+                                .to_string(),
+                        );
+                        self.log_lines
+                            .push(">>> Session closed because game was exited.".to_string());
+                    }
                 }
             }
         }
 
-        let central_frame = egui::Frame::central_panel(&ctx.style())
-            .fill(Color32::from_rgb(18, 20, 24));
+        let central_frame =
+            egui::Frame::central_panel(&ctx.style()).fill(Color32::from_rgb(18, 20, 24));
         egui::CentralPanel::default().frame(central_frame).show(ctx, |ui| {
             ui.add_space(4.0);
 
@@ -721,6 +1024,47 @@ impl eframe::App for PatcherApp {
                 });
                 ui.add_space(4.0);
 
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Network Adapter:")
+                            .size(12.0)
+                            .color(Color32::from_rgb(180, 180, 180)),
+                    );
+                    let selected_label = match self.selected_bind_ip {
+                        Some(ip) => format!("{}", ip),
+                        None => "Auto (All Adapters)".to_string(),
+                    };
+                    egui::ComboBox::from_id_salt("bind_adapter_ip")
+                        .selected_text(selected_label)
+                        .width(185.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.selected_bind_ip,
+                                None,
+                                "Auto (All Adapters)",
+                            );
+                            for &ip in &self.available_local_ips {
+                                ui.selectable_value(
+                                    &mut self.selected_bind_ip,
+                                    Some(ip),
+                                    format!("{}", ip),
+                                );
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Optional: pin game sockets to one specific local IPv4 adapter (useful for multi-NIC PCs or two instances on the same PC)",
+                        );
+                    if ui
+                        .button(RichText::new("🔄").size(11.5))
+                        .on_hover_text("Refresh detected local IPv4 adapters")
+                        .clicked()
+                    {
+                        self.available_local_ips = crate::ip::get_all_local_ips();
+                    }
+                });
+                ui.add_space(4.0);
+
                 let mut action_launch_direct = false;
                 ui.columns(3, |cols| {
                     // Direct LAN Launch Button
@@ -761,6 +1105,7 @@ impl eframe::App for PatcherApp {
                         let tx_status = self.sender.clone();
                         let ctx_clone = ctx.clone();
                         let root = self.resolved_root.clone().unwrap();
+                        let flags = self.flags.clone();
 
                         crate::patcher::set_log_sink(move |msg| {
                             let _ = tx.send(GuiEvent::Log(msg.to_string()));
@@ -769,7 +1114,7 @@ impl eframe::App for PatcherApp {
 
                         let ctx_finish = ctx.clone();
                         thread::spawn(move || {
-                            let res = crate::patcher::apply_all(&root, false);
+                            let res = crate::patcher::apply_all(&root, false, &flags);
                             match res {
                                 Ok(_) => {
                                     let _ = tx_status.send(GuiEvent::Log("\n>>> Reinstallation complete! All coop missions and network fixes re-applied.".to_string()));
@@ -875,6 +1220,7 @@ impl eframe::App for PatcherApp {
                     let tx_status = self.sender.clone();
                     let ctx_clone = ctx.clone();
                     let root = self.resolved_root.clone().unwrap();
+                    let flags = self.flags.clone();
 
                     crate::patcher::set_log_sink(move |msg| {
                         let _ = tx.send(GuiEvent::Log(msg.to_string()));
@@ -883,7 +1229,7 @@ impl eframe::App for PatcherApp {
 
                     let ctx_finish = ctx.clone();
                     thread::spawn(move || {
-                        let res = crate::patcher::apply_all(&root, false);
+                        let res = crate::patcher::apply_all(&root, false, &flags);
                         match res {
                             Ok(_) => {
                                 let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.".to_string()));
@@ -898,6 +1244,80 @@ impl eframe::App for PatcherApp {
                         ctx_finish.request_repaint();
                     });
                 }
+            }
+
+            // Optional Patch Flags & Gameplay Tweaks (List of Checkboxes)
+            if self.resolved_root.is_some() {
+                ui.add_space(8.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(26, 30, 38))
+                    .inner_margin(8.0)
+                    .corner_radius(4.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Optional Patch Flags")
+                                    .strong()
+                                    .size(12.5)
+                                    .color(Color32::from_rgb(220, 225, 235)),
+                            );
+                            ui.label(
+                                RichText::new("(Experimental gameplay fixes for splintercell3.exe)")
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(140, 145, 155)),
+                            );
+                        });
+                        ui.add_space(4.0);
+
+                        let mut toggle_action: Option<(usize, bool)> = None;
+                        for (idx, flag) in self.flags.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                let mut checked = flag.enabled;
+                                let cb = egui::Checkbox::new(
+                                    &mut checked,
+                                    RichText::new(flag.def.name).size(12.0),
+                                );
+                                let resp = ui.add_enabled(can_click, cb);
+                                if flag.def.experimental {
+                                    ui.colored_label(
+                                        Color32::from_rgb(255, 160, 80),
+                                        "⚠️ EXPERIMENTAL",
+                                    );
+                                }
+                                if resp.changed() {
+                                    toggle_action = Some((idx, checked));
+                                }
+                            });
+                            ui.indent(flag.def.id, |ui| {
+                                ui.label(
+                                    RichText::new(flag.def.description)
+                                        .size(10.5)
+                                        .color(Color32::from_rgb(150, 155, 165)),
+                                );
+                            });
+                            ui.add_space(2.0);
+                        }
+
+                        if let Some((idx, new_val)) = toggle_action {
+                            self.flags[idx].enabled = new_val;
+                            if let Some(ref root) = self.resolved_root.clone() {
+                                if self.installed_version.is_some() {
+                                    let flag_id = self.flags[idx].def.id;
+                                    let flag_name = self.flags[idx].def.name;
+                                    match crate::flags::set_flag_applied(&root, flag_id, new_val) {
+                                        Ok(()) => {
+                                            let act = if new_val { "Enabled" } else { "Disabled" };
+                                            self.log_lines.push(format!(">>> [FLAG] {} {}", act, flag_name));
+                                        }
+                                        Err(e) => {
+                                            self.flags[idx].enabled = !new_val;
+                                            self.log_lines.push(format!(">>> [ERROR] Failed to toggle flag {}: {:#}", flag_name, e));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
             }
 
             ui.add_space(6.0);
@@ -923,6 +1343,33 @@ impl eframe::App for PatcherApp {
 
                 match &mut self.match_state {
                     MatchState::Idle => {
+                        let mut clear_notice = false;
+                        if let Some(notice) = &self.disconnect_notice {
+                            let notice_frame = egui::Frame::group(ui.style())
+                                .fill(Color32::from_rgb(38, 26, 26))
+                                .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(220, 100, 80)))
+                                .inner_margin(10.0);
+                            notice_frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(format!("⚠ {}", notice))
+                                            .color(Color32::from_rgb(255, 140, 140))
+                                            .size(13.0)
+                                            .strong(),
+                                    );
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.button(RichText::new("✕").size(11.0)).clicked() {
+                                            clear_notice = true;
+                                        }
+                                    });
+                                });
+                            });
+                            ui.add_space(8.0);
+                        }
+                        if clear_notice {
+                            self.disconnect_notice = None;
+                        }
+
                         ui.columns(2, |cols| {
                             // Left Column: Host a Session
                             let left_frame = egui::Frame::group(cols[0].style())
@@ -972,9 +1419,10 @@ impl eframe::App for PatcherApp {
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(&mut self.guest_code_input)
                                             .char_limit(5)
-                                            .font(egui::TextStyle::Monospace)
-                                            .desired_width(100.0)
-                                            .min_size(Vec2::new(100.0, 38.0))
+                                            .font(egui::FontId::monospace(26.0))
+                                            .vertical_align(egui::Align::Center)
+                                            .desired_width(120.0)
+                                            .min_size(Vec2::new(120.0, 38.0))
                                             .hint_text("K7X9B"),
                                     );
                                     if resp.changed() {
@@ -1191,6 +1639,16 @@ impl eframe::App for PatcherApp {
                 // Advanced Server Settings Collapsible (Default Hidden)
                 ui.collapsing("⚙ Advanced Server Settings", |ui| {
                     ui.add_space(2.0);
+                    if let Some(root) = &self.resolved_root
+                        && let Some(profile_dir) = crate::quicksave_persistence::find_scct_quicksave_profile_dir(root)
+                    {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Persistent quick saves:").size(11.5));
+                            ui.label(
+                                RichText::new(format!("{}", profile_dir.display())).size(10.5),
+                            );
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Server Address:").size(11.5));
                         ui.add(
@@ -1271,12 +1729,25 @@ impl eframe::App for PatcherApp {
             });
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_persistent_quick_saves();
+        self.cancel_matching();
+    }
+}
+
+impl Drop for PatcherApp {
+    fn drop(&mut self) {
+        self.stop_persistent_quick_saves();
+        self.cancel_matching();
+    }
 }
 
 fn run_host_match(
     server_host: String,
     stun_port: u16,
     api_port: u16,
+    bind_ip: Option<std::net::Ipv4Addr>,
     tx: Sender<GuiEvent>,
     cancel_rx: Receiver<()>,
     ctx: egui::Context,
@@ -1287,34 +1758,13 @@ fn run_host_match(
     ctx.request_repaint();
 
     // 1. Bind UDP sockets
-    let sock_disco = match std::net::UdpSocket::bind("0.0.0.0:9100") {
-        Ok(s) => s,
-        Err(_) => match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(GuiEvent::MatchFailed(format!(
-                    "Failed to bind Discovery socket: {:#}",
-                    e
-                )));
-                ctx.request_repaint();
-                return;
-            }
-        },
-    };
-
-    let sock_game = match std::net::UdpSocket::bind("0.0.0.0:9103") {
-        Ok(s) => s,
-        Err(_) => match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(GuiEvent::MatchFailed(format!(
-                    "Failed to bind Gameplay socket: {:#}",
-                    e
-                )));
-                ctx.request_repaint();
-                return;
-            }
-        },
+    let (sock_disco, sock_game) = match crate::ip::bind_coop_udp_sockets(bind_ip) {
+        Ok(socks) => socks,
+        Err(e) => {
+            let _ = tx.send(GuiEvent::MatchFailed(format!("{:#}", e)));
+            ctx.request_repaint();
+            return;
+        }
     };
 
     let _ = tx.send(GuiEvent::Log(format!(
@@ -1351,13 +1801,7 @@ fn run_host_match(
     ctx.request_repaint();
 
     // 3. Register with rendezvous server
-    let target_sa: std::net::SocketAddr = format!("{}:{}", server_host, api_port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip =
-        crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
+    let my_local_ip = crate::ip::resolve_local_ip_for_coop(bind_ip, &server_host, api_port);
 
     let code = match crate::stun::register_with_server(
         &server_host,
@@ -1406,8 +1850,8 @@ fn run_host_match(
             return;
         }
 
-        match crate::stun::poll_server_for_peer(&server_host, api_port, &code) {
-            Ok(Some((peer_disco, peer_game, peer_local_ip))) => {
+        match crate::stun::poll_server_for_peer(&server_host, api_port, &code, Some("host")) {
+            Ok(crate::stun::PollPeerResult::Paired(peer_disco, peer_game, peer_local_ip)) => {
                 let _ = tx.send(GuiEvent::MatchStatus(
                     "Friend connected! Establishing direct connection...".to_string(),
                 ));
@@ -1419,6 +1863,7 @@ fn run_host_match(
                 let (peer_ip, peer_disco_port, peer_game_port, keepalive) = resolve_peer_connection(
                     "HOST",
                     &tx,
+                    &ctx,
                     sock_disco,
                     sock_game,
                     disco_ext,
@@ -1443,7 +1888,7 @@ fn run_host_match(
                 ctx.request_repaint();
                 return;
             }
-            Ok(None) => {
+            Ok(crate::stun::PollPeerResult::Waiting) => {
                 wait_ticks = wait_ticks.wrapping_add(1);
                 if wait_ticks.is_multiple_of(10)
                     && let (Ok(new_disco), Ok(new_game)) = (
@@ -1464,6 +1909,14 @@ fn run_host_match(
                     );
                 }
             }
+            Ok(crate::stun::PollPeerResult::Disconnected(reason)) => {
+                let _ = tx.send(GuiEvent::MatchFailed(format!(
+                    "Hosting session ended: {}",
+                    reason
+                )));
+                ctx.request_repaint();
+                return;
+            }
             Err(e) => {
                 let _ = tx.send(GuiEvent::MatchFailed(format!(
                     "Server polling error: {:#}",
@@ -1480,6 +1933,7 @@ fn run_host_match(
 fn resolve_peer_connection(
     role_tag: &str,
     tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
     sock_disco: std::net::UdpSocket,
     sock_game: std::net::UdpSocket,
     disco_ext: std::net::SocketAddr,
@@ -1491,67 +1945,59 @@ fn resolve_peer_connection(
     // Simultaneous UDP hole punch
     crate::stun::punch_udp_holes(&sock_disco, &sock_game, peer_disco, peer_game);
 
-    // If peer shares identical public IP (both behind same router), connect via LAN IP
-    let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
-    if is_same_public_ip {
-        let mut resolved_lan = None;
-        if let Some(target_local) = peer_local_ip {
-            if let Some(my_lan) = my_local_ip
-                && crate::ip::is_same_subnet(my_lan, target_local)
-            {
-                resolved_lan = Some(target_local);
-            }
-            if resolved_lan.is_none() && crate::ip::find_matching_subnet_ip(target_local).is_some()
-            {
-                resolved_lan = Some(target_local);
-            }
-        }
+    let (ip, peer_disco_port, peer_game_port, is_lan) = crate::stun::resolve_peer_endpoint(
+        disco_ext,
+        my_local_ip,
+        peer_disco,
+        peer_game,
+        peer_local_ip,
+    );
 
-        if let Some(lan_ip) = resolved_lan {
-            drop(sock_disco);
-            drop(sock_game);
-            let _ = tx.send(GuiEvent::Log(format!(
-                "  [{}] Detected friend on the same local network (LAN)!",
-                role_tag
-            )));
-            return (
-                lan_ip,
-                crate::net::DISCOVERY_PORT,
-                crate::net::GAME_PORT,
-                None,
-            );
-        } else if let Some(target_local) = peer_local_ip {
-            drop(sock_disco);
-            drop(sock_game);
-            let _ = tx.send(GuiEvent::Log(format!(
-                "  [{}] Friend detected behind same router! Connecting via direct network...",
-                role_tag
-            )));
-            return (
-                target_local,
-                crate::net::DISCOVERY_PORT,
-                crate::net::GAME_PORT,
-                None,
-            );
-        }
+    if is_lan {
+        let _ = tx.send(GuiEvent::Log(format!(
+            "  [{}] Detected friend on local network (LAN)! Connecting directly...",
+            role_tag
+        )));
+        let lan_peer_disco =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(ip), crate::net::DISCOVERY_PORT);
+        let lan_peer_game =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(ip), crate::net::GAME_PORT);
+        let keepalive = spawn_punch_keepalive(
+            sock_disco,
+            sock_game,
+            lan_peer_disco,
+            lan_peer_game,
+            tx.clone(),
+            ctx.clone(),
+        );
+        return (
+            ip,
+            crate::net::DISCOVERY_PORT,
+            crate::net::GAME_PORT,
+            Some(keepalive),
+        );
     }
 
     let _ = tx.send(GuiEvent::Log(format!(
         "  [{}] Connecting to friend across the Internet...",
         role_tag
     )));
-    let ip = match peer_disco.ip() {
-        std::net::IpAddr::V4(v4) => v4,
-        _ => Ipv4Addr::new(127, 0, 0, 1),
-    };
-    let keepalive = spawn_punch_keepalive(sock_disco, sock_game, peer_disco, peer_game);
-    (ip, peer_disco.port(), peer_game.port(), Some(keepalive))
+    let keepalive = spawn_punch_keepalive(
+        sock_disco,
+        sock_game,
+        peer_disco,
+        peer_game,
+        tx.clone(),
+        ctx.clone(),
+    );
+    (ip, peer_disco_port, peer_game_port, Some(keepalive))
 }
 
 fn run_join_match(
     server_host: String,
     stun_port: u16,
     api_port: u16,
+    bind_ip: Option<std::net::Ipv4Addr>,
     target_code: String,
     tx: Sender<GuiEvent>,
     ctx: egui::Context,
@@ -1563,34 +2009,13 @@ fn run_join_match(
     ctx.request_repaint();
 
     // 1. Bind UDP sockets
-    let sock_disco = match std::net::UdpSocket::bind("0.0.0.0:9100") {
-        Ok(s) => s,
-        Err(_) => match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(GuiEvent::MatchFailed(format!(
-                    "Failed to bind Discovery socket: {:#}",
-                    e
-                )));
-                ctx.request_repaint();
-                return;
-            }
-        },
-    };
-
-    let sock_game = match std::net::UdpSocket::bind("0.0.0.0:9103") {
-        Ok(s) => s,
-        Err(_) => match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(GuiEvent::MatchFailed(format!(
-                    "Failed to bind Gameplay socket: {:#}",
-                    e
-                )));
-                ctx.request_repaint();
-                return;
-            }
-        },
+    let (sock_disco, sock_game) = match crate::ip::bind_coop_udp_sockets(bind_ip) {
+        Ok(socks) => socks,
+        Err(e) => {
+            let _ = tx.send(GuiEvent::MatchFailed(format!("{:#}", e)));
+            ctx.request_repaint();
+            return;
+        }
     };
 
     let _ = tx.send(GuiEvent::Log(format!(
@@ -1629,13 +2054,7 @@ fn run_join_match(
     ));
     ctx.request_repaint();
 
-    let target_sa: std::net::SocketAddr = format!("{}:{}", server_host, api_port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-        .unwrap_or_else(|| std::net::SocketAddr::from(([8, 8, 8, 8], 80)));
-    let my_local_ip =
-        crate::ip::get_best_local_ip().or_else(|| crate::ip::get_local_ip_to(target_sa));
+    let my_local_ip = crate::ip::resolve_local_ip_for_coop(bind_ip, &server_host, api_port);
 
     // 3. Connect via rendezvous server
     let (peer_disco, peer_game, peer_local_ip) = match crate::stun::join_with_server(
@@ -1669,6 +2088,7 @@ fn run_join_match(
     let (peer_ip, peer_disco_port, peer_game_port, keepalive) = resolve_peer_connection(
         "JOIN",
         &tx,
+        &ctx,
         sock_disco,
         sock_game,
         disco_ext,
@@ -1692,7 +2112,10 @@ fn run_join_match(
     ctx.request_repaint();
 }
 
-pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
+pub fn run_gui(
+    explicit_dir: Option<PathBuf>,
+    initial_bind_ip: Option<std::net::Ipv4Addr>,
+) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 680.0])
@@ -1705,6 +2128,6 @@ pub fn run_gui(explicit_dir: Option<PathBuf>) -> eframe::Result {
     eframe::run_native(
         "SCCT Coop Mod Installer & Online Launcher",
         options,
-        Box::new(move |cc| Ok(Box::new(PatcherApp::new(cc, explicit_dir)))),
+        Box::new(move |cc| Ok(Box::new(PatcherApp::new(cc, explicit_dir, initial_bind_ip)))),
     )
 }

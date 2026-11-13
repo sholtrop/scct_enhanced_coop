@@ -1,10 +1,10 @@
 use axum::{
-    extract::{ConnectInfo, Extension, Path, Request, State},
+    Json, Router,
+    extract::{ConnectInfo, Extension, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -63,6 +63,21 @@ pub struct PollResponse {
     pub peer_game_addr: Option<SocketAddr>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_local_ip: Option<Ipv4Addr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct PollParams {
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DisconnectRequest {
+    pub friend_code: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 pub fn extract_client_ip(headers: &HeaderMap, peer_addr: Option<SocketAddr>) -> IpAddr {
@@ -125,10 +140,7 @@ async fn security_middleware(
         log::debug!("Rate limit exceeded for IP: {}", client_ip);
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [
-                ("Retry-After", "1"),
-                ("Content-Type", "application/json"),
-            ],
+            [("Retry-After", "1"), ("Content-Type", "application/json")],
             r#"{"error":"Rate limit exceeded. Maximum 10 requests per second."}"#,
         )
             .into_response();
@@ -291,13 +303,14 @@ async fn poll_handler(
     State(state): State<Arc<AppState>>,
     Extension(client_ip): Extension<IpAddr>,
     Path(code): Path<String>,
+    Query(params): Query<PollParams>,
 ) -> Response {
-
-    match state.registry.poll(&code) {
+    match state.registry.poll(&code, params.role.as_deref()) {
         PollResult::Paired(guest) => {
             log::debug!(
-                "Host polled code='{}' -> guest is ready (host {})",
+                "Host polled code='{}' (role: {:?}) -> guest is ready (host {})",
                 code,
+                params.role,
                 client_ip
             );
             (
@@ -307,12 +320,17 @@ async fn poll_handler(
                     peer_disco_addr: Some(guest.disco_addr),
                     peer_game_addr: Some(guest.game_addr),
                     peer_local_ip: guest.local_ip,
+                    reason: None,
                 }),
             )
                 .into_response()
         }
         PollResult::Waiting => {
-            log::trace!("Host polled code='{}' -> waiting (host {})", code, client_ip);
+            log::trace!(
+                "Host polled code='{}' -> waiting (host {})",
+                code,
+                client_ip
+            );
             (
                 StatusCode::OK,
                 Json(PollResponse {
@@ -320,6 +338,26 @@ async fn poll_handler(
                     peer_disco_addr: None,
                     peer_game_addr: None,
                     peer_local_ip: None,
+                    reason: None,
+                }),
+            )
+                .into_response()
+        }
+        PollResult::Disconnected(reason) => {
+            log::info!(
+                "Polled code='{}' -> session disconnected: {:?} (by {})",
+                code,
+                reason,
+                client_ip
+            );
+            (
+                StatusCode::OK,
+                Json(PollResponse {
+                    status: "disconnected".to_string(),
+                    peer_disco_addr: None,
+                    peer_game_addr: None,
+                    peer_local_ip: None,
+                    reason,
                 }),
             )
                 .into_response()
@@ -337,11 +375,60 @@ async fn poll_handler(
                     peer_disco_addr: None,
                     peer_game_addr: None,
                     peer_local_ip: None,
+                    reason: None,
                 }),
             )
                 .into_response()
         }
     }
+}
+
+async fn disconnect_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(client_ip): Extension<IpAddr>,
+    Json(req): Json<DisconnectRequest>,
+) -> Response {
+    let success = state.registry.disconnect(&req.friend_code, req.reason);
+    log::info!(
+        "Disconnect requested for code='{}' from {}: success={}",
+        req.friend_code,
+        client_ip,
+        success
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "disconnected",
+            "friend_code": req.friend_code,
+            "success": success
+        })),
+    )
+        .into_response()
+}
+
+async fn disconnect_path_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(client_ip): Extension<IpAddr>,
+    Path(code): Path<String>,
+) -> Response {
+    let success = state
+        .registry
+        .disconnect(&code, Some("Explicit disconnect".to_string()));
+    log::info!(
+        "Disconnect path requested for code='{}' from {}: success={}",
+        code,
+        client_ip,
+        success
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "disconnected",
+            "friend_code": code,
+            "success": success
+        })),
+    )
+        .into_response()
 }
 
 pub fn create_router(state: Arc<AppState>) -> Router {
@@ -350,6 +437,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/register", post(register_handler))
         .route("/api/join", post(join_handler))
         .route("/api/poll/{code}", get(poll_handler))
+        .route("/api/disconnect", post(disconnect_handler))
+        .route("/api/disconnect/{code}", post(disconnect_path_handler))
+        .route(
+            "/api/session/{code}",
+            axum::routing::delete(disconnect_path_handler),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             security_middleware,
@@ -385,7 +478,7 @@ pub async fn run_api_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
     fn test_app() -> (Router, Arc<AppState>) {
@@ -529,6 +622,7 @@ mod tests {
 
         // 6. Overwrite protection: cannot re-register connected session
         let resp = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -540,6 +634,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // 7. Disconnect session
+        let disco_payload = serde_json::json!({
+            "friend_code": "MATCH",
+            "reason": "Host left"
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/disconnect")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&disco_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 8. Poll disconnected session -> status: disconnected
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/poll/MATCH?role=guest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let poll_resp: PollResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(poll_resp.status, "disconnected");
+        assert_eq!(poll_resp.reason, Some("Host left".to_string()));
     }
 
     #[tokio::test]

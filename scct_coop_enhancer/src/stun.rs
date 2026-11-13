@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use rand::{rng, RngCore};
+use rand::{RngCore, rng};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
@@ -9,7 +9,7 @@ pub const DEFAULT_SERVER_HOST: &str = "scct_coop.sholtrop.dev";
 pub const DEFAULT_STUN_PORT: u16 = 3478;
 pub const DEFAULT_API_PORT: u16 = 8080;
 
-pub const MAGIC_COOKIE: u32 = 0x2112_A442;
+pub const MAGIC_COOKIE: u32 = 0x2112_A442; // Magic cookie for STUN
 pub const HEADER_SIZE: usize = 20;
 
 pub const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
@@ -50,7 +50,7 @@ impl StunMessage {
         let txn_id = TransactionId::random();
         let mut out = Vec::with_capacity(HEADER_SIZE);
         out.extend_from_slice(&0x0001u16.to_be_bytes()); // Binding Request
-        out.extend_from_slice(&0u16.to_be_bytes());     // Length = 0
+        out.extend_from_slice(&0u16.to_be_bytes()); // Length = 0
         out.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         out.extend_from_slice(&txn_id.0);
         (txn_id, out)
@@ -158,7 +158,11 @@ pub fn stun_query(socket: &UdpSocket, server_host: &str, stun_port: u16) -> Resu
         .collect();
 
     if addrs.is_empty() {
-        bail!("Could not resolve STUN server {}:{}", server_host, stun_port);
+        bail!(
+            "Could not resolve STUN server {}:{}",
+            server_host,
+            stun_port
+        );
     }
 
     let target = addrs[0];
@@ -224,6 +228,8 @@ struct ApiPollResp {
     peer_game_addr: Option<SocketAddr>,
     #[serde(default)]
     peer_local_ip: Option<Ipv4Addr>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 fn parse_http_response<R: for<'de> Deserialize<'de>>(resp: &[u8]) -> Result<R> {
@@ -235,7 +241,10 @@ fn parse_http_response<R: for<'de> Deserialize<'de>>(resp: &[u8]) -> Result<R> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let json_body = text.split("\r\n\r\n").nth(1).context("Malformed HTTP response")?;
+    let json_body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .context("Malformed HTTP response")?;
 
     match status_code {
         429 => bail!("Rate limit exceeded (10 req/s). Please slow down."),
@@ -244,8 +253,13 @@ fn parse_http_response<R: for<'de> Deserialize<'de>>(resp: &[u8]) -> Result<R> {
         _ => {}
     }
 
-    let res: R = serde_json::from_str(json_body)
-        .with_context(|| format!("Failed to parse response (HTTP {}): {}", status_code, json_body.trim()))?;
+    let res: R = serde_json::from_str(json_body).with_context(|| {
+        format!(
+            "Failed to parse response (HTTP {}): {}",
+            status_code,
+            json_body.trim()
+        )
+    })?;
     Ok(res)
 }
 
@@ -271,7 +285,10 @@ fn http_post_json<T: Serialize, R: for<'de> Deserialize<'de>>(
 
     let req = format!(
         "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, server_host, body.len(), body
+        path,
+        server_host,
+        body.len(),
+        body
     );
     stream.write_all(req.as_bytes())?;
 
@@ -331,7 +348,8 @@ pub fn register_with_server(
             bail!("Server is at maximum capacity");
         }
     }
-    resp.friend_code.context("Server did not return a friend code")
+    resp.friend_code
+        .context("Server did not return a friend code")
 }
 
 pub fn join_with_server(
@@ -355,30 +373,92 @@ pub fn join_with_server(
     {
         Ok((disco, game, resp.peer_local_ip))
     } else if resp.status == "already_connected" {
-        bail!("Friend code '{}' is already in a match (cannot join)", friend_code)
+        bail!(
+            "Friend code '{}' is already in a match (cannot join)",
+            friend_code
+        )
     } else {
         bail!("Friend code '{}' not found or expired", friend_code)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollPeerResult {
+    Waiting,
+    Paired(SocketAddr, SocketAddr, Option<Ipv4Addr>),
+    Disconnected(String),
 }
 
 pub fn poll_server_for_peer(
     server_host: &str,
     api_port: u16,
     friend_code: &str,
-) -> Result<Option<(SocketAddr, SocketAddr, Option<Ipv4Addr>)>> {
-    let path = format!("/api/poll/{}", friend_code);
-    let resp: ApiPollResp = http_get_json(server_host, api_port, &path)?;
+    role: Option<&str>,
+) -> Result<PollPeerResult> {
+    let path = if let Some(r) = role {
+        format!("/api/poll/{}?role={}", friend_code, r)
+    } else {
+        format!("/api/poll/{}", friend_code)
+    };
+    let resp: ApiPollResp = match http_get_json(server_host, api_port, &path) {
+        Ok(r) => r,
+        Err(e) => {
+            let err_msg = format!("{:#}", e);
+            if err_msg.contains("code_not_found")
+                || err_msg.contains("expired or not found")
+                || err_msg.contains("404")
+            {
+                return Ok(PollPeerResult::Disconnected(
+                    "Session ended or not found on server".to_string(),
+                ));
+            }
+            return Err(e);
+        }
+    };
     if resp.status == "paired"
         && let Some(disco) = resp.peer_disco_addr
         && let Some(game) = resp.peer_game_addr
     {
-        Ok(Some((disco, game, resp.peer_local_ip)))
+        Ok(PollPeerResult::Paired(disco, game, resp.peer_local_ip))
     } else if resp.status == "waiting" {
-        Ok(None)
+        Ok(PollPeerResult::Waiting)
+    } else if resp.status == "disconnected" {
+        Ok(PollPeerResult::Disconnected(resp.reason.unwrap_or_else(
+            || "Friend disconnected from session".to_string(),
+        )))
     } else {
-        bail!("Session '{}' expired or not found on server", friend_code)
+        Ok(PollPeerResult::Disconnected(format!(
+            "Session ended ({})",
+            resp.status
+        )))
     }
 }
+
+#[derive(Serialize)]
+struct ApiDisconnectReq<'a> {
+    friend_code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'a str>,
+}
+
+pub fn notify_server_disconnect(
+    server_host: &str,
+    api_port: u16,
+    friend_code: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    let req = ApiDisconnectReq {
+        friend_code,
+        reason,
+    };
+    let _ = http_post_json::<_, serde_json::Value>(server_host, api_port, "/api/disconnect", &req);
+    Ok(())
+}
+
+pub const SCCT_PUNCH_PAYLOAD: &[u8] = b"SCCT_PUNCH_V1";
+pub const SCCT_PING_PAYLOAD: &[u8] = b"SCCT_PING_V1";
+pub const SCCT_PONG_PAYLOAD: &[u8] = b"SCCT_PONG_V1";
+pub const SCCT_DISCONNECT_PAYLOAD: &[u8] = b"SCCT_DISCONNECT_V1";
 
 pub fn punch_udp_holes(
     sock_disco: &UdpSocket,
@@ -386,12 +466,67 @@ pub fn punch_udp_holes(
     peer_disco: SocketAddr,
     peer_game: SocketAddr,
 ) {
-    let punch_payload = b"SCCT_PUNCH_V1";
-    for _ in 0..5 {
-        let _ = sock_disco.send_to(punch_payload, peer_disco);
-        let _ = sock_game.send_to(punch_payload, peer_game);
+    for _ in 0..10 {
+        let _ = sock_disco.send_to(SCCT_PUNCH_PAYLOAD, peer_disco);
+        let _ = sock_game.send_to(SCCT_PUNCH_PAYLOAD, peer_game);
+        let _ = sock_disco.send_to(SCCT_PING_PAYLOAD, peer_disco);
+        let _ = sock_game.send_to(SCCT_PING_PAYLOAD, peer_game);
         std::thread::sleep(Duration::from_millis(80));
     }
+}
+
+pub fn send_udp_disconnect(
+    sock_disco: &UdpSocket,
+    sock_game: &UdpSocket,
+    peer_disco: SocketAddr,
+    peer_game: SocketAddr,
+) {
+    for _ in 0..5 {
+        let _ = sock_disco.send_to(SCCT_DISCONNECT_PAYLOAD, peer_disco);
+        let _ = sock_game.send_to(SCCT_DISCONNECT_PAYLOAD, peer_game);
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+/// Resolves whether to connect to peer via local LAN or public Internet.
+/// Returns `(peer_ip, peer_disco_port, peer_game_port, is_lan)`.
+pub fn resolve_peer_endpoint(
+    disco_ext: SocketAddr,
+    my_local_ip: Option<Ipv4Addr>,
+    peer_disco: SocketAddr,
+    peer_game: SocketAddr,
+    peer_local_ip: Option<Ipv4Addr>,
+) -> (Ipv4Addr, u16, u16, bool) {
+    let is_same_public_ip = peer_disco.ip() == disco_ext.ip();
+    if is_same_public_ip {
+        let mut resolved_lan = None;
+        if let Some(target_local) = peer_local_ip {
+            if let Some(my_lan) = my_local_ip
+                && crate::ip::is_same_subnet(my_lan, target_local)
+            {
+                resolved_lan = Some(target_local);
+            }
+            if resolved_lan.is_none() && crate::ip::find_matching_subnet_ip(target_local).is_some()
+            {
+                resolved_lan = Some(target_local);
+            }
+        }
+
+        if let Some(lan_ip) = resolved_lan.or(peer_local_ip) {
+            return (
+                lan_ip,
+                crate::net::DISCOVERY_PORT,
+                crate::net::GAME_PORT,
+                true,
+            );
+        }
+    }
+
+    let ip = match peer_disco.ip() {
+        IpAddr::V4(v4) => v4,
+        _ => Ipv4Addr::new(127, 0, 0, 1),
+    };
+    (ip, peer_disco.port(), peer_game.port(), false)
 }
 
 #[cfg(test)]
@@ -411,7 +546,7 @@ mod tests {
 
         let mut resp = Vec::new();
         resp.extend_from_slice(&0x0101u16.to_be_bytes()); // Binding Response
-        resp.extend_from_slice(&12u16.to_be_bytes());     // Length = 12
+        resp.extend_from_slice(&12u16.to_be_bytes()); // Length = 12
         resp.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
         resp.extend_from_slice(&txn.0);
 
@@ -433,5 +568,69 @@ mod tests {
 
         let parsed = StunMessage::parse_binding_response(&resp, &txn).unwrap();
         assert_eq!(parsed, target);
+    }
+
+    #[test]
+    fn test_udp_disconnect_payload_format() {
+        assert_eq!(SCCT_DISCONNECT_PAYLOAD, b"SCCT_DISCONNECT_V1");
+        assert_eq!(SCCT_PING_PAYLOAD, b"SCCT_PING_V1");
+        assert_eq!(SCCT_PONG_PAYLOAD, b"SCCT_PONG_V1");
+        assert_eq!(SCCT_PUNCH_PAYLOAD, b"SCCT_PUNCH_V1");
+    }
+
+    #[test]
+    fn test_send_and_receive_udp_disconnect() {
+        let disco_rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let game_rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let disco_addr = disco_rx.local_addr().unwrap();
+        let game_addr = game_rx.local_addr().unwrap();
+
+        let disco_tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let game_tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        send_udp_disconnect(&disco_tx, &game_tx, disco_addr, game_addr);
+
+        let mut buf = [0u8; 64];
+        let (len, _) = disco_rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], SCCT_DISCONNECT_PAYLOAD);
+
+        let (len, _) = game_rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..len], SCCT_DISCONNECT_PAYLOAD);
+    }
+
+    #[test]
+    fn test_resolve_peer_endpoint_wan_and_lan() {
+        let my_wan: SocketAddr = "1.2.3.4:10000".parse().unwrap();
+        let peer_wan_disco: SocketAddr = "5.6.7.8:20000".parse().unwrap();
+        let peer_wan_game: SocketAddr = "5.6.7.8:20001".parse().unwrap();
+
+        // 1. WAN connection across different public IPs
+        let (ip, dport, gport, is_lan) = resolve_peer_endpoint(
+            my_wan,
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            peer_wan_disco,
+            peer_wan_game,
+            Some(Ipv4Addr::new(192, 168, 1, 20)),
+        );
+        assert_eq!(ip, Ipv4Addr::new(5, 6, 7, 8));
+        assert_eq!(dport, 20000);
+        assert_eq!(gport, 20001);
+        assert!(!is_lan);
+
+        // 2. LAN connection behind same public router
+        let peer_same_router_disco: SocketAddr = "1.2.3.4:20000".parse().unwrap();
+        let peer_same_router_game: SocketAddr = "1.2.3.4:20001".parse().unwrap();
+        let (ip, dport, gport, is_lan) = resolve_peer_endpoint(
+            my_wan,
+            Some(Ipv4Addr::new(192, 168, 1, 10)),
+            peer_same_router_disco,
+            peer_same_router_game,
+            Some(Ipv4Addr::new(192, 168, 1, 20)),
+        );
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 20));
+        assert_eq!(dport, crate::net::DISCOVERY_PORT);
+        assert_eq!(gport, crate::net::GAME_PORT);
+        assert!(is_lan);
+
     }
 }

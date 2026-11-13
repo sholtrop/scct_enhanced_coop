@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -46,6 +46,10 @@ pub struct Session {
     pub host_endpoints: ClientEndpoints,
     pub guest_endpoints: Option<ClientEndpoints>,
     pub last_seen: Instant,
+    pub host_last_seen: Instant,
+    pub guest_last_seen: Option<Instant>,
+    pub disconnected: bool,
+    pub disconnect_reason: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +70,7 @@ pub enum JoinResult {
 pub enum PollResult {
     Paired(ClientEndpoints),
     Waiting,
+    Disconnected(Option<String>),
     NotFound,
 }
 
@@ -103,9 +108,9 @@ impl FriendCodeRegistry {
             candidate
         };
 
-        // If code already exists, ensure it is not already connected
+        // If code already exists, ensure it is not already connected (unless disconnected)
         if let Some(existing) = self.sessions.get(&final_code) {
-            if existing.guest_endpoints.is_some() {
+            if existing.guest_endpoints.is_some() && !existing.disconnected {
                 return RegisterResult::AlreadyConnected;
             }
         } else if self.sessions.len() >= self.max_sessions {
@@ -117,6 +122,10 @@ impl FriendCodeRegistry {
             host_endpoints,
             guest_endpoints: None,
             last_seen: now,
+            host_last_seen: now,
+            guest_last_seen: None,
+            disconnected: false,
+            disconnect_reason: None,
         };
 
         self.sessions.insert(final_code.clone(), session);
@@ -128,11 +137,15 @@ impl FriendCodeRegistry {
     pub fn join(&self, friend_code: &str, guest_endpoints: ClientEndpoints) -> JoinResult {
         let code = normalize_friend_code(friend_code);
         if let Some(mut session) = self.sessions.get_mut(&code) {
-            if session.guest_endpoints.is_some() {
+            if session.disconnected {
+                JoinResult::NotFound
+            } else if session.guest_endpoints.is_some() {
                 JoinResult::AlreadyConnected
             } else {
+                let now = Instant::now();
                 session.guest_endpoints = Some(guest_endpoints);
-                session.last_seen = Instant::now();
+                session.last_seen = now;
+                session.guest_last_seen = Some(now);
                 JoinResult::Success(session.host_endpoints.clone())
             }
         } else {
@@ -140,11 +153,45 @@ impl FriendCodeRegistry {
         }
     }
 
-    /// Host polls for guest arrival.
-    pub fn poll(&self, friend_code: &str) -> PollResult {
+    /// Host or Guest polls for session status, peer arrival, and peer liveness.
+    pub fn poll(&self, friend_code: &str, role: Option<&str>) -> PollResult {
         let code = normalize_friend_code(friend_code);
         if let Some(mut session) = self.sessions.get_mut(&code) {
-            session.last_seen = Instant::now();
+            let now = Instant::now();
+            session.last_seen = now;
+
+            if session.disconnected {
+                return PollResult::Disconnected(session.disconnect_reason.clone());
+            }
+
+            match role {
+                Some("host") => {
+                    session.host_last_seen = now;
+                    // If guest was paired, verify guest heartbeat liveness (12s timeout)
+                    if session.guest_endpoints.is_some() {
+                        if let Some(gls) = session.guest_last_seen {
+                            if now.duration_since(gls) > Duration::from_secs(12) {
+                                session.disconnected = true;
+                                session.disconnect_reason =
+                                    Some("Friend timed out (no response)".to_string());
+                                return PollResult::Disconnected(session.disconnect_reason.clone());
+                            }
+                        }
+                    }
+                }
+                Some("guest") => {
+                    session.guest_last_seen = Some(now);
+                    // Verify host heartbeat liveness (12s timeout)
+                    if now.duration_since(session.host_last_seen) > Duration::from_secs(12) {
+                        session.disconnected = true;
+                        session.disconnect_reason =
+                            Some("Friend timed out (no response)".to_string());
+                        return PollResult::Disconnected(session.disconnect_reason.clone());
+                    }
+                }
+                _ => {}
+            }
+
             if let Some(guest) = &session.guest_endpoints {
                 PollResult::Paired(guest.clone())
             } else {
@@ -155,12 +202,29 @@ impl FriendCodeRegistry {
         }
     }
 
+    /// Mark a session disconnected.
+    pub fn disconnect(&self, friend_code: &str, reason: Option<String>) -> bool {
+        let code = normalize_friend_code(friend_code);
+        if let Some(mut session) = self.sessions.get_mut(&code) {
+            session.disconnected = true;
+            session.disconnect_reason = reason.or_else(|| Some("User disconnected".to_string()));
+            session.last_seen = Instant::now();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Clean up expired sessions based on last_seen time.
     pub fn cleanup_expired(&self, ttl: Duration) -> usize {
         let now = Instant::now();
         let before = self.sessions.len();
         self.sessions.retain(|code, s| {
-            let keep = now.duration_since(s.last_seen) < ttl;
+            let keep = if s.disconnected {
+                now.duration_since(s.last_seen) < Duration::from_secs(60)
+            } else {
+                now.duration_since(s.last_seen) < ttl
+            };
             if !keep {
                 log::debug!("Friend code '{}' expired and removed", code);
             }
@@ -219,14 +283,17 @@ mod tests {
         assert_eq!(res, RegisterResult::Success("K7X9B".to_string()));
 
         // Before guest joins, poll returns Waiting
-        assert_eq!(registry.poll("K7X9B"), PollResult::Waiting);
+        assert_eq!(registry.poll("K7X9B", None), PollResult::Waiting);
 
         // Guest joins with code
         let join_res = registry.join("K7X9B", guest_ep.clone());
         assert_eq!(join_res, JoinResult::Success(host_ep.clone()));
 
         // After guest joins, host poll returns guest endpoints
-        assert_eq!(registry.poll("K7X9B"), PollResult::Paired(guest_ep.clone()));
+        assert_eq!(
+            registry.poll("K7X9B", Some("host")),
+            PollResult::Paired(guest_ep.clone())
+        );
 
         // Second guest attempting to join fails with AlreadyConnected
         let second_guest = registry.join("K7X9B", guest_ep.clone());
@@ -235,6 +302,17 @@ mod tests {
         // Re-registering connected code fails with AlreadyConnected
         let re_reg = registry.register("K7X9B".to_string(), host_ep.clone());
         assert_eq!(re_reg, RegisterResult::AlreadyConnected);
+
+        // Disconnect session
+        assert!(registry.disconnect("K7X9B", Some("Host quit".to_string())));
+        assert_eq!(
+            registry.poll("K7X9B", Some("guest")),
+            PollResult::Disconnected(Some("Host quit".to_string()))
+        );
+
+        // Once disconnected, host can re-register the code
+        let re_reg_ok = registry.register("K7X9B".to_string(), host_ep.clone());
+        assert_eq!(re_reg_ok, RegisterResult::Success("K7X9B".to_string()));
     }
 
     #[test]
@@ -258,5 +336,32 @@ mod tests {
             registry.register("CCCCC".to_string(), ep.clone()),
             RegisterResult::CapacityExceeded
         );
+    }
+
+    #[test]
+    fn test_peer_timeout() {
+        let registry = FriendCodeRegistry::new(10);
+        let host_ep = ClientEndpoints {
+            disco_addr: "1.2.3.4:9100".parse().unwrap(),
+            game_addr: "1.2.3.4:9103".parse().unwrap(),
+            local_ip: None,
+        };
+        let guest_ep = ClientEndpoints {
+            disco_addr: "5.6.7.8:9100".parse().unwrap(),
+            game_addr: "5.6.7.8:9103".parse().unwrap(),
+            local_ip: None,
+        };
+
+        registry.register("TEST1".to_string(), host_ep);
+        registry.join("TEST1", guest_ep);
+
+        // Artificially age the host_last_seen
+        if let Some(mut session) = registry.sessions.get_mut("TEST1") {
+            session.host_last_seen = Instant::now() - Duration::from_secs(15);
+        }
+
+        // Guest polls and detects host timed out
+        let poll_res = registry.poll("TEST1", Some("guest"));
+        assert!(matches!(poll_res, PollResult::Disconnected(_)));
     }
 }

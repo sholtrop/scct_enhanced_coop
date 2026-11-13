@@ -1,8 +1,7 @@
 #[cfg(windows)]
-use anyhow::bail;
+use anyhow::{Result, bail};
 #[cfg(not(windows))]
-use anyhow::Context;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -20,7 +19,7 @@ impl GameProcess {
         {
             if self.handle_val != 0 {
                 unsafe {
-                    use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+                    use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
                     WaitForSingleObject(
                         self.handle_val as windows_sys::Win32::Foundation::HANDLE,
                         INFINITE,
@@ -76,6 +75,8 @@ pub const CAVE_ONLINE_PORT_VA: usize = crate::net::CAVE_ONLINE_PORT_VA as usize;
 pub const JOIN_GAME_PORT_VA: usize = crate::net::JOIN_GAME_PORT_VA as usize;
 #[cfg(windows)]
 pub const CAVE_LAN_PEER_VA: usize = 0x113303A0;
+#[cfg(windows)]
+pub const CAVE_LOCAL_BIND_IP_VA: usize = crate::net::G_LOCAL_BIND_IP_VA as usize;
 
 #[cfg(windows)]
 unsafe fn write_proc_bytes(
@@ -85,7 +86,7 @@ unsafe fn write_proc_bytes(
     in_text: bool,
 ) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Memory::{VirtualProtectEx, PAGE_EXECUTE_READWRITE};
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtectEx};
 
     unsafe {
         let mut old_prot: u32 = 0;
@@ -112,7 +113,13 @@ unsafe fn write_proc_bytes(
 
         if prot_changed {
             let mut dummy: u32 = 0;
-            VirtualProtectEx(h_process, addr as *const _, bytes.len(), old_prot, &mut dummy);
+            VirtualProtectEx(
+                h_process,
+                addr as *const _,
+                bytes.len(),
+                old_prot,
+                &mut dummy,
+            );
         }
     }
 }
@@ -124,12 +131,13 @@ pub fn launch_game(
     peer_ip: Option<Ipv4Addr>,
     peer_disco_port: u16,
     peer_game_port: u16,
+    local_bind_ip: Option<Ipv4Addr>,
 ) -> Result<GameProcess> {
     use std::ffi::CString;
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
     use windows_sys::Win32::System::Threading::{
-        CreateProcessA, ResumeThread, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOA,
+        CREATE_SUSPENDED, CreateProcessA, PROCESS_INFORMATION, ResumeThread, STARTUPINFOA,
     };
 
     let exe_str = CString::new(exe_path.to_string_lossy().as_bytes())?;
@@ -207,7 +215,11 @@ pub fn launch_game(
                 || (oct[0] == 172 && (16..=31).contains(&oct[1]))
                 || (oct[0] == 192 && oct[1] == 168);
             let is_local_routable = !is_private || crate::ip::find_matching_subnet_ip(ip).is_some();
-            let probe_ip = if is_local_routable { ip_bytes } else { [0u8; 4] };
+            let probe_ip = if is_local_routable {
+                ip_bytes
+            } else {
+                [0u8; 4]
+            };
 
             write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
         } else {
@@ -221,6 +233,12 @@ pub fn launch_game(
             write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
             write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
         }
+
+        let bind_octets = local_bind_ip
+            .filter(|ip| !ip.is_unspecified())
+            .map(|ip| ip.octets())
+            .unwrap_or([0u8; 4]);
+        write_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &bind_octets, false);
 
         // 3. Resume the game thread
         ResumeThread(h_thread);
@@ -240,6 +258,7 @@ pub fn launch_game(
     _peer_ip: Option<Ipv4Addr>,
     _peer_disco_port: u16,
     _peer_game_port: u16,
+    _local_bind_ip: Option<Ipv4Addr>,
 ) -> Result<GameProcess> {
     let child = std::process::Command::new(exe_path)
         .current_dir(game_dir)

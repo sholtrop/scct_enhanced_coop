@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -441,10 +441,11 @@ pub struct MapPatchSummary {
 pub fn patch_sp_map_to_coop(
     input_path: &Path,
     output_path: &Path,
+    p1_offset: (f32, f32, f32),
     spawn_offset: (f32, f32, f32),
 ) -> Result<MapPatchSummary> {
-    let orig_data = fs::read(input_path)
-        .with_context(|| format!("Reading map {}", input_path.display()))?;
+    let orig_data =
+        fs::read(input_path).with_context(|| format!("Reading map {}", input_path.display()))?;
 
     let upk = parse_upk_tables(&orig_data)?;
     let mut names = upk.names.clone();
@@ -457,7 +458,9 @@ pub fn patch_sp_map_to_coop(
         .map(|(i, (n, _))| (n.clone(), i))
         .collect();
 
-    let none_idx = *name_to_idx.get("None").context("Missing 'None' in Name Table")?;
+    let none_idx = *name_to_idx
+        .get("None")
+        .context("Missing 'None' in Name Table")?;
     let none_ci = write_compact_index(none_idx as i32);
 
     fn ensure_name(
@@ -475,14 +478,25 @@ pub fn patch_sp_map_to_coop(
         idx as i32
     }
 
-    let idx_b_multiplayer_map = ensure_name(&mut names, &mut name_to_idx, "bMultiplayerMap", 0x00070010);
-    let idx_use_default_sound_map = ensure_name(&mut names, &mut name_to_idx, "UseDefaultSoundMap", 0x00070010);
+    let idx_b_multiplayer_map =
+        ensure_name(&mut names, &mut name_to_idx, "bMultiplayerMap", 0x00070010);
+    let idx_use_default_sound_map = ensure_name(
+        &mut names,
+        &mut name_to_idx,
+        "UseDefaultSoundMap",
+        0x00070010,
+    );
     let idx_sam_mesh = ensure_name(&mut names, &mut name_to_idx, "SamMesh", 0x00070010);
     let idx_start_mesh = ensure_name(&mut names, &mut name_to_idx, "StartMesh", 0x00070010);
     let idx_coop_player = ensure_name(&mut names, &mut name_to_idx, "COOP_Player", 0x00070010);
     let idx_coop_anims = ensure_name(&mut names, &mut name_to_idx, "CoopAnims", 0x00070010);
     let idx_spot_id = ensure_name(&mut names, &mut name_to_idx, "spotID", 0x00070010);
-    let idx_next_navigation_point = ensure_name(&mut names, &mut name_to_idx, "nextNavigationPoint", 0x00070010);
+    let idx_next_navigation_point = ensure_name(
+        &mut names,
+        &mut name_to_idx,
+        "nextNavigationPoint",
+        0x00070010,
+    );
 
     let existing_export_names: HashSet<String> = exports
         .iter()
@@ -497,10 +511,18 @@ pub fn patch_sp_map_to_coop(
     }
     let idx_p2_obj_name = ensure_name(&mut names, &mut name_to_idx, &p2_obj_name, 0x00070010);
 
-    let idx_core = *name_to_idx.get("Core").context("Missing 'Core' in Name Table")? as i32;
-    let idx_engine = *name_to_idx.get("Engine").context("Missing 'Engine' in Name Table")? as i32;
-    let idx_package = *name_to_idx.get("Package").context("Missing 'Package' in Name Table")? as i32;
-    let idx_skeletal_mesh = *name_to_idx.get("SkeletalMesh").context("Missing 'SkeletalMesh' in Name Table")? as i32;
+    let idx_core = *name_to_idx
+        .get("Core")
+        .context("Missing 'Core' in Name Table")? as i32;
+    let idx_engine = *name_to_idx
+        .get("Engine")
+        .context("Missing 'Engine' in Name Table")? as i32;
+    let idx_package = *name_to_idx
+        .get("Package")
+        .context("Missing 'Package' in Name Table")? as i32;
+    let idx_skeletal_mesh = *name_to_idx
+        .get("SkeletalMesh")
+        .context("Missing 'SkeletalMesh' in Name Table")? as i32;
 
     imports.push(ImportEntry {
         class_pkg: idx_core,
@@ -544,19 +566,34 @@ pub fn patch_sp_map_to_coop(
     let li_start = exports[li_idx].serial_offset as usize;
     let li_end = li_start + (exports[li_idx].serial_size as usize);
     if &orig_data[li_end - none_ci.len()..li_end] != none_ci.as_slice() {
-        bail!("{}: LevelInfo0 does not end with expected None CompactIndex", input_path.display());
+        bail!(
+            "{}: LevelInfo0 does not end with expected None CompactIndex",
+            input_path.display()
+        );
     }
     let li_prop_start = parse_state_frame_end(&orig_data, li_start)?;
-    let (li_head_props, li_first_none, _) = parse_tagged_properties_raw(&names, &orig_data, li_prop_start, li_end)?;
+    let (li_head_props, li_first_none, _) =
+        parse_tagged_properties_raw(&names, &orig_data, li_prop_start, li_end)?;
     let mut filtered_li_head = Vec::new();
+    let mut has_use_default_sound_map = false;
     for p in &li_head_props {
-        if p.name != "SamMesh" && p.name != "bMultiplayerMap" && p.name != "UseDefaultSoundMap" {
+        if p.name == "UseDefaultSoundMap" {
+            has_use_default_sound_map = true;
+        }
+        if p.name != "SamMesh" && p.name != "bMultiplayerMap" {
             filtered_li_head.extend_from_slice(&p.raw_full);
         }
     }
     let mut li_coop_props = serialize_bool_property(idx_b_multiplayer_map, true);
-    li_coop_props.extend_from_slice(&serialize_bool_property(idx_use_default_sound_map, false));
-    li_coop_props.extend_from_slice(&serialize_object_property(idx_sam_mesh, coop_player_mesh_ref));
+    if !has_use_default_sound_map {
+        // Penthouse (and any map missing it) needs UseDefaultSoundMap = False so
+        // SoundMapName is not overwritten to <Map>_COOP, which DareAudio cannot find in MAPS.SM0.
+        li_coop_props.extend_from_slice(&serialize_bool_property(idx_use_default_sound_map, false));
+    }
+    li_coop_props.extend_from_slice(&serialize_object_property(
+        idx_sam_mesh,
+        coop_player_mesh_ref,
+    ));
 
     let mut patched_levelinfo_bytes = Vec::new();
     patched_levelinfo_bytes.extend_from_slice(&orig_data[li_start..li_prop_start]);
@@ -572,17 +609,34 @@ pub fn patch_sp_map_to_coop(
     let (ps1_props, _ps1_none_off, ps1_after_none) =
         parse_tagged_properties_raw(&names, &orig_data, ps1_prop_start, ps1_end)?;
     if ps1_after_none != ps1_end {
-        bail!("{}: EchelonPlayerStart has unexpected trailing bytes", input_path.display());
+        bail!(
+            "{}: EchelonPlayerStart has unexpected trailing bytes",
+            input_path.display()
+        );
     }
 
     let mut ps1_kept = Vec::new();
     for p in &ps1_props {
         if p.name != "StartMesh" && p.name != "nextNavigationPoint" && p.name != "spotID" {
-            ps1_kept.extend_from_slice(&p.raw_full);
+            if p.name == "Location" && p.raw_val.len() == 12 && p1_offset != (0.0, 0.0, 0.0) {
+                let x = f32::from_le_bytes(p.raw_val[0..4].try_into()?);
+                let y = f32::from_le_bytes(p.raw_val[4..8].try_into()?);
+                let z = f32::from_le_bytes(p.raw_val[8..12].try_into()?);
+                let target_p1 = (x + p1_offset.0, y + p1_offset.1, z + p1_offset.2);
+                ps1_kept.extend_from_slice(&p.raw_header);
+                ps1_kept.extend_from_slice(&target_p1.0.to_le_bytes());
+                ps1_kept.extend_from_slice(&target_p1.1.to_le_bytes());
+                ps1_kept.extend_from_slice(&target_p1.2.to_le_bytes());
+            } else {
+                ps1_kept.extend_from_slice(&p.raw_full);
+            }
         }
     }
     let mut ps1_extra = serialize_object_property(idx_next_navigation_point, new_pstart2_exp_idx);
-    ps1_extra.extend_from_slice(&serialize_object_property(idx_start_mesh, coop_player_mesh_ref));
+    ps1_extra.extend_from_slice(&serialize_object_property(
+        idx_start_mesh,
+        coop_player_mesh_ref,
+    ));
 
     let mut patched_ps1_bytes = Vec::new();
     patched_ps1_bytes.extend_from_slice(ps1_state_frame);
@@ -592,7 +646,10 @@ pub fn patch_sp_map_to_coop(
 
     // 3. Build Player 2's EchelonPlayerStartCoop
     let mut ps2_chunks = serialize_int_property(idx_spot_id, 2);
-    ps2_chunks.extend_from_slice(&serialize_object_property(idx_start_mesh, coop_player_mesh_ref));
+    ps2_chunks.extend_from_slice(&serialize_object_property(
+        idx_start_mesh,
+        coop_player_mesh_ref,
+    ));
 
     let p2_strip_set: HashSet<&str> = P2_STRIP_PROPS.iter().copied().collect();
     let mut p1_loc: Option<(f32, f32, f32)> = None;
@@ -606,7 +663,12 @@ pub fn patch_sp_map_to_coop(
             let x = f32::from_le_bytes(p.raw_val[0..4].try_into()?);
             let y = f32::from_le_bytes(p.raw_val[4..8].try_into()?);
             let z = f32::from_le_bytes(p.raw_val[8..12].try_into()?);
-            p1_loc = Some((x, y, z));
+            let final_p1 = if p1_offset != (0.0, 0.0, 0.0) {
+                (x + p1_offset.0, y + p1_offset.1, z + p1_offset.2)
+            } else {
+                (x, y, z)
+            };
+            p1_loc = Some(final_p1);
             let target_p2 = (x + spawn_offset.0, y + spawn_offset.1, z + spawn_offset.2);
             p2_loc = Some(target_p2);
 
@@ -632,13 +694,21 @@ pub fn patch_sp_map_to_coop(
     let ml_raw = &orig_data[ml_start..ml_end];
 
     if ml_raw.len() < none_ci.len() || &ml_raw[..none_ci.len()] != none_ci.as_slice() {
-        bail!("{}: MyLevel does not begin with None CompactIndex", input_path.display());
+        bail!(
+            "{}: MyLevel does not begin with None CompactIndex",
+            input_path.display()
+        );
     }
     let arr_hdr_off = none_ci.len();
     let db_num = i32::from_le_bytes(ml_raw[arr_hdr_off..arr_hdr_off + 4].try_into()?);
     let db_max = i32::from_le_bytes(ml_raw[arr_hdr_off + 4..arr_hdr_off + 8].try_into()?);
     if db_num != db_max {
-        bail!("{}: MyLevel db_num={} != db_max={}", input_path.display(), db_num, db_max);
+        bail!(
+            "{}: MyLevel db_num={} != db_max={}",
+            input_path.display(),
+            db_num,
+            db_max
+        );
     }
 
     let mut off = arr_hdr_off + 8;
@@ -651,7 +721,8 @@ pub fn patch_sp_map_to_coop(
             insert_pos_in_ml = Some(off);
         }
     }
-    let insert_pos_in_ml = insert_pos_in_ml.context("P1 PlayerStart not found in MyLevel.Actors")?;
+    let insert_pos_in_ml =
+        insert_pos_in_ml.context("P1 PlayerStart not found in MyLevel.Actors")?;
 
     let mut patched_mylevel_bytes = Vec::new();
     patched_mylevel_bytes.extend_from_slice(&none_ci);
@@ -722,7 +793,11 @@ pub fn patch_sp_map_to_coop(
 
     let havok_stream = &orig_data[upk.exports_end..];
     if havok_stream.len() < 4 || &havok_stream[..4] != HAVOK_MAGIC {
-        bail!("{}: Unexpected Havok header {:?}", input_path.display(), &havok_stream[..4]);
+        bail!(
+            "{}: Unexpected Havok header {:?}",
+            input_path.display(),
+            &havok_stream[..4]
+        );
     }
     out_stream.extend_from_slice(havok_stream);
 
@@ -754,5 +829,3 @@ pub fn patch_sp_map_to_coop(
         havok_offset: new_exports_end,
     })
 }
-
-
