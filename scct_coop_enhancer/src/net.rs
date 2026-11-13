@@ -178,10 +178,10 @@ pub const HOOK_SITE_QUAZAL_POLL: u32 = 0x10DE53B0;
 pub const HOOK_SITE_QUAZAL_WSASENDTO: u32 = 0x10DE65CA;
 pub const HOOK_SITE_BROWSE_REPLY_URL: u32 = 0x10DC36CE;
 /// `SimStation::CheckSimulationChecksum` (`0x10DF8750`): called by `SyncEngine::Step` (`0x10DF414A`).
-/// Returns `al = 1` (`mov al, 1; ret`) so asynchronous level-load `UserChecksum0` accumulation
-/// folded into `[SimStation + 0xB0C]` does not trigger a false-positive `[SyncEngine + 0x68] = 6`
-/// (`eax = 3` -> popup `0x1C` -> `LeaveSession(1)`) disconnect on Step 3.
+/// Verifies simulation lockstep synchronization between Host and Guest.
 pub const HOOK_SITE_CHECK_SIM_CHECKSUM: u32 = 0x10DF8750;
+pub const SIM_CHECKSUM_ORIG: &[u8] = &[0x6A, 0x05, 0xE8, 0xC9, 0xFE, 0xFF, 0xFF, 0xC3];
+pub const SIM_CHECKSUM_PATCHED: &[u8] = &[0xB0, 0x01, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90];
 
 pub fn decode_hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -380,12 +380,6 @@ pub fn get_net_sites() -> Vec<PatchSite> {
             new: make_call(HOOK_SITE_BROWSE_REPLY_URL, HOOK_BROWSE_REPLY_URL, 5),
             desc: "Quazal HandleBrowseReply: rewrite SessionDescriptor StationURL IP/port",
         },
-        PatchSite {
-            va: HOOK_SITE_CHECK_SIM_CHECKSUM,
-            orig: decode_hex("6a05e8c9feffffc3"),
-            new: decode_hex("b001c39090909090"),
-            desc: "SimStation::CheckSimulationChecksum: bypass false-positive step 3 desync abort",
-        },
     ]
 }
 
@@ -478,6 +472,14 @@ pub fn is_lan_and_zerotier_fix_applied(pe_bytes: &[u8]) -> bool {
         {
             return false;
         }
+    }
+
+    let sim_chk_off = match va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) {
+        Ok(off) => off,
+        Err(_) => return false,
+    };
+    if pe_bytes.len() >= sim_chk_off + 8 && &pe_bytes[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED {
+        return false;
     }
     let text_entry = match secs.get(b".text".as_slice()) {
         Some(&off) => off,
@@ -719,6 +721,11 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     buf[text_off + 8..text_off + 12].copy_from_slice(&new_text_vs.to_le_bytes());
     buf[data_off + 8..data_off + 12].copy_from_slice(&new_data_vs.to_le_bytes());
 
+    let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
+    if buf.len() >= sim_chk_off + 8 && &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED {
+        buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
+    }
+
     if !is_lan_and_zerotier_fix_applied(&buf) {
         bail!("Self-verification of patched executable failed");
     }
@@ -824,6 +831,14 @@ pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
         {
             return false;
         }
+    }
+
+    let sim_chk_off = match va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) {
+        Ok(off) => off,
+        Err(_) => return false,
+    };
+    if pe_bytes.len() >= sim_chk_off + 8 && &pe_bytes[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED {
+        return false;
     }
     true
 }
@@ -941,6 +956,11 @@ pub fn apply_online_coop_fix_with_ports(
     for site in &sites {
         let so = va_to_text_off(site.va)?;
         buf[so..so + site.new.len()].copy_from_slice(&site.new);
+    }
+
+    let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
+    if buf.len() >= sim_chk_off + 8 && &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED {
+        buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
     }
 
     if !is_online_coop_fix_applied(&buf) {
@@ -1345,11 +1365,11 @@ mod tests {
         let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM).unwrap();
         assert_eq!(
             &vanilla[sim_chk_off..sim_chk_off + 8],
-            decode_hex("6a05e8c9feffffc3").as_slice()
+            SIM_CHECKSUM_ORIG
         );
         assert_eq!(
             &patched[sim_chk_off..sim_chk_off + 8],
-            decode_hex("b001c39090909090").as_slice()
+            SIM_CHECKSUM_ORIG
         );
 
         // Idempotent when re-applied
