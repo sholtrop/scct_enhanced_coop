@@ -260,7 +260,7 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
     println!("    Waiting for game to exit...");
     println!("  ================================================================\n");
 
-    proc.wait_for_exit();
+    proc.wait_for_exit_monitoring_desync(opts.game_root);
     drop(quicksave_guard);
     guard.finish();
 
@@ -378,7 +378,7 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
     println!("    Waiting for game to exit...");
     println!("  ================================================================\n");
 
-    proc.wait_for_exit();
+    proc.wait_for_exit_monitoring_desync(opts.game_root);
     drop(quicksave_guard);
     guard.finish();
 
@@ -436,7 +436,7 @@ pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
     println!("    Waiting for game to exit...");
     println!("  ================================================================\n");
 
-    proc.wait_for_exit();
+    proc.wait_for_exit_monitoring_desync(opts.game_root);
     drop(quicksave_guard);
 
     println!("  [EXIT] Game exited. Co-op LAN session closed cleanly.");

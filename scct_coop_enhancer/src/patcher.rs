@@ -768,15 +768,6 @@ pub fn patch_exe_fixes(exe_path: &Path, exe_bak_path: &Path) -> Result<()> {
         modified = true;
     }
 
-    let sim_chk_off = 0x4F8750; // VA 0x10DF8750 (SimStation::CheckSimulationChecksum)
-    let sim_chk_orig = [0x6A, 0x05, 0xE8, 0xC9, 0xFE, 0xFF, 0xFF, 0xC3];
-    let sim_chk_patched = [0xB0, 0x01, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90];
-    if data.len() >= sim_chk_off + 8 && &data[sim_chk_off..sim_chk_off + 8] == &sim_chk_patched {
-        data[sim_chk_off..sim_chk_off + 8].copy_from_slice(&sim_chk_orig);
-        scct_log!("  [EXE] Restored simulation checksum desync disconnect check @ 0x10DF8750");
-        modified = true;
-    }
-
     if modified {
         if let Ok(mut perms) = std::fs::metadata(exe_path).map(|m| m.permissions()) {
             if perms.readonly() {

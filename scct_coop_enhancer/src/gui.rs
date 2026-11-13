@@ -273,6 +273,8 @@ pub enum GuiEvent {
     MatchFailed(String),
     PeerDisconnected(String),
     GameExited(u32),
+    DesyncDetected(PathBuf),
+    DesyncDumpFailed(String),
 }
 
 pub struct PatcherApp {
@@ -652,8 +654,27 @@ impl PatcherApp {
                 }
                 let tx = self.sender.clone();
                 let ctx_clone = ctx.clone();
+                let root_clone = root.clone();
                 thread::spawn(move || {
-                    proc.wait_for_exit();
+                    let mut desync_dumped = false;
+                    let mut game_proc = proc;
+                    while game_proc.is_alive() {
+                        if !desync_dumped && game_proc.is_desync_flagged() {
+                            desync_dumped = true;
+                            match game_proc.dump_desync_state(&root_clone) {
+                                Ok(dump_path) => {
+                                    let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
+                                    ctx_clone.request_repaint();
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
+                                    ctx_clone.request_repaint();
+                                }
+                            }
+                        }
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    game_proc.wait_for_exit();
                     let _ = tx.send(GuiEvent::GameExited(pid));
                     ctx_clone.request_repaint();
                 });
@@ -732,8 +753,27 @@ impl PatcherApp {
                 self.running_game_pid = Some(pid);
                 let tx = self.sender.clone();
                 let ctx_clone = ctx.clone();
+                let root_clone = root.clone();
                 thread::spawn(move || {
-                    proc.wait_for_exit();
+                    let mut desync_dumped = false;
+                    let mut game_proc = proc;
+                    while game_proc.is_alive() {
+                        if !desync_dumped && game_proc.is_desync_flagged() {
+                            desync_dumped = true;
+                            match game_proc.dump_desync_state(&root_clone) {
+                                Ok(dump_path) => {
+                                    let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
+                                    ctx_clone.request_repaint();
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
+                                    ctx_clone.request_repaint();
+                                }
+                            }
+                        }
+                        thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    game_proc.wait_for_exit();
                     let _ = tx.send(GuiEvent::GameExited(pid));
                     ctx_clone.request_repaint();
                 });
@@ -890,6 +930,34 @@ impl eframe::App for PatcherApp {
                         self.log_lines
                             .push(">>> Session closed because game was exited.".to_string());
                     }
+                }
+                GuiEvent::DesyncDetected(path) => {
+                    self.log_lines.push(
+                        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                            .to_string(),
+                    );
+                    self.log_lines.push(
+                        ">>> [DESYNC DETECTED] Simulation lockstep mismatch detected between Host and Guest!"
+                            .to_string(),
+                    );
+                    self.log_lines.push(format!(
+                        ">>> [DESYNC DUMP] Diagnostic actor dump saved to: {}",
+                        path.display()
+                    ));
+                    self.log_lines.push(
+                        ">>> Compare this file with your co-op partner's dump file to find the desynced actor."
+                            .to_string(),
+                    );
+                    self.log_lines.push(
+                        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                            .to_string(),
+                    );
+                }
+                GuiEvent::DesyncDumpFailed(err) => {
+                    self.log_lines.push(format!(
+                        ">>> [DESYNC ERROR] Failed to dump desync diagnostic state: {}",
+                        err
+                    ));
                 }
             }
         }
