@@ -189,6 +189,7 @@ pub const SIM_CHECKSUM_HOOK_BYTES: &[u8] = &[0xE9, 0x8B, 0xE8, 0x2B, 0x00, 0x90,
 /// gameplay runs full checksum verification, flagging `0x11330400 = 1` if a real desync occurs.
 pub const SIM_CHECKSUM_CAVE_VA: u32 = 0x110B6FE0;
 pub const CAVE_DESYNC_FLAG_VA: u32 = 0x11330400;
+pub const CAVE_DESYNC_COUNT_VA: u32 = 0x11330404;
 pub const SIM_CHECKSUM_CAVE_BYTES: [u8; 32] = [
     0x83, 0x3D, 0xE0, 0x55, 0x1F, 0x11, 0x00, // cmp dword ptr ds:[0x111F55E0], 0
     0x74, 0x13,                               // je 0x110B6FFC (warmup in progress -> al=1)
@@ -201,6 +202,21 @@ pub const SIM_CHECKSUM_CAVE_BYTES: [u8; 32] = [
     0xB0, 0x01,                               // mov al, 1
     0xC3,                                     // ret (returns al=1 -> synchronized)
     0x90,                                     // nop
+];
+
+/// Code cave in .text (`0x110B6FE0..0x110B7000`, 32 bytes) for Trace Mode desync bypass:
+/// runs the real `0x10DF8620(5)` check, flags `0x11330400 = 1` & increments `[0x11330404]`
+/// on mismatch so the diagnostic dump still fires, then returns `al = 1` so gameplay continues.
+pub const STARTUP_CHECKSUM_BYPASS_CAVE_BYTES: [u8; 32] = [
+    0x6A, 0x05,                               // push 5
+    0xE8, 0x39, 0x16, 0xD4, 0xFF,             // call 0x10DF8620
+    0x84, 0xC0,                               // test al, al
+    0x75, 0x0D,                               // jne 0x110B6FF8
+    0xFF, 0x05, 0x04, 0x04, 0x33, 0x11,       // inc dword ptr ds:[0x11330404]
+    0xC6, 0x05, 0x00, 0x04, 0x33, 0x11, 0x01, // mov byte ptr ds:[0x11330400], 1
+    0xB0, 0x01,                               // mov al, 1
+    0xC3,                                     // ret
+    0x90, 0x90, 0x90, 0x90, 0x90,             // nop x 5
 ];
 
 pub fn decode_hex(s: &str) -> Vec<u8> {
@@ -305,6 +321,15 @@ pub const SETPAUSE_LOBBY_UNREADY_NOP_LEN: usize = 12;
 pub const HOOK_PAUSE_IS_PLAYER_READY: u32 = 0x109639E0;
 pub const PAUSE_IS_PLAYER_READY_ORIG_HEX: &str = "a19c551f1183ec28";
 pub const PAUSE_IS_PLAYER_READY_NEW_HEX: &str = "b801000000c39090";
+
+/// `AEAIPawn::[vt+0x2BC]` (`0x10C18480`) render-visibility tick cull gate at VA `0x10C1852C`
+/// (immediately after once-only static `FName` initialization, with zero `.reloc` entries):
+/// returns `1` to skip `AEPawn::Tick` (`0x10B89DD0`) & pattern updates when `[esi+0x424] & 4`,
+/// `LastRenderTime ([esi+0x50]) == 0.0f`, or `TimeSeconds - LastRenderTime > 1.0f`.
+/// Patching with `xor eax, eax; pop esi; ret` disables visibility-gated AI tick culling.
+pub const HOOK_AI_VISIBILITY_CULL: u32 = 0x10C1852C;
+pub const AI_VISIBILITY_CULL_ORIG: &[u8] = &[0x80, 0x7E, 0x4C, 0x07, 0x74, 0x61, 0x8B, 0x8E];
+pub const AI_VISIBILITY_CULL_PATCHED: &[u8] = &[0x33, 0xC0, 0x5E, 0xC3, 0x90, 0x90, 0x90, 0x90];
 
 pub struct PatchSite {
     pub va: u32,
@@ -482,11 +507,7 @@ pub fn is_lan_and_zerotier_fix_applied(pe_bytes: &[u8]) -> bool {
         return false;
     }
 
-    let sim_chk_off = match va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) {
-        Ok(off) => off,
-        Err(_) => return false,
-    };
-    if pe_bytes.len() < sim_chk_off + 8 || &pe_bytes[sim_chk_off..sim_chk_off + 8] != SIM_CHECKSUM_ORIG {
+    if !is_sim_checksum_site_valid(pe_bytes) {
         return false;
     }
 
@@ -732,16 +753,22 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     buf[sock_cave_off..sock_cave_off + sock_cave.len()].copy_from_slice(&sock_cave);
     buf[multi_cave_off..multi_cave_off + multi_cave.len()].copy_from_slice(&multi_cave);
 
-    // Restore SIM_CHECKSUM to vanilla retail (push 5; call 0x10DF8620; ret) if previously patched
+    // Restore SIM_CHECKSUM to vanilla retail unless the Trace Mode bypass flag is intentionally active
+    let bypass_active = is_startup_checksum_bypass_patched(&buf);
     let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
-    if buf.len() >= sim_chk_off + 8
+    if !bypass_active
+        && buf.len() >= sim_chk_off + 8
         && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
             || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
     {
         buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
     }
     let sim_cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA)?;
-    if buf.len() >= sim_cave_off + 32 && &buf[sim_cave_off..sim_cave_off + 32] == &SIM_CHECKSUM_CAVE_BYTES {
+    if !bypass_active
+        && buf.len() >= sim_cave_off + 32
+        && (&buf[sim_cave_off..sim_cave_off + 32] == &SIM_CHECKSUM_CAVE_BYTES
+            || &buf[sim_cave_off..sim_cave_off + 32] == &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES)
+    {
         buf[sim_cave_off..sim_cave_off + 32].fill(0);
     }
     for site in &sites {
@@ -800,13 +827,188 @@ pub fn get_online_sites() -> Vec<PatchSite> {
             new: vec![0x90; SETPAUSE_LOBBY_UNREADY_NOP_LEN],
             desc: "UGameEngine::SetPause: prevent coop lobby client unreadying on Alt-Tab",
         },
-        PatchSite {
-            va: HOOK_PAUSE_IS_PLAYER_READY,
-            orig: decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX),
-            new: decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX),
-            desc: "Coop pause menu IsPlayerReady: both players always ready (resume/quicksave/quickload)",
-        },
     ]
+}
+
+fn is_text_patch_applied(pe_bytes: &[u8], va: u32, patched: &[u8]) -> bool {
+    let Ok(off) = va_to_text_off(va) else {
+        return false;
+    };
+    pe_bytes.len() >= off + patched.len() && &pe_bytes[off..off + patched.len()] == patched
+}
+
+fn patch_text_site_bytes(
+    pe_bytes: &mut [u8],
+    va: u32,
+    orig: &[u8],
+    patched: &[u8],
+    label: &str,
+) -> Result<usize> {
+    assert_eq!(orig.len(), patched.len());
+    let off = va_to_text_off(va)?;
+    if pe_bytes.len() < off + orig.len() {
+        bail!("PE image too short for {} patch @ 0x{:08X}", label, va);
+    }
+    let cur = &pe_bytes[off..off + orig.len()];
+    if cur == patched {
+        return Ok(off);
+    }
+    if cur != orig {
+        bail!(
+            "Unexpected bytes at 0x{:08X} for {}: {:02x?} (expected {:02x?})",
+            va,
+            label,
+            cur,
+            orig
+        );
+    }
+    pe_bytes[off..off + patched.len()].copy_from_slice(patched);
+    Ok(off)
+}
+
+fn revert_text_site_bytes(pe_bytes: &mut [u8], va: u32, orig: &[u8], patched: &[u8]) -> bool {
+    assert_eq!(orig.len(), patched.len());
+    let Ok(off) = va_to_text_off(va) else {
+        return false;
+    };
+    if pe_bytes.len() < off + patched.len() || &pe_bytes[off..off + patched.len()] != patched {
+        return false;
+    }
+    pe_bytes[off..off + orig.len()].copy_from_slice(orig);
+    true
+}
+
+/// Returns whether the optional `HOOK_PAUSE_IS_PLAYER_READY` (`0x109639E0`) patch is applied.
+pub fn is_pause_always_ready_patched(pe_bytes: &[u8]) -> bool {
+    let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
+    is_text_patch_applied(pe_bytes, HOOK_PAUSE_IS_PLAYER_READY, &new)
+}
+
+/// Patches `IsPlayerReady` (`0x109639E0`) to always return `1` (idempotent).
+pub fn patch_pause_always_ready_bytes(pe_bytes: &mut [u8]) -> Result<usize> {
+    let orig = decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX);
+    let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
+    patch_text_site_bytes(
+        pe_bytes,
+        HOOK_PAUSE_IS_PLAYER_READY,
+        &orig,
+        &new,
+        "IsPlayerReady",
+    )
+}
+
+/// Reverts `IsPlayerReady` (`0x109639E0`) back to vanilla bytes if patched.
+pub fn revert_pause_always_ready_bytes(pe_bytes: &mut [u8]) -> bool {
+    let orig = decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX);
+    let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
+    revert_text_site_bytes(pe_bytes, HOOK_PAUSE_IS_PLAYER_READY, &orig, &new)
+}
+
+/// Returns whether AI visibility tick-culling (`AEAIPawn::vt+0x2BC` @ `0x10C1852C`) is disabled.
+pub fn is_ai_visibility_culling_disabled(pe_bytes: &[u8]) -> bool {
+    is_text_patch_applied(pe_bytes, HOOK_AI_VISIBILITY_CULL, AI_VISIBILITY_CULL_PATCHED)
+}
+
+/// Patches `AEAIPawn::vt+0x2BC` (`0x10C1852C`) to return `0`, disabling visibility tick-culling (idempotent).
+pub fn patch_ai_visibility_culling_disabled_bytes(pe_bytes: &mut [u8]) -> Result<usize> {
+    patch_text_site_bytes(
+        pe_bytes,
+        HOOK_AI_VISIBILITY_CULL,
+        AI_VISIBILITY_CULL_ORIG,
+        AI_VISIBILITY_CULL_PATCHED,
+        "AEAIPawn::vt+0x2BC",
+    )
+}
+
+/// Reverts `AEAIPawn::vt+0x2BC` (`0x10C1852C`) back to vanilla visibility culling bytes.
+pub fn revert_ai_visibility_culling_disabled_bytes(pe_bytes: &mut [u8]) -> bool {
+    revert_text_site_bytes(
+        pe_bytes,
+        HOOK_AI_VISIBILITY_CULL,
+        AI_VISIBILITY_CULL_ORIG,
+        AI_VISIBILITY_CULL_PATCHED,
+    )
+}
+
+fn is_sim_checksum_site_valid(pe_bytes: &[u8]) -> bool {
+    let Ok(sim_chk_off) = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) else {
+        return false;
+    };
+    if pe_bytes.len() < sim_chk_off + 8 {
+        return false;
+    }
+    &pe_bytes[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_ORIG
+        || is_startup_checksum_bypass_patched(pe_bytes)
+}
+
+/// Returns whether the Trace Mode startup checksum disconnect bypass (`0x10DF8750` -> `0x110B6FE0`) is active.
+pub fn is_startup_checksum_bypass_patched(pe_bytes: &[u8]) -> bool {
+    let (Ok(chk_off), Ok(cave_off)) = (
+        va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM),
+        va_to_text_off(SIM_CHECKSUM_CAVE_VA),
+    ) else {
+        return false;
+    };
+    pe_bytes.len() >= chk_off + 8
+        && pe_bytes.len() >= cave_off + 32
+        && &pe_bytes[chk_off..chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES
+        && &pe_bytes[cave_off..cave_off + 32] == &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES
+}
+
+/// Patches `0x10DF8750` (`SimStation::CheckSimulationChecksum`) to log mismatches without disconnecting (idempotent).
+pub fn patch_startup_checksum_bypass_bytes(pe_bytes: &mut [u8]) -> Result<usize> {
+    let chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
+    let cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA)?;
+    if pe_bytes.len() < chk_off + 8 || pe_bytes.len() < cave_off + 32 {
+        bail!(
+            "PE image too short for CheckSimulationChecksum trace bypass @ 0x{:08X}",
+            HOOK_SITE_CHECK_SIM_CHECKSUM
+        );
+    }
+    if is_startup_checksum_bypass_patched(pe_bytes) {
+        return Ok(chk_off);
+    }
+    let cur_site = &pe_bytes[chk_off..chk_off + 8];
+    if cur_site != SIM_CHECKSUM_ORIG
+        && cur_site != SIM_CHECKSUM_HOOK_BYTES
+        && cur_site != SIM_CHECKSUM_PATCHED
+    {
+        bail!(
+            "Unexpected bytes at 0x{:08X} for CheckSimulationChecksum: {:02x?}",
+            HOOK_SITE_CHECK_SIM_CHECKSUM,
+            cur_site
+        );
+    }
+    let cur_cave = &pe_bytes[cave_off..cave_off + 32];
+    if cur_cave.iter().any(|&b| b != 0)
+        && cur_cave != &SIM_CHECKSUM_CAVE_BYTES
+        && cur_cave != &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES
+    {
+        bail!(
+            "Code cave at 0x{:08X} contains unexpected bytes: {:02x?}",
+            SIM_CHECKSUM_CAVE_VA,
+            cur_cave
+        );
+    }
+    pe_bytes[cave_off..cave_off + 32].copy_from_slice(&STARTUP_CHECKSUM_BYPASS_CAVE_BYTES);
+    pe_bytes[chk_off..chk_off + 8].copy_from_slice(SIM_CHECKSUM_HOOK_BYTES);
+    Ok(chk_off)
+}
+
+/// Reverts the Trace Mode startup checksum disconnect bypass back to vanilla `SIM_CHECKSUM_ORIG`.
+pub fn revert_startup_checksum_bypass_bytes(pe_bytes: &mut [u8]) -> bool {
+    if !is_startup_checksum_bypass_patched(pe_bytes) {
+        return false;
+    }
+    let (Ok(chk_off), Ok(cave_off)) = (
+        va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM),
+        va_to_text_off(SIM_CHECKSUM_CAVE_VA),
+    ) else {
+        return false;
+    };
+    pe_bytes[chk_off..chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
+    pe_bytes[cave_off..cave_off + 32].fill(0);
+    true
 }
 
 pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
@@ -861,11 +1063,7 @@ pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
         }
     }
 
-    let sim_chk_off = match va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM) {
-        Ok(off) => off,
-        Err(_) => return false,
-    };
-    if pe_bytes.len() < sim_chk_off + 8 || &pe_bytes[sim_chk_off..sim_chk_off + 8] != SIM_CHECKSUM_ORIG {
+    if !is_sim_checksum_site_valid(pe_bytes) {
         return false;
     }
     true
@@ -930,6 +1128,7 @@ pub fn apply_online_coop_fix_with_ports(
         set_direct_target_in_exe(&mut buf, target_ip, disco_port, game_port)?;
         fs::write(exe_path, &buf).with_context(|| format!("Writing {}", exe_path.display()))?;
         crate::scct_log!("  [NET] Online Coop fix active in System/splintercell3.exe");
+        crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
         return Ok(());
     }
 
@@ -987,7 +1186,8 @@ pub fn apply_online_coop_fix_with_ports(
     }
 
     let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
-    if buf.len() >= sim_chk_off + 8
+    if !is_startup_checksum_bypass_patched(&buf)
+        && buf.len() >= sim_chk_off + 8
         && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
             || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
     {
@@ -1256,10 +1456,19 @@ mod tests {
             &clean_bytes[ready_off..ready_off + 8],
             decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX).as_slice()
         );
+        // Optional IsPlayerReady toggle is no longer force-applied by online fix
         assert_eq!(
             &buf[ready_off..ready_off + 8],
-            decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX).as_slice()
+            decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX).as_slice()
         );
+        assert!(!is_pause_always_ready_patched(&buf));
+        let mut toggled = buf.clone();
+        assert_eq!(patch_pause_always_ready_bytes(&mut toggled).unwrap(), ready_off);
+        assert!(is_pause_always_ready_patched(&toggled));
+        assert!(is_online_coop_fix_applied(&toggled));
+        assert!(revert_pause_always_ready_bytes(&mut toggled));
+        assert!(!is_pause_always_ready_patched(&toggled));
+        assert!(is_online_coop_fix_applied(&toggled));
         let jp_off = va_to_text_off(JOIN_GAME_PORT_VA).unwrap();
         assert_eq!(&buf[jp_off..jp_off + 4], &2383u32.to_le_bytes());
         let dp_off = va_to_text_off(CAVE_ONLINE_PORT_VA).unwrap();
@@ -1337,6 +1546,9 @@ mod tests {
 
     #[test]
     fn test_pause_is_player_ready_site_integrity() {
+        let ready_off = va_to_text_off(HOOK_PAUSE_IS_PLAYER_READY).unwrap();
+        assert_eq!(ready_off, 0x0639E0);
+
         let orig = decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX);
         let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
         assert_eq!(orig.len(), new.len());
@@ -1345,13 +1557,19 @@ mod tests {
         // mov eax, 1; ret
         assert_eq!(&new[0..6], &[0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3]);
 
+        // Managed via optional UI flag rather than get_online_sites()
         let sites = get_online_sites();
-        let site = sites
-            .iter()
-            .find(|s| s.va == HOOK_PAUSE_IS_PLAYER_READY)
-            .expect("pause IsPlayerReady patch site registered in get_online_sites");
-        assert_eq!(site.orig, orig);
-        assert_eq!(site.new, new);
+        assert!(sites.iter().all(|s| s.va != HOOK_PAUSE_IS_PLAYER_READY));
+
+        let mut mock = vec![0u8; ready_off + orig.len()];
+        mock[ready_off..ready_off + orig.len()].copy_from_slice(&orig);
+        assert!(!is_pause_always_ready_patched(&mock));
+        assert_eq!(patch_pause_always_ready_bytes(&mut mock).unwrap(), ready_off);
+        assert!(is_pause_always_ready_patched(&mock));
+        assert_eq!(&mock[ready_off..ready_off + new.len()], new.as_slice());
+        assert!(revert_pause_always_ready_bytes(&mut mock));
+        assert!(!is_pause_always_ready_patched(&mock));
+        assert_eq!(&mock[ready_off..ready_off + orig.len()], orig.as_slice());
     }
 
     #[test]
@@ -1415,5 +1633,89 @@ mod tests {
 
         let _ = fs::remove_file(&test_exe);
         let _ = fs::remove_file(&test_bak);
+    }
+
+    #[test]
+    fn test_startup_checksum_bypass_cave_and_toggle() {
+        // Verify relative call displacement from 0x110B6FE2 to 0x10DF8620
+        let rel_call = i32::from_le_bytes(STARTUP_CHECKSUM_BYPASS_CAVE_BYTES[3..7].try_into().unwrap());
+        assert_eq!((SIM_CHECKSUM_CAVE_VA + 7).wrapping_add(rel_call as u32), 0x10DF8620);
+        // Verify jnz target lands at 0x110B6FF8 (mov al, 1; ret)
+        assert_eq!(STARTUP_CHECKSUM_BYPASS_CAVE_BYTES[0x09], 0x75);
+        assert_eq!(
+            0x110B6FE9u32 + 2 + (STARTUP_CHECKSUM_BYPASS_CAVE_BYTES[0x0A] as u32),
+            0x110B6FF8
+        );
+        assert_eq!(
+            &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES[0x18..0x1B],
+            &[0xB0, 0x01, 0xC3]
+        );
+
+        let chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM).unwrap();
+        let cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA).unwrap();
+        let mut mock = vec![0u8; cave_off + 32];
+        mock[chk_off..chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
+
+        assert!(!is_startup_checksum_bypass_patched(&mock));
+        assert_eq!(patch_startup_checksum_bypass_bytes(&mut mock).unwrap(), chk_off);
+        assert!(is_startup_checksum_bypass_patched(&mock));
+        assert_eq!(&mock[chk_off..chk_off + 8], SIM_CHECKSUM_HOOK_BYTES);
+        assert_eq!(&mock[cave_off..cave_off + 32], &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES);
+
+        // Idempotent re-apply
+        assert_eq!(patch_startup_checksum_bypass_bytes(&mut mock).unwrap(), chk_off);
+        assert!(is_sim_checksum_site_valid(&mock));
+
+        // Clean revert restores vanilla bytes and clears cave
+        assert!(revert_startup_checksum_bypass_bytes(&mut mock));
+        assert!(!is_startup_checksum_bypass_patched(&mock));
+        assert_eq!(&mock[chk_off..chk_off + 8], SIM_CHECKSUM_ORIG);
+        assert!(mock[cave_off..cave_off + 32].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_ai_visibility_culling_toggle() {
+        let cull_off = va_to_text_off(HOOK_AI_VISIBILITY_CULL).unwrap();
+        assert_eq!(cull_off, 0x31852C);
+        let mut mock = vec![0u8; cull_off + 16];
+        mock[cull_off..cull_off + 8].copy_from_slice(AI_VISIBILITY_CULL_ORIG);
+
+        assert!(!is_ai_visibility_culling_disabled(&mock));
+        assert_eq!(
+            patch_ai_visibility_culling_disabled_bytes(&mut mock).unwrap(),
+            cull_off
+        );
+        assert!(is_ai_visibility_culling_disabled(&mock));
+        assert_eq!(&mock[cull_off..cull_off + 8], AI_VISIBILITY_CULL_PATCHED);
+        // Idempotent
+        assert_eq!(
+            patch_ai_visibility_culling_disabled_bytes(&mut mock).unwrap(),
+            cull_off
+        );
+        // Revert
+        assert!(revert_ai_visibility_culling_disabled_bytes(&mut mock));
+        assert!(!is_ai_visibility_culling_disabled(&mock));
+        assert_eq!(&mock[cull_off..cull_off + 8], AI_VISIBILITY_CULL_ORIG);
+
+        let clean_candidates = [
+            "../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
+            "../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
+        ];
+        if let Some(p) = clean_candidates
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists())
+        {
+            let mut real_exe = std::fs::read(p).unwrap();
+            assert!(!is_ai_visibility_culling_disabled(&real_exe));
+            assert_eq!(
+                &real_exe[cull_off..cull_off + 8],
+                AI_VISIBILITY_CULL_ORIG
+            );
+            patch_ai_visibility_culling_disabled_bytes(&mut real_exe).unwrap();
+            assert!(is_ai_visibility_culling_disabled(&real_exe));
+            assert!(revert_ai_visibility_culling_disabled_bytes(&mut real_exe));
+            assert!(!is_ai_visibility_culling_disabled(&real_exe));
+        }
     }
 }

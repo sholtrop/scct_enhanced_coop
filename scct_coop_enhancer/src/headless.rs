@@ -230,6 +230,7 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
         peer_disco_port,
         peer_game_port,
     )?;
+    sync_all_flags(opts.game_root, opts.flags)?;
 
     if opts.no_launch {
         println!("  [READY] Peer target written to splintercell3.exe (--no-launch specified).");
@@ -348,6 +349,7 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
         peer_disco_port,
         peer_game_port,
     )?;
+    sync_all_flags(opts.game_root, opts.flags)?;
 
     if opts.no_launch {
         println!("  [READY] Host target written to splintercell3.exe (--no-launch specified).");

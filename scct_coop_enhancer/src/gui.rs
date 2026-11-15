@@ -652,32 +652,7 @@ impl PatcherApp {
                 {
                     *game_launched = true;
                 }
-                let tx = self.sender.clone();
-                let ctx_clone = ctx.clone();
-                let root_clone = root.clone();
-                thread::spawn(move || {
-                    let mut desync_dumped = false;
-                    let mut game_proc = proc;
-                    while game_proc.is_alive() {
-                        if !desync_dumped && game_proc.is_desync_flagged() {
-                            desync_dumped = true;
-                            match game_proc.dump_desync_state(&root_clone) {
-                                Ok(dump_path) => {
-                                    let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
-                                    ctx_clone.request_repaint();
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
-                                    ctx_clone.request_repaint();
-                                }
-                            }
-                        }
-                        thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    game_proc.wait_for_exit();
-                    let _ = tx.send(GuiEvent::GameExited(pid));
-                    ctx_clone.request_repaint();
-                });
+                spawn_game_monitor(proc, self.sender.clone(), ctx.clone(), root.clone());
                 self.log_lines.push(format!(
                     ">>> Chaos Theory Coop launched successfully (PID: {})!",
                     pid
@@ -751,32 +726,7 @@ impl PatcherApp {
             Ok(proc) => {
                 let pid = proc.pid;
                 self.running_game_pid = Some(pid);
-                let tx = self.sender.clone();
-                let ctx_clone = ctx.clone();
-                let root_clone = root.clone();
-                thread::spawn(move || {
-                    let mut desync_dumped = false;
-                    let mut game_proc = proc;
-                    while game_proc.is_alive() {
-                        if !desync_dumped && game_proc.is_desync_flagged() {
-                            desync_dumped = true;
-                            match game_proc.dump_desync_state(&root_clone) {
-                                Ok(dump_path) => {
-                                    let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
-                                    ctx_clone.request_repaint();
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
-                                    ctx_clone.request_repaint();
-                                }
-                            }
-                        }
-                        thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    game_proc.wait_for_exit();
-                    let _ = tx.send(GuiEvent::GameExited(pid));
-                    ctx_clone.request_repaint();
-                });
+                spawn_game_monitor(proc, self.sender.clone(), ctx.clone(), root.clone());
                 let adapter_desc = match self.selected_bind_ip {
                     Some(ip) => format!("bound to adapter {}", ip),
                     None => "all local adapters (Auto)".to_string(),
@@ -813,6 +763,7 @@ impl eframe::App for PatcherApp {
                     };
                     if ok && let Some(ref root) = self.resolved_root {
                         self.installed_version = crate::patcher::get_installed_version(root);
+                        self.flags = crate::flags::load_flag_states(root);
                         self.detection_msg = format!(
                             "Game detected: {} (Co-op Mod v{} installed)",
                             root.display(),
@@ -831,6 +782,7 @@ impl eframe::App for PatcherApp {
                     if ok {
                         self.installed_version = None;
                         if let Some(ref root) = self.resolved_root {
+                            self.flags = crate::flags::load_flag_states(root);
                             self.detection_msg =
                                 format!("Game detected: {} (Vanilla)", root.display());
                         }
@@ -1330,7 +1282,7 @@ impl eframe::App for PatcherApp {
                                     .color(Color32::from_rgb(220, 225, 235)),
                             );
                             ui.label(
-                                RichText::new("(Experimental gameplay fixes for splintercell3.exe)")
+                                RichText::new("(Optional patches for splintercell3.exe and map UPKs)")
                                     .size(11.0)
                                     .color(Color32::from_rgb(140, 145, 155)),
                             );
@@ -2178,6 +2130,50 @@ fn run_join_match(
         "  [JOIN] Direct connection ready! Click 'Launch Game (Co-op)' below.".to_string(),
     ));
     ctx.request_repaint();
+}
+
+fn spawn_game_monitor(
+    mut game_proc: crate::launcher::GameProcess,
+    tx: Sender<GuiEvent>,
+    ctx_clone: egui::Context,
+    root_clone: PathBuf,
+) {
+    let pid = game_proc.pid;
+    thread::spawn(move || {
+        let mut desync_dumped = false;
+        let mut trace_notified = false;
+        while game_proc.is_alive() {
+            if let Some(trace_path) = game_proc.poll_startup_trace(&root_clone) {
+                if !trace_notified {
+                    trace_notified = true;
+                    let _ = tx.send(GuiEvent::Log(format!(
+                        ">>> [TRACE] Recording startup sync/tick trace to: {}",
+                        trace_path.display()
+                    )));
+                    ctx_clone.request_repaint();
+                }
+            }
+            if !desync_dumped && game_proc.is_desync_flagged() {
+                desync_dumped = true;
+                let _ = game_proc.poll_startup_trace(&root_clone);
+                match game_proc.dump_desync_state(&root_clone) {
+                    Ok(dump_path) => {
+                        let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
+                        ctx_clone.request_repaint();
+                    }
+                    Err(e) => {
+                        let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
+                        ctx_clone.request_repaint();
+                    }
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = game_proc.poll_startup_trace(&root_clone);
+        game_proc.wait_for_exit();
+        let _ = tx.send(GuiEvent::GameExited(pid));
+        ctx_clone.request_repaint();
+    });
 }
 
 pub fn run_gui(

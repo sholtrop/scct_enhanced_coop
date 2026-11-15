@@ -46,7 +46,7 @@ use crate::umd::{
     append_missions_to_map_rotation, build_appended_coop_ini, normalize_umd_payload_baseline,
     parse_umd_archive, patch_umd_for_all_sp_levels,
 };
-use crate::upk::patch_sp_map_to_coop;
+use crate::upk::{map_has_attached_speaker_pawns, patch_sp_map_to_coop_with_options};
 
 pub const MOD_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const VERSION_FILENAME: &str = "scct_coop_version.txt";
@@ -651,9 +651,78 @@ pub fn is_camera_alarm_patched(data: &[u8]) -> bool {
 
 pub fn is_nonlethal_gameover_patched(data: &[u8]) -> bool {
     let nlen = NONLETHAL_GAMEOVER_PATCHED.len();
+    let aizone_len = COOP_AIZONE_ENABLE_PATCHED.len();
     let endm_len = COOP_ENDMISSION_DISPATCH_PATCHED.len();
     data.windows(nlen).any(|w| w == NONLETHAL_GAMEOVER_PATCHED)
+        && !data.windows(aizone_len).any(|w| w == COOP_AIZONE_ENABLE_PATCHED)
         && data.windows(endm_len).any(|w| w == COOP_ENDMISSION_DISPATCH_PATCHED)
+}
+
+/// Legacy `System/Engine.u` (`LevelInfo.PostBeginPlay`) 52-byte bytecode pattern.
+/// When earlier mod versions patched this to redirect `VarObject` via `SoundMapName`,
+/// converted maps diverged or broke clean script expectations; restoring clean vanilla
+/// `Engine.u` eliminates that mismatch.
+pub const ENGINE_U_LEVELINFO_ORIG: &[u8] = &[
+    0x0F, 0x00, 0x40, 0x02, 0x65, 0x8B, 0x16, 0x07, 0x36, 0x00, 0x97, 0x7E, 0x00, 0x40, 0x02, 0x1F,
+    0x2E, 0x00, 0x16, 0x25, 0x16, 0x0F, 0x00, 0x40, 0x02, 0x80, 0x00, 0x40, 0x02, 0x7E, 0x00, 0x40,
+    0x02, 0x1F, 0x2E, 0x00, 0x16, 0x16, 0x07, 0x4A, 0x00, 0x2D, 0x01, 0x79, 0x16, 0x0F, 0x01, 0x7A,
+    0x16, 0x00, 0x40, 0x02,
+];
+
+pub const ENGINE_U_LEVELINFO_PATCHED: &[u8] = &[
+    0x0F, 0x00, 0x40, 0x02, 0x01, 0x7A, 0x16, 0x07, 0x4A, 0x00, 0x7A, 0x00, 0x40, 0x02, 0x1F, 0x00,
+    0x16, 0x0F, 0x00, 0x40, 0x02, 0x65, 0x8B, 0x16, 0x0F, 0x00, 0x40, 0x02, 0x80, 0x00, 0x40, 0x02,
+    0x7E, 0x00, 0x40, 0x02, 0x1F, 0x2E, 0x00, 0x16, 0x16, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B, 0x0B,
+    0x0B, 0x0B, 0x0B, 0x0B,
+];
+
+pub fn restore_clean_engine_u(system_dir: &Path) -> Result<()> {
+    assert_eq!(
+        ENGINE_U_LEVELINFO_ORIG.len(),
+        ENGINE_U_LEVELINFO_PATCHED.len()
+    );
+    let engine_u_path = find_child_ci(system_dir, "Engine.u");
+    let engine_u_bak_path = system_dir.join("Engine.u.bak");
+
+    if engine_u_bak_path.is_file() {
+        let bak_data = std::fs::read(&engine_u_bak_path)
+            .with_context(|| format!("Reading {}", engine_u_bak_path.display()))?;
+        let differs = match std::fs::read(&engine_u_path) {
+            Ok(cur) => cur != bak_data,
+            Err(_) => true,
+        };
+        if differs {
+            if let Ok(mut perms) = std::fs::metadata(&engine_u_path).map(|m| m.permissions())
+                && perms.readonly()
+            {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&engine_u_path, perms);
+            }
+            std::fs::copy(&engine_u_bak_path, &engine_u_path)
+                .with_context(|| format!("Restoring {}", engine_u_path.display()))?;
+            scct_log!("  [UPK] Restored clean vanilla System/Engine.u from Engine.u.bak");
+        }
+    }
+
+    if engine_u_path.is_file() {
+        let mut data = std::fs::read(&engine_u_path)
+            .with_context(|| format!("Reading {}", engine_u_path.display()))?;
+        let nlen = ENGINE_U_LEVELINFO_PATCHED.len();
+        if let Some(pos) = data.windows(nlen).position(|w| w == ENGINE_U_LEVELINFO_PATCHED) {
+            data[pos..pos + nlen].copy_from_slice(ENGINE_U_LEVELINFO_ORIG);
+            if let Ok(mut perms) = std::fs::metadata(&engine_u_path).map(|m| m.permissions())
+                && perms.readonly()
+            {
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&engine_u_path, perms);
+            }
+            std::fs::write(&engine_u_path, &data)
+                .with_context(|| format!("Writing {}", engine_u_path.display()))?;
+            scct_log!("  [UPK] Reverted legacy LevelInfo.PostBeginPlay patch in System/Engine.u");
+        }
+    }
+
+    Ok(())
 }
 
 pub fn revert_camera_alarm_bytes(data: &mut [u8]) -> bool {
@@ -772,7 +841,99 @@ pub fn patch_exe_fixes(exe_path: &Path, exe_bak_path: &Path) -> Result<()> {
         std::fs::write(exe_path, &data)
             .with_context(|| format!("Writing {}", exe_path.display()))?;
     }
+
+    if let Some(sys_dir) = exe_path.parent() {
+        let _ = restore_clean_engine_u(sys_dir);
+    }
     Ok(())
+}
+
+fn build_maps_ci_map(maps_dir: &Path) -> std::collections::HashMap<String, String> {
+    let mut disk_ci = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(maps_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            disk_ci.insert(name.to_lowercase(), name);
+        }
+    }
+    disk_ci
+}
+
+fn resolve_clean_sp_scl_path(
+    maps_dir: &Path,
+    disk_ci: &std::collections::HashMap<String, String>,
+    src_map: &str,
+) -> Result<PathBuf> {
+    let bak_key = format!("{}.scl.bak", src_map.to_lowercase());
+    let scl_key = format!("{}.scl", src_map.to_lowercase());
+    if let Some(orig) = disk_ci.get(&bak_key) {
+        Ok(maps_dir.join(orig))
+    } else if let Some(orig) = disk_ci.get(&scl_key) {
+        Ok(maps_dir.join(orig))
+    } else {
+        bail!(
+            "Missing source SP map for {} in {}",
+            src_map,
+            maps_dir.display()
+        );
+    }
+}
+
+/// Returns `true` if any built `*_COOP.scl` map still has HQ/speaker pawns attached to an AI zone.
+pub fn are_coop_maps_keeping_speaker_zones(game_root: &Path) -> bool {
+    let data_dir = find_child_ci(game_root, "Data");
+    let maps_dir = find_child_ci(&data_dir, "Maps");
+    if !maps_dir.is_dir() {
+        return false;
+    }
+    for spec in SP_COOP_LEVELS {
+        let coop_scl = find_child_ci(&maps_dir, &format!("{}.scl", spec.coop_map));
+        if coop_scl.is_file() && map_has_attached_speaker_pawns(&coop_scl).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Rebuilds existing `*_COOP.scl` maps that contain speaker pawns so `CurrentEAIZone` detachment
+/// matches `detach_speakers`.
+pub fn sync_coop_maps_detach_state(game_root: &Path, detach_speakers: bool) -> Result<bool> {
+    let data_dir = find_child_ci(game_root, "Data");
+    let maps_dir = find_child_ci(&data_dir, "Maps");
+    if !maps_dir.is_dir() {
+        return Ok(false);
+    }
+    let disk_ci = build_maps_ci_map(&maps_dir);
+    let mut changed = false;
+
+    for spec in SP_COOP_LEVELS {
+        let dst_scl_path = find_child_ci(&maps_dir, &format!("{}.scl", spec.coop_map));
+        if !dst_scl_path.is_file() {
+            continue;
+        }
+        let src_scl_path = resolve_clean_sp_scl_path(&maps_dir, &disk_ci, spec.source_map)?;
+        if !map_has_attached_speaker_pawns(&src_scl_path)? {
+            continue;
+        }
+        let dst_has_attached = map_has_attached_speaker_pawns(&dst_scl_path)?;
+        if dst_has_attached == detach_speakers {
+            patch_sp_map_to_coop_with_options(
+                &src_scl_path,
+                &dst_scl_path,
+                spec.p1_offset,
+                spec.spawn_offset,
+                detach_speakers,
+            )?;
+            let mode = if detach_speakers {
+                "detached HQ speakers"
+            } else {
+                "kept vanilla CurrentEAIZone"
+            };
+            scct_log!("  [UPK ] Rebuilt {}.scl ({})", spec.coop_map, mode);
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 pub fn apply_all(
@@ -808,12 +969,13 @@ pub fn apply_all(
         apply_online_coop_fix(&exe_path, &exe_bak_path, None)?;
     }
     patch_exe_fixes(&exe_path, &exe_bak_path)?;
-    crate::flags::sync_all_flags(game_root, flags)?;
+    crate::flags::sync_exe_flags(game_root, flags)?;
 
     scct_log!(
         "\n=== Step 2: Patching `System/dynamic-pc.umd` & `System/Echelon.u` (Coop Dropdown & Remote Hacking) ==="
     );
     let extracted = patch_umd_for_all_sp_levels(&umd_path, &umd_bak_path, SP_COOP_LEVELS)?;
+    restore_clean_engine_u(&system_dir)?;
     if echelon_u_path.exists() || echelon_u_bak_path.exists() {
         patch_echelon_u_eev(&echelon_u_path, &echelon_u_bak_path)?;
     }
@@ -827,13 +989,12 @@ pub fn apply_all(
 
     std::fs::create_dir_all(&gen_loadings_dir)?;
 
-    let mut disk_ci = std::collections::HashMap::new();
-    if let Ok(entries) = std::fs::read_dir(&maps_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            disk_ci.insert(name.to_lowercase(), name);
-        }
-    }
+    let disk_ci = build_maps_ci_map(&maps_dir);
+    let skip_upk_pawn_detach = flags.iter().any(|f| {
+        crate::flags::flag_matches_id(f.def.id, crate::flags::FLAG_SKIP_UPK_PAWN_DETACH)
+            && f.enabled
+    });
+    let detach_speakers = !skip_upk_pawn_detach;
 
     for (coop_map, info) in &extracted {
         let spec = &info.spec;
@@ -841,24 +1002,16 @@ pub fn apply_all(
         let identity = spec.identity;
         let spawn_offset = spec.spawn_offset;
 
-        let bak_key = format!("{}.scl.bak", src_map.to_lowercase());
-        let scl_key = format!("{}.scl", src_map.to_lowercase());
-
-        let src_scl_path = if let Some(orig) = disk_ci.get(&bak_key) {
-            maps_dir.join(orig)
-        } else if let Some(orig) = disk_ci.get(&scl_key) {
-            maps_dir.join(orig)
-        } else {
-            bail!(
-                "Missing source SP map for {} in {}",
-                src_map,
-                maps_dir.display()
-            );
-        };
+        let src_scl_path = resolve_clean_sp_scl_path(&maps_dir, &disk_ci, src_map)?;
 
         let dst_scl_path = maps_dir.join(format!("{}.scl", coop_map));
-        let summary =
-            patch_sp_map_to_coop(&src_scl_path, &dst_scl_path, spec.p1_offset, spawn_offset)?;
+        let summary = patch_sp_map_to_coop_with_options(
+            &src_scl_path,
+            &dst_scl_path,
+            spec.p1_offset,
+            spawn_offset,
+            detach_speakers,
+        )?;
 
         // Copy matching sound files
         for sfx_ext in &["_sound.occ", "_sound.uns"] {
@@ -1107,6 +1260,18 @@ mod tests {
         assert_eq!(off2, 36);
         assert!(is_nonlethal_gameover_patched(&buf));
 
+        // Legacy COOP_AIZONE_ENABLE_PATCHED must fail is_nonlethal_gameover_patched and get reverted
+        let az_off = 36 + NONLETHAL_GAMEOVER_ORIG.len() + 24;
+        buf[az_off..az_off + COOP_AIZONE_ENABLE_PATCHED.len()]
+            .copy_from_slice(COOP_AIZONE_ENABLE_PATCHED);
+        assert!(!is_nonlethal_gameover_patched(&buf));
+        patch_nonlethal_gameover_bytes(&mut buf).unwrap();
+        assert!(is_nonlethal_gameover_patched(&buf));
+        assert_eq!(
+            &buf[az_off..az_off + COOP_AIZONE_ENABLE_ORIG.len()],
+            COOP_AIZONE_ENABLE_ORIG
+        );
+
         // Revert
         assert!(revert_nonlethal_gameover_bytes(&mut buf));
         assert!(!is_nonlethal_gameover_patched(&buf));
@@ -1114,6 +1279,37 @@ mod tests {
             &buf[36..36 + NONLETHAL_GAMEOVER_ORIG.len()],
             NONLETHAL_GAMEOVER_ORIG
         );
+    }
+
+    #[test]
+    fn test_restore_clean_engine_u() {
+        let dir = std::env::temp_dir().join(format!("scct_test_restore_engine_u_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let engine_u = dir.join("Engine.u");
+        let engine_u_bak = dir.join("Engine.u.bak");
+
+        let mut patched = vec![0x11; 32];
+        patched.extend_from_slice(ENGINE_U_LEVELINFO_PATCHED);
+        patched.extend_from_slice(&[0x22; 32]);
+        std::fs::write(&engine_u, &patched).unwrap();
+
+        // Without Engine.u.bak, bytecode pattern is reverted in-place
+        restore_clean_engine_u(&dir).unwrap();
+        let after_inplace = std::fs::read(&engine_u).unwrap();
+        let mut expected_clean = vec![0x11; 32];
+        expected_clean.extend_from_slice(ENGINE_U_LEVELINFO_ORIG);
+        expected_clean.extend_from_slice(&[0x22; 32]);
+        assert_eq!(after_inplace, expected_clean);
+
+        // With Engine.u.bak, Engine.u is restored from Engine.u.bak
+        let bak_bytes = vec![0x55; 64];
+        std::fs::write(&engine_u_bak, &bak_bytes).unwrap();
+        restore_clean_engine_u(&dir).unwrap();
+        assert_eq!(std::fs::read(&engine_u).unwrap(), bak_bytes);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

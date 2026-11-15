@@ -439,11 +439,125 @@ pub struct MapPatchSummary {
     pub detached_speakers: Vec<String>,
 }
 
+#[allow(dead_code)]
 pub fn patch_sp_map_to_coop(
     input_path: &Path,
     output_path: &Path,
     p1_offset: (f32, f32, f32),
     spawn_offset: (f32, f32, f32),
+) -> Result<MapPatchSummary> {
+    patch_sp_map_to_coop_with_options(input_path, output_path, p1_offset, spawn_offset, true)
+}
+
+struct SpeakerZoneMatch {
+    oname: String,
+    cname: String,
+    exp_start: usize,
+    prop_start: usize,
+    first_none: usize,
+    exp_end: usize,
+    props: Vec<RawProperty>,
+}
+
+fn inspect_speaker_pawn_with_zone(
+    data: &[u8],
+    names: &[(String, u32)],
+    imports: &[ImportEntry],
+    exports: &[ExportEntry],
+    e: &ExportEntry,
+) -> Option<SpeakerZoneMatch> {
+    if e.serial_size <= 0 {
+        return None;
+    }
+    let oname = &names[e.obj_name as usize].0;
+    let cname = resolve_class_name(names, imports, exports, e.class_idx);
+
+    let is_lambert_class = cname.eq_ignore_ascii_case("ELambert");
+    let is_lambert_name = oname.to_ascii_lowercase().starts_with("elambert");
+    let is_candidate = is_lambert_class
+        || is_lambert_name
+        || cname.eq_ignore_ascii_case("EAIGenericNPC")
+        || cname.to_ascii_lowercase().contains("pawn");
+
+    if !is_candidate {
+        return None;
+    }
+
+    let exp_start = e.serial_offset as usize;
+    let exp_end = exp_start + (e.serial_size as usize);
+    if exp_end > data.len() {
+        return None;
+    }
+
+    let prop_start = parse_state_frame_end(data, exp_start).ok()?;
+    let (props, first_none, _) =
+        parse_tagged_properties_raw(names, data, prop_start, exp_end).ok()?;
+
+    if !props.iter().any(|p| p.name == "CurrentEAIZone") {
+        return None;
+    }
+
+    let mut is_speaker = is_lambert_class || is_lambert_name;
+    if !is_speaker {
+        for p in &props {
+            if p.name == "Tag" && p.ptype == 6 && !p.raw_val.is_empty() {
+                let mut tag_off = 0;
+                if let Ok(tag_name_idx) = read_compact_index(&p.raw_val, &mut tag_off)
+                    && (tag_name_idx as usize) < names.len()
+                {
+                    let tag_str = &names[tag_name_idx as usize].0;
+                    if tag_str.eq_ignore_ascii_case("lambert")
+                        || tag_str.eq_ignore_ascii_case("elambert")
+                        || tag_str.eq_ignore_ascii_case("hq")
+                        || tag_str.eq_ignore_ascii_case("headquarters")
+                        || tag_str.eq_ignore_ascii_case("grim")
+                        || tag_str.eq_ignore_ascii_case("redding")
+                    {
+                        is_speaker = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if oname.eq_ignore_ascii_case("EAIGenericNPC20")
+            || oname.eq_ignore_ascii_case("EAIGenericNPC29")
+            || oname.eq_ignore_ascii_case("EAIGenericNPC43")
+        {
+            is_speaker = true;
+        }
+    }
+
+    if !is_speaker {
+        return None;
+    }
+
+    Some(SpeakerZoneMatch {
+        oname: oname.clone(),
+        cname,
+        exp_start,
+        prop_start,
+        first_none,
+        exp_end,
+        props,
+    })
+}
+
+/// Returns `true` if the given `.scl` map still has any HQ/speaker pawn with `CurrentEAIZone`.
+pub fn map_has_attached_speaker_pawns(map_path: &Path) -> Result<bool> {
+    let data =
+        fs::read(map_path).with_context(|| format!("Reading map {}", map_path.display()))?;
+    let upk = parse_upk_tables(&data)?;
+    Ok(upk.exports.iter().any(|e| {
+        inspect_speaker_pawn_with_zone(&data, &upk.names, &upk.imports, &upk.exports, e).is_some()
+    }))
+}
+
+pub fn patch_sp_map_to_coop_with_options(
+    input_path: &Path,
+    output_path: &Path,
+    p1_offset: (f32, f32, f32),
+    spawn_offset: (f32, f32, f32),
+    detach_speakers: bool,
 ) -> Result<MapPatchSummary> {
     let orig_data =
         fs::read(input_path).with_context(|| format!("Reading map {}", input_path.display()))?;
@@ -744,87 +858,23 @@ pub fn patch_sp_map_to_coop(
     let mut detached_speakers = Vec::new();
     let mut patched_speakers: Vec<(usize, Vec<u8>)> = Vec::new();
 
-    for (pos, e) in exports.iter().enumerate() {
-        if e.serial_size <= 0 {
-            continue;
-        }
-        let oname = &names[e.obj_name as usize].0;
-        let cname = resolve_class_name(&names, &imports, &exports, e.class_idx);
-
-        let is_lambert_class = cname.eq_ignore_ascii_case("ELambert");
-        let is_lambert_name = oname.to_ascii_lowercase().starts_with("elambert");
-        let is_candidate = is_lambert_class
-            || is_lambert_name
-            || cname.eq_ignore_ascii_case("EAIGenericNPC")
-            || cname.to_ascii_lowercase().contains("pawn");
-
-        if !is_candidate {
-            continue;
-        }
-
-        let exp_start = e.serial_offset as usize;
-        let exp_end = exp_start + (e.serial_size as usize);
-        if exp_end > orig_data.len() {
-            continue;
-        }
-
-        let prop_start = match parse_state_frame_end(&orig_data, exp_start) {
-            Ok(off) => off,
-            Err(_) => continue,
-        };
-
-        let (props, first_none, _) =
-            match parse_tagged_properties_raw(&names, &orig_data, prop_start, exp_end) {
-                Ok(res) => res,
-                Err(_) => continue,
+    if detach_speakers {
+        for (pos, e) in exports.iter().enumerate() {
+            let Some(m) =
+                inspect_speaker_pawn_with_zone(&orig_data, &names, &imports, &exports, e)
+            else {
+                continue;
             };
-
-        let has_zone = props.iter().any(|p| p.name == "CurrentEAIZone");
-        if !has_zone {
-            continue;
-        }
-
-        let mut is_speaker = is_lambert_class || is_lambert_name;
-        if !is_speaker {
-            for p in &props {
-                if p.name == "Tag" && p.ptype == 6 && !p.raw_val.is_empty() {
-                    let mut tag_off = 0;
-                    if let Ok(tag_name_idx) = read_compact_index(&p.raw_val, &mut tag_off) {
-                        if (tag_name_idx as usize) < names.len() {
-                            let tag_str = &names[tag_name_idx as usize].0;
-                            if tag_str.eq_ignore_ascii_case("lambert")
-                                || tag_str.eq_ignore_ascii_case("elambert")
-                                || tag_str.eq_ignore_ascii_case("hq")
-                                || tag_str.eq_ignore_ascii_case("headquarters")
-                                || tag_str.eq_ignore_ascii_case("grim")
-                                || tag_str.eq_ignore_ascii_case("redding")
-                            {
-                                is_speaker = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if oname.eq_ignore_ascii_case("EAIGenericNPC20")
-                || oname.eq_ignore_ascii_case("EAIGenericNPC29")
-                || oname.eq_ignore_ascii_case("EAIGenericNPC43")
-            {
-                is_speaker = true;
-            }
-        }
-
-        if is_speaker {
             let mut patched_bytes = Vec::new();
-            patched_bytes.extend_from_slice(&orig_data[exp_start..prop_start]);
-            for p in &props {
+            patched_bytes.extend_from_slice(&orig_data[m.exp_start..m.prop_start]);
+            for p in &m.props {
                 if p.name != "CurrentEAIZone" {
                     patched_bytes.extend_from_slice(&p.raw_full);
                 }
             }
-            patched_bytes.extend_from_slice(&orig_data[first_none..exp_end]);
+            patched_bytes.extend_from_slice(&orig_data[m.first_none..m.exp_end]);
             patched_speakers.push((pos, patched_bytes));
-            detached_speakers.push(format!("{}({})", oname, cname));
+            detached_speakers.push(format!("{}({})", m.oname, m.cname));
         }
     }
 
@@ -1001,6 +1051,49 @@ mod tests {
             }
         }
         assert!(found_speaker, "EAIGenericNPC20 not found in exports");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_patch_sp_map_preserves_speaker_pawn_when_detach_disabled() {
+        let candidates = [
+            PathBuf::from("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
+            PathBuf::from("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
+        ];
+        let bank_src = candidates.into_iter().find(|p| p.exists());
+        let Some(bank_src) = bank_src else {
+            eprintln!("Skipping test_patch_sp_map_preserves_speaker_pawn_when_detach_disabled (clean 03_Bank.scl not found)");
+            return;
+        };
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("scct_upk_keep_zone_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let kept_map = temp_dir.join("03_Bank_COOP_keep.scl");
+        let detached_map = temp_dir.join("03_Bank_COOP_detach.scl");
+
+        let summary_keep = patch_sp_map_to_coop_with_options(
+            &bank_src,
+            &kept_map,
+            (0.0, 0.0, 0.0),
+            (-55.0, -65.0, 8.0),
+            false,
+        )
+        .expect("patch_sp_map_to_coop_with_options(false) failed");
+        assert!(summary_keep.detached_speakers.is_empty());
+        assert!(map_has_attached_speaker_pawns(&kept_map).unwrap());
+
+        let summary_detach = patch_sp_map_to_coop_with_options(
+            &bank_src,
+            &detached_map,
+            (0.0, 0.0, 0.0),
+            (-55.0, -65.0, 8.0),
+            true,
+        )
+        .expect("patch_sp_map_to_coop_with_options(true) failed");
+        assert!(!summary_detach.detached_speakers.is_empty());
+        assert!(!map_has_attached_speaker_pawns(&detached_map).unwrap());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -10,6 +10,7 @@ mod net;
 mod patcher;
 mod quicksave_persistence;
 mod stun;
+mod trace;
 mod umd;
 mod upk;
 
