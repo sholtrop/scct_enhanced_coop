@@ -11,8 +11,16 @@ enum InstallState {
     Idle,
     Installing,
     Uninstalling,
-    Success,
     Failed,
+}
+
+fn install_button_label(state: &InstallState) -> &'static str {
+    match state {
+        InstallState::Idle => "🎮 Install Mod",
+        InstallState::Installing => "Installing Mod... (Please wait)",
+        InstallState::Uninstalling => "Uninstalling Mod... (Please wait)",
+        InstallState::Failed => "❌ Installation Failed (Click to Retry)",
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -258,8 +266,18 @@ pub enum MatchState {
 
 pub enum GuiEvent {
     Log(String),
-    InstallDone(bool),
-    UninstallDone(bool),
+    InstallDone {
+        root: PathBuf,
+        ok: bool,
+    },
+    UninstallDone {
+        root: PathBuf,
+        ok: bool,
+    },
+    FlagsApplyDone {
+        ok: bool,
+        applied: Option<crate::patcher::ModFlags>,
+    },
     FriendCodeRegistered(String),
     MatchStatus(String),
     Matched {
@@ -273,7 +291,7 @@ pub enum GuiEvent {
     MatchFailed(String),
     PeerDisconnected(String),
     GameExited(u32),
-    DesyncDetected(PathBuf),
+    DesyncDetected(crate::launcher::DesyncReport),
     DesyncDumpFailed(String),
 }
 
@@ -309,8 +327,16 @@ pub struct PatcherApp {
     available_local_ips: Vec<std::net::Ipv4Addr>,
     selected_bind_ip: Option<std::net::Ipv4Addr>,
 
-    // Modular patch flags & optional gameplay tweaks
-    pub flags: Vec<crate::flags::FlagState>,
+    // Stage 1 instant Host -> Client resync on checksum mismatch
+    auto_resync: bool,
+
+    // Show debug/mod flag UI controls only when `--dev` is passed at startup
+    dev_mode: bool,
+
+    // Per-feature patch toggles across all 6 mod groups (28 toggles)
+    patch_flags: crate::patcher::ModFlags,
+    applied_flags: Option<crate::patcher::ModFlags>,
+    applying_flags: bool,
 }
 
 impl PatcherApp {
@@ -318,6 +344,8 @@ impl PatcherApp {
         cc: &eframe::CreationContext,
         explicit_dir: Option<PathBuf>,
         initial_bind_ip: Option<std::net::Ipv4Addr>,
+        initial_auto_resync: bool,
+        dev_mode: bool,
     ) -> Self {
         // Force dark mode regardless of OS light/dark theme preference
         let mut dark_visuals = egui::Visuals::dark();
@@ -329,6 +357,16 @@ impl PatcherApp {
             .set_visuals_of(egui::Theme::Light, dark_visuals.clone());
         cc.egui_ctx.set_visuals(dark_visuals);
 
+        Self::init_state(explicit_dir, initial_bind_ip, initial_auto_resync, dev_mode, true)
+    }
+
+    fn init_state(
+        explicit_dir: Option<PathBuf>,
+        initial_bind_ip: Option<std::net::Ipv4Addr>,
+        initial_auto_resync: bool,
+        dev_mode: bool,
+        auto_detect: bool,
+    ) -> Self {
         let (sender, receiver) = channel();
         let initial_bind_ip = initial_bind_ip.filter(|ip| !ip.is_unspecified());
 
@@ -355,10 +393,18 @@ impl PatcherApp {
             api_port: crate::stun::DEFAULT_API_PORT,
             available_local_ips: crate::ip::get_all_local_ips(),
             selected_bind_ip: initial_bind_ip,
-            flags: crate::flags::default_flag_states(),
+            auto_resync: initial_auto_resync,
+            dev_mode,
+            patch_flags: crate::patcher::ModFlags::default(),
+            applied_flags: None,
+            applying_flags: false,
         };
 
-        let detected = crate::patcher::auto_detect_game_roots();
+        let detected = if auto_detect {
+            crate::patcher::auto_detect_game_roots()
+        } else {
+            Vec::new()
+        };
         app.detected_roots = detected.clone();
 
         if let Some(explicit) = explicit_dir {
@@ -391,8 +437,8 @@ impl PatcherApp {
 
     pub fn set_game_root(&mut self, root: PathBuf) {
         self.game_dir_input = root.display().to_string();
+        self.state = InstallState::Idle;
         self.installed_version = crate::patcher::get_installed_version(&root);
-        self.flags = crate::flags::load_flag_states(&root);
 
         if let Some(ref ver) = self.installed_version {
             self.detection_msg = format!(
@@ -404,20 +450,140 @@ impl PatcherApp {
             self.detection_msg = format!("Game detected: {} (Vanilla)", root.display());
         }
         self.resolved_root = Some(root.clone());
+        self.update_flags_from_disk(&root, None, true);
+        self.sync_quicksave_worker();
+    }
 
-        if self.persistent_quick_saves.is_none() {
-            self.persistent_quick_saves = Some(
-                crate::quicksave_persistence::spawn_quicksave_persistence(root),
-            );
+    fn clear_game_root(&mut self, msg: String) {
+        self.resolved_root = None;
+        self.installed_version = None;
+        self.applied_flags = None;
+        self.state = InstallState::Idle;
+        self.detection_msg = msg;
+        self.stop_persistent_quick_saves();
+    }
+
+    /// Updates install state after `apply_all_with_flags` finishes for `event_root`.
+    fn handle_install_done(&mut self, event_root: &Path, ok: bool) {
+        if self.resolved_root.as_deref() != Some(event_root) {
+            if matches!(self.state, InstallState::Installing) {
+                self.state = InstallState::Idle;
+            }
+            return;
+        }
+        if ok {
+            self.installed_version = crate::patcher::get_installed_version(event_root);
+            if let Some(ver) = self.installed_version.clone() {
+                self.state = InstallState::Idle;
+                let fallback = self.patch_flags;
+                self.update_flags_from_disk(event_root, Some(fallback), false);
+                self.detection_msg =
+                    format!("Game detected: {} (Co-op Mod v{} installed)", event_root.display(), ver);
+                self.sync_quicksave_worker();
+            } else {
+                self.state = InstallState::Failed;
+            }
+        } else {
+            self.state = InstallState::Failed;
+        }
+    }
+
+    /// Updates install state after `restore_vanilla` finishes for `event_root`.
+    fn handle_uninstall_done(&mut self, event_root: &Path, ok: bool) {
+        if self.resolved_root.as_deref() != Some(event_root) {
+            if matches!(self.state, InstallState::Uninstalling) {
+                self.state = InstallState::Idle;
+            }
+            return;
+        }
+        self.state = InstallState::Idle;
+        if ok {
+            self.installed_version = crate::patcher::get_installed_version(event_root);
+            self.applied_flags = None;
+            self.detection_msg = format!("Game detected: {} (Vanilla)", event_root.display());
+        }
+    }
+
+    fn start_install_task(&mut self, ctx: &egui::Context, completion_msg: &'static str) {
+        let Some(root) = self.resolved_root.clone() else {
+            return;
+        };
+        self.state = InstallState::Installing;
+        self.log_lines.clear();
+
+        let tx = self.sender.clone();
+        let tx_status = self.sender.clone();
+        let ctx_clone = ctx.clone();
+        let patch_flags = self.patch_flags;
+
+        crate::patcher::set_log_sink(move |msg| {
+            let _ = tx.send(GuiEvent::Log(msg.to_string()));
+            ctx_clone.request_repaint();
+        });
+
+        let ctx_finish = ctx.clone();
+        thread::spawn(move || {
+            let res = crate::patcher::apply_all_with_flags(&root, &patch_flags);
+            match res {
+                Ok(_) => {
+                    let _ = tx_status.send(GuiEvent::Log(completion_msg.to_string()));
+                    let _ = tx_status.send(GuiEvent::InstallDone { root, ok: true });
+                }
+                Err(e) => {
+                    let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
+                    let _ = tx_status.send(GuiEvent::InstallDone { root, ok: false });
+                }
+            }
+            crate::patcher::clear_log_sink();
+            ctx_finish.request_repaint();
+        });
+    }
+
+    /// Refreshes `applied_flags` from disk; in non-dev mode, keeps `patch_flags` pinned to the default preset.
+    fn update_flags_from_disk(
+        &mut self,
+        root: &Path,
+        fallback_applied: Option<crate::patcher::ModFlags>,
+        reset_to_default_if_undetected: bool,
+    ) {
+        let detected = crate::patcher::ModFlags::detect_from_disk(root, Some(&self.patch_flags));
+        if self.dev_mode {
+            if let Some(d) = detected {
+                self.patch_flags = d;
+            } else if reset_to_default_if_undetected {
+                self.patch_flags = crate::patcher::ModFlags::default();
+            }
+        } else {
+            self.patch_flags = crate::patcher::ModFlags::default();
+        }
+        self.applied_flags = detected.or(fallback_applied);
+    }
+
+    fn sync_quicksave_worker(&mut self) {
+        if self.patch_flags.runtime_quicksave_persistence {
+            if let Some(root) = self.resolved_root.clone() {
+                let needs_restart = self
+                    .persistent_quick_saves
+                    .as_ref()
+                    .is_some_and(|handle| handle.game_root() != root.as_path());
+                if needs_restart {
+                    self.stop_persistent_quick_saves();
+                }
+                if self.persistent_quick_saves.is_none() {
+                    self.persistent_quick_saves = Some(
+                        crate::quicksave_persistence::spawn_quicksave_persistence(root),
+                    );
+                }
+            }
+        } else {
+            self.stop_persistent_quick_saves();
         }
     }
 
     fn check_manual_path_input(&mut self) {
         let trimmed = self.game_dir_input.trim();
         if trimmed.is_empty() {
-            self.resolved_root = None;
-            self.installed_version = None;
-            self.detection_msg = "Please select or enter the Chaos Theory game folder.".to_string();
+            self.clear_game_root("Please select or enter the Chaos Theory game folder.".to_string());
             return;
         }
 
@@ -427,11 +593,10 @@ impl PatcherApp {
                 self.set_game_root(valid);
             }
         } else {
-            self.resolved_root = None;
-            self.installed_version = None;
-            self.detection_msg =
+            self.clear_game_root(
                 "System/splintercell3.exe not found in this folder. Please verify the path."
-                    .to_string();
+                    .to_string(),
+            );
         }
     }
 
@@ -453,6 +618,46 @@ impl PatcherApp {
         }
     }
 
+    fn build_launch_runtime_options(&self) -> crate::launcher::LaunchRuntimeOptions {
+        crate::launcher::LaunchRuntimeOptions {
+            auto_resync: self.auto_resync,
+            install_trace_hooks: self.patch_flags.runtime_startup_trace_hooks,
+            monitor_desync_dump: self.patch_flags.runtime_desync_monitor_dump,
+            inject_lan_net_globals: self.patch_flags.net_multi_nic_adapter_fix,
+            inject_nat_direct_target: self.patch_flags.net_nat_and_direct_ip,
+            enable_persistent_quicksave_load: self.patch_flags.runtime_quicksave_persistence,
+        }
+    }
+
+    fn flush_quicksaves_on_game_exit(&mut self) {
+        if !self.patch_flags.runtime_quicksave_persistence {
+            return;
+        }
+        let result = if let Some(ref handle) = self.persistent_quick_saves {
+            handle.flush()
+        } else if let Some(ref root) = self.resolved_root {
+            crate::quicksave_persistence::snapshot_quick_saves_for_persistence(root)
+        } else {
+            return;
+        };
+        match result {
+            Ok(report) if report.backed_up_count > 0 => {
+                self.log_lines.push(format!(
+                    ">>> [QUICKSAVE] Backed up {} co-op quick save(s) to {}.",
+                    report.backed_up_count,
+                    report.backup_dir.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.log_lines.push(format!(
+                    ">>> [QUICKSAVE] Final backup on exit failed: {:#}",
+                    error
+                ));
+            }
+        }
+    }
+
     fn stop_persistent_quick_saves(&mut self) {
         if let Some(mut quicksaves) = self.persistent_quick_saves.take() {
             quicksaves.stop();
@@ -460,11 +665,244 @@ impl PatcherApp {
     }
 
     fn restore_quick_saves_before_launch(&mut self, game_root: &Path) {
-        if let Err(error) = crate::quicksave_persistence::restore_latest_quick_saves(game_root) {
+        if !self.patch_flags.runtime_quicksave_persistence {
+            return;
+        }
+        self.sync_quicksave_worker();
+        match crate::quicksave_persistence::restore_latest_quick_saves(game_root) {
+            Ok(report) => {
+                if report.backed_up_count > 0 {
+                    self.log_lines.push(format!(
+                        ">>> [QUICKSAVE] Preserved {} newer live quick save(s) into {}.",
+                        report.backed_up_count,
+                        report.backup_dir.display()
+                    ));
+                }
+                if report.restored_count > 0 {
+                    self.log_lines.push(format!(
+                        ">>> [QUICKSAVE] Restored {} previous co-op quick save(s) to {}.",
+                        report.restored_count,
+                        report.profile_dir.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                self.log_lines.push(format!(
+                    ">>> [QUICKSAVE] Could not restore previous co-op quick saves: {:#}",
+                    error
+                ));
+            }
+        }
+    }
+
+    fn apply_patch_flags_background(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.resolved_root.clone() else {
+            return;
+        };
+        if self.applying_flags
+            || self.state == InstallState::Installing
+            || self.state == InstallState::Uninstalling
+        {
+            return;
+        }
+        self.applying_flags = true;
+        let flags = self.patch_flags;
+        let tx = self.sender.clone();
+        let tx_status = self.sender.clone();
+        let ctx_clone = ctx.clone();
+        let ctx_finish = ctx.clone();
+
+        crate::patcher::set_log_sink(move |msg| {
+            let _ = tx.send(GuiEvent::Log(msg.to_string()));
+            ctx_clone.request_repaint();
+        });
+
+        thread::spawn(move || {
+            let res = crate::patcher::sync_mod_flags(&root, &flags, None);
+            match res {
+                Ok(()) => {
+                    let _ = tx_status.send(GuiEvent::Log(format!(
+                        ">>> [PATCHES] Applied to game files: {}",
+                        flags.summary_line()
+                    )));
+                    let _ = tx_status.send(GuiEvent::FlagsApplyDone {
+                        ok: true,
+                        applied: Some(flags),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx_status.send(GuiEvent::Log(format!(
+                        ">>> [PATCHES ERROR] Could not apply flags (make sure Chaos Theory is closed): {:#}",
+                        e
+                    )));
+                    let _ = tx_status.send(GuiEvent::FlagsApplyDone {
+                        ok: false,
+                        applied: None,
+                    });
+                }
+            }
+            crate::patcher::clear_log_sink();
+            ctx_finish.request_repaint();
+        });
+    }
+
+    fn prepare_mod_flags_before_launch(
+        &mut self,
+        game_root: &Path,
+        direct_target: Option<(Ipv4Addr, u16, u16)>,
+    ) -> bool {
+        if let Err(e) = crate::patcher::sync_mod_flags(game_root, &self.patch_flags, direct_target) {
             self.log_lines.push(format!(
-                ">>> [QUICKSAVE] Could not restore previous co-op quick saves: {:#}",
-                error
+                ">>> [LAUNCH ERROR] Could not sync mod flags before launch (make sure Chaos Theory is closed first): {:#}",
+                e
             ));
+            return false;
+        }
+        self.applied_flags = Some(self.patch_flags);
+        self.log_lines.push(format!(
+            ">>> [PATCHES] Active for launch: {}",
+            self.patch_flags.summary_line()
+        ));
+        true
+    }
+
+    fn render_debug_patch_toggles(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut qs_toggled = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button(RichText::new("All Standard ON (26/28)").size(11.0))
+                .on_hover_text(
+                    "Enables all 26 standard Co-op Mod features (keeps Checksum Disconnect Bypass and execAddPlayerInZones AI Zone Wake OFF)",
+                )
+                .clicked()
+            {
+                self.patch_flags = crate::patcher::ModFlags::standard_coop();
+                qs_toggled = true;
+            }
+            if ui
+                .button(RichText::new("Min Sync (Net + #4/#6 + Diag)").size(11.0))
+                .on_hover_text(
+                    "Enables ONLY Multi-NIC/NAT networking, #4 AI Vis Cull, #6 Controller Checksum, and Trace/Desync Diagnostics",
+                )
+                .clicked()
+            {
+                self.patch_flags = crate::patcher::ModFlags::minimal_coop_sync();
+                qs_toggled = true;
+            }
+            if ui
+                .button(RichText::new("Net Only (2/28)").size(11.0))
+                .on_hover_text(
+                    "Enables ONLY Multi-NIC LAN & Direct-IP NAT hooks; reverts all gameplay, menu, UMD, MapRotation, and UPK changes to vanilla",
+                )
+                .clicked()
+            {
+                self.patch_flags = crate::patcher::ModFlags::net_only();
+                qs_toggled = true;
+            }
+            if ui
+                .button(RichText::new("All OFF (100% Vanilla)").size(11.0))
+                .on_hover_text(
+                    "Disables ALL 28 mod flags: restores vanilla EXE, Echelon.u, dynamic-pc.umd, MapRotation.ini, removes *_COOP.* maps, and skips all runtime hooks",
+                )
+                .clicked()
+            {
+                self.patch_flags = crate::patcher::ModFlags::all_disabled();
+                qs_toggled = true;
+            }
+        });
+
+        ui.add_space(4.0);
+        let is_busy = self.applying_flags
+            || self.state == InstallState::Installing
+            || self.state == InstallState::Uninstalling;
+        let has_pending = self.resolved_root.is_some()
+            && self.applied_flags.as_ref() != Some(&self.patch_flags);
+        let can_apply = self.resolved_root.is_some() && !is_busy;
+
+        ui.horizontal_wrapped(|ui| {
+            let apply_label = if self.applying_flags {
+                "⏳ Applying Flags..."
+            } else {
+                "💾 Apply Flags to Disk"
+            };
+            let mut apply_btn = egui::Button::new(
+                RichText::new(apply_label)
+                    .size(11.5)
+                    .strong()
+                    .color(if can_apply { Color32::WHITE } else { Color32::from_rgb(160, 160, 160) }),
+            );
+            if has_pending && can_apply {
+                apply_btn = apply_btn.fill(Color32::from_rgb(185, 115, 25));
+            } else if can_apply {
+                apply_btn = apply_btn.fill(Color32::from_rgb(45, 95, 145));
+            }
+            if ui
+                .add_enabled(can_apply, apply_btn)
+                .on_hover_text(
+                    "Applies all checkbox changes to disk incrementally in the background (also runs automatically before Launch)",
+                )
+                .clicked()
+            {
+                self.apply_patch_flags_background(ctx);
+            }
+
+            if self.applying_flags {
+                ui.label(
+                    RichText::new("Syncing disk changes (UMD/UPK updates run off the UI thread)...")
+                        .size(11.0)
+                        .color(Color32::from_rgb(140, 210, 255)),
+                );
+            } else if has_pending {
+                ui.label(
+                    RichText::new("● Pending changes (click Apply or Launch)")
+                        .size(11.0)
+                        .color(Color32::from_rgb(255, 200, 100)),
+                );
+            } else if self.applied_flags.is_some() {
+                ui.label(
+                    RichText::new("✔ Disk matches selected flags")
+                        .size(11.0)
+                        .color(Color32::from_rgb(110, 220, 130)),
+                );
+            }
+        });
+
+        ui.add_space(4.0);
+        for (g_idx, group) in crate::patcher::FlagGroup::ALL.iter().copied().enumerate() {
+            let group_descs: Vec<&crate::patcher::FlagDescriptor> = crate::patcher::FLAG_DESCRIPTORS
+                .iter()
+                .filter(|d| d.group == group)
+                .collect();
+            let on_count = group_descs
+                .iter()
+                .filter(|d| (d.get)(&self.patch_flags))
+                .count();
+            let header_title = format!("{} ({}/{})", group.label(), on_count, group_descs.len());
+            egui::CollapsingHeader::new(RichText::new(header_title).size(11.5).strong())
+                .id_salt(format!("flag_group_{}", g_idx))
+                .default_open(g_idx == 0 || g_idx == 2 || g_idx == 4)
+                .show(ui, |ui| {
+                    for d in &group_descs {
+                        let label_text = if d.requires_heavy_rebuild {
+                            RichText::new(format!("{} [UMD/UPK]", d.label))
+                                .size(11.0)
+                                .color(Color32::from_rgb(225, 210, 160))
+                        } else {
+                            RichText::new(d.label).size(11.0)
+                        };
+                        let mut val = (d.get)(&self.patch_flags);
+                        if ui.checkbox(&mut val, label_text).on_hover_text(d.tooltip).changed() {
+                            *(d.get_mut)(&mut self.patch_flags) = val;
+                            if d.short_name == "quicksave_persist" {
+                                qs_toggled = true;
+                            }
+                        }
+                    }
+                });
+        }
+
+        if qs_toggled {
+            self.sync_quicksave_worker();
         }
     }
 
@@ -611,36 +1049,31 @@ impl PatcherApp {
 
         self.stop_keepalive();
 
-        let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
-        if let Err(e) = crate::net::update_direct_target_in_exe(
-            &exe_path,
-            &exe_bak_path,
-            Some(peer_ip),
-            peer_disco_port,
-            peer_game_port,
-        ) {
-            self.log_lines.push(format!(
-                ">>> [LAUNCH ERROR] Could not prepare game executable (make sure Chaos Theory is closed first): {:#}",
-                e
-            ));
+        if !self.prepare_mod_flags_before_launch(&root, Some((peer_ip, peer_disco_port, peer_game_port)))
+        {
             ctx.request_repaint();
             return;
         }
 
-        if let Err(e) = crate::flags::sync_all_flags(&root, &self.flags) {
-            self.log_lines
-                .push(format!(">>> [WARNING] Could not sync patch flags: {:#}", e));
-        }
-
         self.restore_quick_saves_before_launch(&root);
 
+        let peer_role = if is_host {
+            crate::trace::PeerRole::Host
+        } else {
+            crate::trace::PeerRole::Guest
+        };
+        let launch_opts = self.build_launch_runtime_options();
         match crate::launcher::launch_game(
             &exe_path,
             &root,
-            Some(peer_ip),
-            peer_disco_port,
-            peer_game_port,
+            peer_role,
+            Some(crate::launcher::DirectPeerTarget {
+                ip: peer_ip,
+                disco_port: peer_disco_port,
+                game_port: peer_game_port,
+            }),
             self.selected_bind_ip,
+            launch_opts,
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
@@ -698,30 +1131,21 @@ impl PatcherApp {
 
         self.stop_keepalive();
 
-        let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
-        if let Err(e) = crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None) {
-            self.log_lines.push(format!(
-                ">>> [LAUNCH ERROR] Could not prepare game executable (make sure Chaos Theory is closed first): {:#}",
-                e
-            ));
+        if !self.prepare_mod_flags_before_launch(&root, None) {
             ctx.request_repaint();
             return;
         }
 
-        if let Err(e) = crate::flags::sync_all_flags(&root, &self.flags) {
-            self.log_lines
-                .push(format!(">>> [WARNING] Could not sync patch flags: {:#}", e));
-        }
-
         self.restore_quick_saves_before_launch(&root);
 
+        let launch_opts = self.build_launch_runtime_options();
         match crate::launcher::launch_game(
             &exe_path,
             &root,
+            crate::trace::PeerRole::LanOrDirect,
             None,
-            crate::net::DISCOVERY_PORT,
-            crate::net::GAME_PORT,
             self.selected_bind_ip,
+            launch_opts,
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
@@ -755,37 +1179,21 @@ impl eframe::App for PatcherApp {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 GuiEvent::Log(msg) => self.log_lines.push(msg),
-                GuiEvent::InstallDone(ok) => {
-                    self.state = if ok {
-                        InstallState::Success
-                    } else {
-                        InstallState::Failed
-                    };
-                    if ok && let Some(ref root) = self.resolved_root {
-                        self.installed_version = crate::patcher::get_installed_version(root);
-                        self.flags = crate::flags::load_flag_states(root);
-                        self.detection_msg = format!(
-                            "Game detected: {} (Co-op Mod v{} installed)",
-                            root.display(),
-                            self.installed_version
-                                .as_deref()
-                                .unwrap_or(crate::patcher::MOD_VERSION)
-                        );
-                    }
+                GuiEvent::InstallDone { root, ok } => {
+                    self.handle_install_done(&root, ok);
                 }
-                GuiEvent::UninstallDone(ok) => {
-                    self.state = if ok {
-                        InstallState::Success
-                    } else {
-                        InstallState::Failed
-                    };
+                GuiEvent::UninstallDone { root, ok } => {
+                    self.handle_uninstall_done(&root, ok);
+                }
+                GuiEvent::FlagsApplyDone { ok, applied } => {
+                    self.applying_flags = false;
                     if ok {
-                        self.installed_version = None;
-                        if let Some(ref root) = self.resolved_root {
-                            self.flags = crate::flags::load_flag_states(root);
-                            self.detection_msg =
-                                format!("Game detected: {} (Vanilla)", root.display());
+                        if let Some(root) = self.resolved_root.clone() {
+                            self.update_flags_from_disk(&root, applied, false);
+                        } else if let Some(flags) = applied {
+                            self.applied_flags = Some(flags);
                         }
+                        self.sync_quicksave_worker();
                     }
                 }
                 GuiEvent::FriendCodeRegistered(code) => {
@@ -860,6 +1268,7 @@ impl eframe::App for PatcherApp {
                         ">>> Splinter Cell Chaos Theory (PID: {}) has exited.",
                         pid
                     ));
+                    self.flush_quicksaves_on_game_exit();
                     if let MatchState::Matched { ref code, .. } = self.match_state {
                         let code_clone = code.clone();
                         let host = self.server_host.clone();
@@ -883,7 +1292,7 @@ impl eframe::App for PatcherApp {
                             .push(">>> Session closed because game was exited.".to_string());
                     }
                 }
-                GuiEvent::DesyncDetected(path) => {
+                GuiEvent::DesyncDetected(report) => {
                     self.log_lines.push(
                         "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
                             .to_string(),
@@ -893,11 +1302,21 @@ impl eframe::App for PatcherApp {
                             .to_string(),
                     );
                     self.log_lines.push(format!(
-                        ">>> [DESYNC DUMP] Diagnostic actor dump saved to: {}",
-                        path.display()
+                        ">>> [MISMATCH SLOTS] {}",
+                        report.mismatched_slots
                     ));
+                    self.log_lines.push(format!(
+                        ">>> [DESYNC DUMP] Diagnostic actor dump saved to: {}",
+                        report.dump_path.display()
+                    ));
+                    if let Some(ref trace_path) = report.trace_path {
+                        self.log_lines.push(format!(
+                            ">>> [STARTUP TRACE] Startup tick/checksum trace saved to: {}",
+                            trace_path.display()
+                        ));
+                    }
                     self.log_lines.push(
-                        ">>> Compare this file with your co-op partner's dump file to find the desynced actor."
+                        ">>> Compare BOTH scct_desync_dump and scct_startup_trace from BOTH peers (Host and Guest)."
                             .to_string(),
                     );
                     self.log_lines.push(
@@ -964,10 +1383,10 @@ impl eframe::App for PatcherApp {
                                 self.set_game_root(valid);
                             } else {
                                 self.game_dir_input = folder.display().to_string();
-                                self.resolved_root = None;
-                                self.detection_msg =
+                                self.clear_game_root(
                                     "System/splintercell3.exe not found in selected folder."
-                                        .to_string();
+                                        .to_string(),
+                                );
                             }
                         }
                     }
@@ -1029,7 +1448,9 @@ impl eframe::App for PatcherApp {
             // =================================================================
             // Main Action Buttons ("Install Mod" / "Reinstall" + "Uninstall")
             // =================================================================
-            let is_busy = self.state == InstallState::Installing || self.state == InstallState::Uninstalling;
+            let is_busy = self.applying_flags
+                || self.state == InstallState::Installing
+                || self.state == InstallState::Uninstalling;
             let can_click = !is_busy && self.resolved_root.is_some();
 
             if let Some(ref ver) = self.installed_version {
@@ -1083,6 +1504,18 @@ impl eframe::App for PatcherApp {
                         self.available_local_ips = crate::ip::get_all_local_ips();
                     }
                 });
+                if self.dev_mode {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(
+                            &mut self.auto_resync,
+                            RichText::new("⚡ Auto-Resync on Desync (Experimental)").size(11.5),
+                        )
+                        .on_hover_text(
+                            "Stage 1 in-memory Host -> Client state resync when a lockstep checksum mismatch occurs (prevents desync disconnects without reloading)",
+                        );
+                    });
+                }
                 ui.add_space(4.0);
 
                 let mut action_launch_direct = false;
@@ -1118,36 +1551,10 @@ impl eframe::App for PatcherApp {
                     .min_size(Vec2::new(cols[1].available_width(), 36.0));
 
                     if cols[1].add_enabled(can_click, btn_reinstall).clicked() {
-                        self.state = InstallState::Installing;
-                        self.log_lines.clear();
-
-                        let tx = self.sender.clone();
-                        let tx_status = self.sender.clone();
-                        let ctx_clone = ctx.clone();
-                        let root = self.resolved_root.clone().unwrap();
-                        let flags = self.flags.clone();
-
-                        crate::patcher::set_log_sink(move |msg| {
-                            let _ = tx.send(GuiEvent::Log(msg.to_string()));
-                            ctx_clone.request_repaint();
-                        });
-
-                        let ctx_finish = ctx.clone();
-                        thread::spawn(move || {
-                            let res = crate::patcher::apply_all(&root, false, &flags);
-                            match res {
-                                Ok(_) => {
-                                    let _ = tx_status.send(GuiEvent::Log("\n>>> Reinstallation complete! All coop missions and network fixes re-applied.".to_string()));
-                                    let _ = tx_status.send(GuiEvent::InstallDone(true));
-                                }
-                                Err(e) => {
-                                    let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
-                                    let _ = tx_status.send(GuiEvent::InstallDone(false));
-                                }
-                            }
-                            crate::patcher::clear_log_sink();
-                            ctx_finish.request_repaint();
-                        });
+                        self.start_install_task(
+                            ctx,
+                            "\n>>> Reinstallation complete! All coop missions and network fixes re-applied.",
+                        );
                     }
 
                     // Uninstall Button
@@ -1186,11 +1593,11 @@ impl eframe::App for PatcherApp {
                             match res {
                                 Ok(_) => {
                                     let _ = tx_status.send(GuiEvent::Log("\n>>> Uninstallation complete! Restored 100% vanilla game files.".to_string()));
-                                    let _ = tx_status.send(GuiEvent::UninstallDone(true));
+                                    let _ = tx_status.send(GuiEvent::UninstallDone { root, ok: true });
                                 }
                                 Err(e) => {
                                     let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
-                                    let _ = tx_status.send(GuiEvent::UninstallDone(false));
+                                    let _ = tx_status.send(GuiEvent::UninstallDone { root, ok: false });
                                 }
                             }
                             crate::patcher::clear_log_sink();
@@ -1213,13 +1620,7 @@ impl eframe::App for PatcherApp {
                 });
                 ui.add_space(4.0);
 
-                let button_text = match self.state {
-                    InstallState::Idle => "🎮 Install Mod",
-                    InstallState::Installing => "Installing Mod... (Please wait)",
-                    InstallState::Uninstalling => "Uninstalling Mod... (Please wait)",
-                    InstallState::Success => "✔ Mod Installed Successfully",
-                    InstallState::Failed => "❌ Installation Failed (Click to Retry)",
-                };
+                let button_text = install_button_label(&self.state);
 
                 let btn = egui::Button::new(
                     RichText::new(button_text).size(15.0).strong().color(
@@ -1233,111 +1634,11 @@ impl eframe::App for PatcherApp {
                 .min_size(Vec2::new(ui.available_width(), 36.0));
 
                 if ui.add_enabled(can_click, btn).clicked() {
-                    self.state = InstallState::Installing;
-                    self.log_lines.clear();
-
-                    let tx = self.sender.clone();
-                    let tx_status = self.sender.clone();
-                    let ctx_clone = ctx.clone();
-                    let root = self.resolved_root.clone().unwrap();
-                    let flags = self.flags.clone();
-
-                    crate::patcher::set_log_sink(move |msg| {
-                        let _ = tx.send(GuiEvent::Log(msg.to_string()));
-                        ctx_clone.request_repaint();
-                    });
-
-                    let ctx_finish = ctx.clone();
-                    thread::spawn(move || {
-                        let res = crate::patcher::apply_all(&root, false, &flags);
-                        match res {
-                            Ok(_) => {
-                                let _ = tx_status.send(GuiEvent::Log("\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.".to_string()));
-                                let _ = tx_status.send(GuiEvent::InstallDone(true));
-                            }
-                            Err(e) => {
-                                let _ = tx_status.send(GuiEvent::Log(format!("\n>>> ERROR: {:#}", e)));
-                                let _ = tx_status.send(GuiEvent::InstallDone(false));
-                            }
-                        }
-                        crate::patcher::clear_log_sink();
-                        ctx_finish.request_repaint();
-                    });
+                    self.start_install_task(
+                        ctx,
+                        "\n>>> Installation complete! You can now use the Friend Code section below to play online with friends.",
+                    );
                 }
-            }
-
-            // Optional Patch Flags & Gameplay Tweaks (List of Checkboxes)
-            if self.resolved_root.is_some() && !self.flags.is_empty() {
-                ui.add_space(8.0);
-                egui::Frame::NONE
-                    .fill(Color32::from_rgb(26, 30, 38))
-                    .inner_margin(8.0)
-                    .corner_radius(4.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Optional Patch Flags")
-                                    .strong()
-                                    .size(12.5)
-                                    .color(Color32::from_rgb(220, 225, 235)),
-                            );
-                            ui.label(
-                                RichText::new("(Optional patches for splintercell3.exe and map UPKs)")
-                                    .size(11.0)
-                                    .color(Color32::from_rgb(140, 145, 155)),
-                            );
-                        });
-                        ui.add_space(4.0);
-
-                        let mut toggle_action: Option<(usize, bool)> = None;
-                        for (idx, flag) in self.flags.iter_mut().enumerate() {
-                            ui.horizontal(|ui| {
-                                let mut checked = flag.enabled;
-                                let cb = egui::Checkbox::new(
-                                    &mut checked,
-                                    RichText::new(flag.def.name).size(12.0),
-                                );
-                                let resp = ui.add_enabled(can_click, cb);
-                                if flag.def.experimental {
-                                    ui.colored_label(
-                                        Color32::from_rgb(255, 160, 80),
-                                        "⚠️ EXPERIMENTAL",
-                                    );
-                                }
-                                if resp.changed() {
-                                    toggle_action = Some((idx, checked));
-                                }
-                            });
-                            ui.indent(flag.def.id, |ui| {
-                                ui.label(
-                                    RichText::new(flag.def.description)
-                                        .size(10.5)
-                                        .color(Color32::from_rgb(150, 155, 165)),
-                                );
-                            });
-                            ui.add_space(2.0);
-                        }
-
-                        if let Some((idx, new_val)) = toggle_action {
-                            self.flags[idx].enabled = new_val;
-                            if let Some(ref root) = self.resolved_root.clone() {
-                                if self.installed_version.is_some() {
-                                    let flag_id = self.flags[idx].def.id;
-                                    let flag_name = self.flags[idx].def.name;
-                                    match crate::flags::set_flag_applied(&root, flag_id, new_val) {
-                                        Ok(()) => {
-                                            let act = if new_val { "Enabled" } else { "Disabled" };
-                                            self.log_lines.push(format!(">>> [FLAG] {} {}", act, flag_name));
-                                        }
-                                        Err(e) => {
-                                            self.flags[idx].enabled = !new_val;
-                                            self.log_lines.push(format!(">>> [ERROR] Failed to toggle flag {}: {:#}", flag_name, e));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
             }
 
             ui.add_space(6.0);
@@ -1694,6 +1995,29 @@ impl eframe::App for PatcherApp {
 
             ui.add_space(6.0);
 
+            if self.dev_mode {
+                // =================================================================
+                // Mod Feature & Debug Flags (28 Toggles across 6 Groups)
+                // =================================================================
+                let debug_frame = egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgb(20, 24, 30))
+                    .inner_margin(8.0);
+                debug_frame.show(ui, |ui| {
+                    let flags_title = format!(
+                        "🧪 Mod Feature & Debug Flags ({})",
+                        self.patch_flags.summary_line()
+                    );
+                    egui::CollapsingHeader::new(RichText::new(flags_title).size(13.0).strong())
+                        .id_salt("mod_feature_flags_header")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            self.render_debug_patch_toggles(ui, ctx);
+                        });
+                });
+
+                ui.add_space(6.0);
+            }
+
             // =================================================================
             // Output Log Console
             // =================================================================
@@ -1732,10 +2056,14 @@ impl eframe::App for PatcherApp {
                                     Color32::from_rgb(255, 100, 100)
                                 } else if line.contains("[COOP]") {
                                     Color32::from_rgb(230, 230, 130)
+                                } else if line.contains("[RESYNC]") {
+                                    Color32::from_rgb(130, 240, 200)
                                 } else if line.contains("[NET]")
                                     || line.contains("[HOST]")
                                     || line.contains("[JOIN]")
                                     || line.contains("[P2P]")
+                                    || line.contains("[PATCHES]")
+                                    || line.contains("[FLAGS]")
                                 {
                                     Color32::from_rgb(140, 210, 255)
                                 } else {
@@ -2139,52 +2467,100 @@ fn spawn_game_monitor(
     root_clone: PathBuf,
 ) {
     let pid = game_proc.pid;
+    let role_str = game_proc.peer_role.as_str();
+    let resync_active = game_proc.resync_coord.is_some();
     thread::spawn(move || {
         let mut desync_dumped = false;
         let mut trace_notified = false;
-        while game_proc.is_alive() {
-            if let Some(trace_path) = game_proc.poll_startup_trace(&root_clone) {
-                if !trace_notified {
-                    trace_notified = true;
-                    let _ = tx.send(GuiEvent::Log(format!(
-                        ">>> [TRACE] Recording startup sync/tick trace to: {}",
-                        trace_path.display()
-                    )));
-                    ctx_clone.request_repaint();
-                }
+        loop {
+            let alive = game_proc.is_alive();
+            let poll =
+                game_proc.poll_monitor_once(&root_clone, &mut desync_dumped, &mut trace_notified);
+            if let Some(trace_path) = poll.trace_started {
+                let _ = tx.send(GuiEvent::Log(format!(
+                    ">>> [TRACE] Recording startup sync/tick trace ({}) to: {}",
+                    role_str,
+                    trace_path.display()
+                )));
+                ctx_clone.request_repaint();
             }
-            if !desync_dumped && game_proc.is_desync_flagged() {
-                desync_dumped = true;
-                let _ = game_proc.poll_startup_trace(&root_clone);
-                match game_proc.dump_desync_state(&root_clone) {
-                    Ok(dump_path) => {
-                        let _ = tx.send(GuiEvent::DesyncDetected(dump_path));
-                        ctx_clone.request_repaint();
+            if !poll.resync_logs.is_empty() {
+                for line in poll.resync_logs {
+                    let _ = tx.send(GuiEvent::Log(format!(">>> {}", line)));
+                }
+                ctx_clone.request_repaint();
+            }
+            if let Some(desync_res) = poll.desync {
+                match desync_res {
+                    Ok(report) => {
+                        let _ = tx.send(GuiEvent::DesyncDetected(report));
                     }
                     Err(e) => {
                         let _ = tx.send(GuiEvent::DesyncDumpFailed(format!("{:#}", e)));
-                        ctx_clone.request_repaint();
                     }
                 }
+                ctx_clone.request_repaint();
             }
-            thread::sleep(std::time::Duration::from_millis(100));
+            if !alive {
+                break;
+            }
+            let sleep_ms = if resync_active { 10 } else { 100 };
+            thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
-        let _ = game_proc.poll_startup_trace(&root_clone);
         game_proc.wait_for_exit();
         let _ = tx.send(GuiEvent::GameExited(pid));
         ctx_clone.request_repaint();
     });
 }
 
+/// Centers a rectangular RGBA icon inside a square buffer using its border pixel so
+/// Windows taskbar/titlebar icon scaling does not squash non-square logos.
+fn pad_icon_to_square(icon: egui::IconData) -> egui::IconData {
+    let (w, h) = (icon.width as usize, icon.height as usize);
+    if w == 0 || h == 0 || w == h || icon.rgba.len() != w * h * 4 {
+        return icon;
+    }
+
+    let side = w.max(h);
+    let fill = [icon.rgba[0], icon.rgba[1], icon.rgba[2], icon.rgba[3]];
+    let mut padded = fill.repeat(side * side);
+
+    let x_off = (side - w) / 2;
+    let y_off = (side - h) / 2;
+    for (row, src_row) in icon.rgba.chunks_exact(w * 4).enumerate() {
+        let dst_start = ((y_off + row) * side + x_off) * 4;
+        padded[dst_start..dst_start + w * 4].copy_from_slice(src_row);
+    }
+
+    egui::IconData {
+        rgba: padded,
+        width: side as u32,
+        height: side as u32,
+    }
+}
+
+fn load_app_icon() -> Option<egui::IconData> {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../images/scct_ec_logo.png"))
+        .ok()
+        .map(pad_icon_to_square)
+}
+
 pub fn run_gui(
     explicit_dir: Option<PathBuf>,
     initial_bind_ip: Option<std::net::Ipv4Addr>,
+    initial_auto_resync: bool,
+    dev_mode: bool,
 ) -> eframe::Result {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([780.0, 800.0])
+        .with_min_inner_size([540.0, 480.0])
+        .with_title("SCCT Coop Mod Installer & Online Launcher");
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 680.0])
-            .with_min_inner_size([540.0, 480.0])
-            .with_title("SCCT Coop Mod Installer & Online Launcher"),
+        viewport,
         hardware_acceleration: eframe::HardwareAcceleration::Preferred,
         ..Default::default()
     };
@@ -2192,6 +2568,94 @@ pub fn run_gui(
     eframe::run_native(
         "SCCT Coop Mod Installer & Online Launcher",
         options,
-        Box::new(move |cc| Ok(Box::new(PatcherApp::new(cc, explicit_dir, initial_bind_ip)))),
+        Box::new(move |cc| {
+            Ok(Box::new(PatcherApp::new(
+                cc,
+                explicit_dir,
+                initial_bind_ip,
+                initial_auto_resync,
+                dev_mode,
+            )))
+        }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstallState, PatcherApp, install_button_label, load_app_icon};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn embedded_app_icon_loads_as_square_rgba() {
+        let icon = load_app_icon().expect("scct_ec_logo.png should decode");
+        assert!(icon.width > 0);
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+    }
+
+    fn make_fake_root(label: &str, with_version_file: bool) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "scct-gui-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        let sys = root.join("System");
+        std::fs::create_dir_all(&sys).unwrap();
+        std::fs::write(sys.join("splintercell3.exe"), b"MZ").unwrap();
+        if with_version_file {
+            crate::patcher::write_version_file(&root).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn uninstall_done_resets_state_to_idle_and_shows_install_button() {
+        let root = make_fake_root("uninstall", true);
+        let mut app = PatcherApp::init_state(Some(root.clone()), None, false, false, false);
+        assert!(app.installed_version.is_some());
+
+        app.state = InstallState::Uninstalling;
+        crate::patcher::remove_version_file(&root).unwrap();
+        app.handle_uninstall_done(&root, true);
+
+        assert_eq!(app.installed_version, None);
+        assert_eq!(app.state, InstallState::Idle);
+        assert_eq!(install_button_label(&app.state), "🎮 Install Mod");
+        assert!(!install_button_label(&app.state).contains("Installed Successfully"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn switching_game_root_and_stale_install_events_do_not_leave_stale_state() {
+        let installed_root = make_fake_root("installed", true);
+        let vanilla_root = make_fake_root("vanilla", false);
+
+        let mut app = PatcherApp::init_state(None, None, false, false, false);
+        app.set_game_root(installed_root.clone());
+        app.state = InstallState::Failed;
+
+        // Switching to another game root resets stale state cleanly.
+        app.set_game_root(vanilla_root.clone());
+        assert_eq!(app.state, InstallState::Idle);
+        assert_eq!(app.installed_version, None);
+
+        // Stale completion for the old root must not claim vanilla_root is installed.
+        app.state = InstallState::Installing;
+        app.handle_install_done(&installed_root, true);
+        assert_eq!(app.installed_version, None);
+        assert_eq!(app.state, InstallState::Idle);
+
+        // If ok=true yet version file is still absent on active root, do not report success.
+        app.handle_install_done(&vanilla_root, true);
+        assert_eq!(app.installed_version, None);
+        assert_eq!(app.state, InstallState::Failed);
+
+        std::fs::remove_dir_all(installed_root).unwrap();
+        std::fs::remove_dir_all(vanilla_root).unwrap();
+    }
 }

@@ -15,8 +15,63 @@ pub const VA_WARMUP_FLAG: usize = 0x111F55E0;
 pub const VA_GNAMES: usize = 0x1130DFC0;
 pub const VA_GNAMES_COUNT: usize = 0x1130DFC4;
 
+/// Decodes a NUL-terminated 8-bit ANSI (`FNameEntry::Name`) byte slice using SCCT's
+/// `appFromAnsi` zero-extension mapping (stopping at the first NUL byte).
+pub fn decode_ansi_cstr(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .copied()
+        .take_while(|&b| b != 0)
+        .map(char::from)
+        .collect()
+}
+
+pub struct DesyncReport {
+    pub dump_path: PathBuf,
+    pub trace_path: Option<PathBuf>,
+    pub mismatched_slots: String,
+}
+
+pub struct MonitorPollResult {
+    pub trace_started: Option<PathBuf>,
+    pub resync_logs: Vec<String>,
+    pub desync: Option<Result<DesyncReport>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectPeerTarget {
+    pub ip: Ipv4Addr,
+    pub disco_port: u16,
+    pub game_port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchRuntimeOptions {
+    pub auto_resync: bool,
+    pub install_trace_hooks: bool,
+    pub monitor_desync_dump: bool,
+    pub inject_lan_net_globals: bool,
+    pub inject_nat_direct_target: bool,
+    pub enable_persistent_quicksave_load: bool,
+}
+
+impl Default for LaunchRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            auto_resync: false,
+            install_trace_hooks: true,
+            monitor_desync_dump: true,
+            inject_lan_net_globals: true,
+            inject_nat_direct_target: true,
+            enable_persistent_quicksave_load: true,
+        }
+    }
+}
+
 pub struct GameProcess {
     pub pid: u32,
+    pub peer_role: crate::trace::PeerRole,
+    pub peer_ip: Option<Ipv4Addr>,
     #[cfg(windows)]
     handle_val: usize,
     #[cfg(not(windows))]
@@ -24,6 +79,113 @@ pub struct GameProcess {
     trace_buf_va: usize,
     trace_flushed_seq: u32,
     trace_prev_u0: Option<u32>,
+    trace_last_mismatch_total: u32,
+    trace_path: Option<PathBuf>,
+    dump_path: Option<PathBuf>,
+    trace_owner_marker: Option<PathBuf>,
+    monitor_desync_dump: bool,
+    pub(crate) resync_coord: Option<crate::resync::ResyncCoordinator>,
+    resync_aborted: bool,
+    pub(crate) last_resync_error: Option<String>,
+}
+
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code);
+            let _ = CloseHandle(h);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(&format!("/proc/{}", pid)).exists()
+    }
+}
+
+pub(crate) fn resolve_session_paths_with(
+    game_root: &Path,
+    role: crate::trace::PeerRole,
+    pid: u32,
+    pid_alive: impl Fn(u32) -> bool,
+) -> (PathBuf, PathBuf, Option<PathBuf>) {
+    const OWNER_PREFIX: &str = ".scct_trace_owner_";
+    let sys_dir = crate::patcher::find_child_ci(game_root, "System");
+    let mut conflict = false;
+
+    if let Ok(entries) = std::fs::read_dir(&sys_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name_str.strip_prefix(OWNER_PREFIX) else {
+                continue;
+            };
+            let Ok(other_pid) = rest.parse::<u32>() else {
+                continue;
+            };
+            if other_pid == pid {
+                continue;
+            }
+            if pid_alive(other_pid) {
+                conflict = true;
+            } else {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    if conflict {
+        let suffix = format!("{}_pid{}", role.file_tag(), pid);
+        (
+            crate::trace::session_file_path(game_root, "scct_startup_trace", "txt", Some(&suffix)),
+            crate::trace::session_file_path(game_root, "scct_desync_dump", "txt", Some(&suffix)),
+            None,
+        )
+    } else {
+        let marker = sys_dir.join(format!("{}{}", OWNER_PREFIX, pid));
+        let marker_opt = if std::fs::write(&marker, format!("{}\n", pid)).is_ok() {
+            Some(marker)
+        } else {
+            None
+        };
+        (
+            crate::trace::session_file_path(game_root, "scct_startup_trace", "txt", None),
+            crate::trace::session_file_path(game_root, "scct_desync_dump", "txt", None),
+            marker_opt,
+        )
+    }
+}
+
+impl Drop for GameProcess {
+    fn drop(&mut self) {
+        if let Some(marker) = self.trace_owner_marker.take() {
+            let _ = std::fs::remove_file(marker);
+        }
+        #[cfg(windows)]
+        if self.handle_val != 0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(
+                    self.handle_val as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+            self.handle_val = 0;
+        }
+    }
 }
 
 impl GameProcess {
@@ -65,10 +227,7 @@ impl GameProcess {
         }
         #[cfg(not(windows))]
         {
-            match self.child.try_wait() {
-                Ok(None) => true,
-                _ => false,
-            }
+            matches!(self.child.try_wait(), Ok(None))
         }
     }
 
@@ -103,6 +262,50 @@ impl GameProcess {
             }
             file.read_exact(out).is_ok()
         }
+    }
+
+    pub fn write_memory(&self, addr: usize, data: &[u8]) -> bool {
+        #[cfg(windows)]
+        {
+            if self.handle_val == 0 {
+                return false;
+            }
+            use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+            let mut bytes_written: usize = 0;
+            let res = unsafe {
+                WriteProcessMemory(
+                    self.handle_val as windows_sys::Win32::Foundation::HANDLE,
+                    addr as *mut _,
+                    data.as_ptr() as *const _,
+                    data.len(),
+                    &mut bytes_written,
+                )
+            };
+            res != 0 && bytes_written == data.len()
+        }
+        #[cfg(not(windows))]
+        {
+            use std::fs::OpenOptions;
+            use std::io::{Seek, SeekFrom, Write};
+            let Ok(mut file) = OpenOptions::new()
+                .write(true)
+                .open(format!("/proc/{}/mem", self.pid))
+            else {
+                return false;
+            };
+            if file.seek(SeekFrom::Start(addr as u64)).is_err() {
+                return false;
+            }
+            file.write_all(data).is_ok()
+        }
+    }
+
+    pub fn write_u32(&self, addr: usize, val: u32) -> bool {
+        self.write_memory(addr, &val.to_le_bytes())
+    }
+
+    pub fn trace_buf_va(&self) -> usize {
+        self.trace_buf_va
     }
 
     pub fn read_u8(&self, addr: usize) -> Option<u8> {
@@ -150,17 +353,35 @@ impl GameProcess {
         }
     }
 
-    #[allow(dead_code)]
     pub fn read_string(&self, addr: usize, max_len: usize) -> Option<String> {
-        let mut buf = vec![0u8; max_len];
-        if !self.read_memory(addr, &mut buf) {
-            return None;
+        if max_len == 0 {
+            return Some(String::new());
         }
-        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-        Some(String::from_utf8_lossy(&buf[..len]).to_string())
+        let mut buf = vec![0u8; max_len];
+        if self.read_memory(addr, &mut buf) {
+            return Some(decode_ansi_cstr(&buf));
+        }
+
+        // Fallback near page boundaries: read bytes one at a time.
+        let mut bytes = Vec::new();
+        for i in 0..max_len {
+            let Some(b) = self.read_u8(addr + i) else {
+                return if bytes.is_empty() {
+                    None
+                } else {
+                    Some(decode_ansi_cstr(&bytes))
+                };
+            };
+            if b == 0 {
+                return Some(decode_ansi_cstr(&bytes));
+            }
+            bytes.push(b);
+        }
+        Some(decode_ansi_cstr(&bytes))
     }
 
     /// Reads a null-terminated UTF-16LE string from target process memory.
+    #[allow(dead_code)]
     pub fn read_wstring(&self, addr: usize, max_chars: usize) -> Option<String> {
         if max_chars == 0 {
             return Some(String::new());
@@ -168,8 +389,11 @@ impl GameProcess {
         let mut buf = vec![0u8; max_chars * 2];
         if self.read_memory(addr, &mut buf) {
             let units: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .copied()
+                .map(u16::from_le_bytes)
                 .take_while(|&u| u != 0)
                 .collect();
             return Some(String::from_utf16_lossy(&units));
@@ -193,14 +417,14 @@ impl GameProcess {
         Some(String::from_utf16_lossy(&units))
     }
 
-    /// Resolves a UE2 `FName` index via `GNames` (`FNameEntry::Name` UTF-16LE at `+0x0C`).
+    /// Resolves a UE2 `FName` index via `GNames` (`FNameEntry::Name` ANSI string at `+0x0C`).
     pub fn resolve_fname(&self, gnames_ptr: u32, gnames_count: u32, name_idx: u32) -> String {
         if gnames_ptr != 0 && name_idx < gnames_count {
             let entry_ptr = self
                 .read_u32(gnames_ptr as usize + (name_idx as usize) * 4)
                 .unwrap_or(0);
             if entry_ptr != 0
-                && let Some(name) = self.read_wstring(entry_ptr as usize + 0x0C, 64)
+                && let Some(name) = self.read_string(entry_ptr as usize + 0x0C, 64)
                 && !name.is_empty()
             {
                 return name;
@@ -227,6 +451,33 @@ impl GameProcess {
         (loc, rot)
     }
 
+    fn ensure_session_paths(&mut self, game_root: &Path) -> (PathBuf, PathBuf) {
+        if let (Some(trace_path), Some(dump_path)) = (&self.trace_path, &self.dump_path) {
+            return (trace_path.clone(), dump_path.clone());
+        }
+        let (trace_path, dump_path, marker) =
+            resolve_session_paths_with(game_root, self.peer_role, self.pid, is_pid_alive);
+        self.trace_path = Some(trace_path.clone());
+        self.dump_path = Some(dump_path.clone());
+        self.trace_owner_marker = marker;
+        (trace_path, dump_path)
+    }
+
+    pub fn trace_output_path(&self) -> Option<&Path> {
+        self.trace_path.as_deref()
+    }
+
+    pub fn read_trace_mismatch_summary(&self) -> Option<crate::trace::TraceMismatchSummary> {
+        if self.trace_buf_va == 0 {
+            return None;
+        }
+        let mut hdr = [0u8; crate::trace::TRACE_HDR_SIZE];
+        if !self.read_memory(self.trace_buf_va + crate::trace::TRACE_HDR_OFF, &mut hdr) {
+            return None;
+        }
+        crate::trace::TraceMismatchSummary::from_header_bytes(&hdr)
+    }
+
     pub fn is_desync_flagged(&self) -> bool {
         if self.read_u8(CAVE_DESYNC_FLAG_VA).unwrap_or(0) != 0 {
             return true;
@@ -238,31 +489,11 @@ impl GameProcess {
                 return true;
             }
         }
-        false
+        self.read_trace_mismatch_summary()
+            .is_some_and(|s| s.seen_status6 || s.has_slot5_mismatch())
     }
 
-    pub fn dump_desync_state(&self, game_root: &Path) -> Result<PathBuf> {
-        let sys_dir = crate::patcher::find_child_ci(game_root, "System");
-        let dump_path = sys_dir.join("scct_desync_dump.txt");
-
-        let sync_engine_ptr = self.read_u32(VA_SYNC_ENGINE).unwrap_or(0);
-        let step = if sync_engine_ptr != 0 {
-            self.read_i32(sync_engine_ptr as usize + 0x5C).unwrap_or(-1)
-        } else {
-            -1
-        };
-        let status = if sync_engine_ptr != 0 {
-            self.read_i32(sync_engine_ptr as usize + 0x68).unwrap_or(-1)
-        } else {
-            -1
-        };
-        let user_checksum = self.read_u32(VA_USER_CHECKSUM_0).unwrap_or(0);
-        let warmup_flag = self.read_u32(VA_WARMUP_FLAG).unwrap_or(0);
-        let mismatch_count = self.read_u32(CAVE_DESYNC_COUNT_VA).unwrap_or(0);
-
-        let gnames_ptr = self.read_u32(VA_GNAMES).unwrap_or(0);
-        let gnames_count = self.read_u32(VA_GNAMES_COUNT).unwrap_or(0);
-
+    pub fn resolve_level_info(&self) -> (u32, u32, u32, u32, u32) {
         let gengine_ptr = self.read_u32(VA_GENGINE).unwrap_or(0);
         let glevel_direct = if gengine_ptr != 0 {
             self.read_u32(gengine_ptr as usize + 0x17C).unwrap_or(0)
@@ -299,6 +530,47 @@ impl GameProcess {
         } else {
             viewport_actor_level
         };
+        (
+            level_ptr,
+            gengine_ptr,
+            glevel_direct,
+            viewport_ptr,
+            viewport_actor_level,
+        )
+    }
+
+    pub fn resolve_level_ptr(&self) -> u32 {
+        self.resolve_level_info().0
+    }
+
+    pub fn dump_desync_state(&mut self, game_root: &Path) -> Result<PathBuf> {
+        let (trace_path, dump_path) = self.ensure_session_paths(game_root);
+        let trace_summary = self.read_trace_mismatch_summary();
+        let bypass_active = self
+            .read_u8(crate::net::HOOK_SITE_CHECK_SIM_CHECKSUM as usize)
+            .unwrap_or(0)
+            == 0xE9;
+
+        let sync_engine_ptr = self.read_u32(VA_SYNC_ENGINE).unwrap_or(0);
+        let step = if sync_engine_ptr != 0 {
+            self.read_i32(sync_engine_ptr as usize + 0x5C).unwrap_or(-1)
+        } else {
+            -1
+        };
+        let status = if sync_engine_ptr != 0 {
+            self.read_i32(sync_engine_ptr as usize + 0x68).unwrap_or(-1)
+        } else {
+            -1
+        };
+        let user_checksum = self.read_u32(VA_USER_CHECKSUM_0).unwrap_or(0);
+        let warmup_flag = self.read_u32(VA_WARMUP_FLAG).unwrap_or(0);
+        let mismatch_count = self.read_u32(CAVE_DESYNC_COUNT_VA).unwrap_or(0);
+
+        let gnames_ptr = self.read_u32(VA_GNAMES).unwrap_or(0);
+        let gnames_count = self.read_u32(VA_GNAMES_COUNT).unwrap_or(0);
+
+        let (level_ptr, gengine_ptr, glevel_direct, viewport_ptr, viewport_actor_level) =
+            self.resolve_level_info();
 
         let mut pawn_lines = Vec::new();
         let mut actor_lines = Vec::new();
@@ -340,7 +612,7 @@ impl GameProcess {
                 let vel_y = self.read_f32(actor_ptr as usize + 0x104).unwrap_or(0.0);
                 let vel_z = self.read_f32(actor_ptr as usize + 0x108).unwrap_or(0.0);
 
-                if (flags_2c & 0x20) != 0 {
+                if (flags_2c & 0x10) != 0 {
                     let ctrl_ptr = self.read_u32(actor_ptr as usize + 0x2B4).unwrap_or(0);
                     if (flags_28 & 0x04) == 0 && physics != 0 {
                         let pawn_loc_sum = (loc.2 as i32)
@@ -348,16 +620,17 @@ impl GameProcess {
                             .wrapping_add(loc.0 as i32);
                         let pawn_rot_sum = rot.1.wrapping_add(rot.2).wrapping_add(rot.0);
                         let (ctrl_loc, ctrl_rot) = self.read_actor_loc_rot(ctrl_ptr);
-                        let (ctrl_loc_sum, ctrl_rot_sum) = if ctrl_ptr != 0 {
-                            (
-                                (ctrl_loc.2 as i32)
-                                    .wrapping_add(ctrl_loc.1 as i32)
-                                    .wrapping_add(ctrl_loc.0 as i32),
-                                ctrl_rot.1.wrapping_add(ctrl_rot.2).wrapping_add(ctrl_rot.0),
-                            )
-                        } else {
-                            (0, 0)
-                        };
+                        let (ctrl_loc_sum, ctrl_rot_sum) =
+                            if ctrl_ptr != 0 && (flags_2c & 0x20) != 0 {
+                                (
+                                    (ctrl_loc.2 as i32)
+                                        .wrapping_add(ctrl_loc.1 as i32)
+                                        .wrapping_add(ctrl_loc.0 as i32),
+                                    ctrl_rot.1.wrapping_add(ctrl_rot.2).wrapping_add(ctrl_rot.0),
+                                )
+                            } else {
+                                (0, 0)
+                            };
                         let tick_delta = pawn_loc_sum
                             .wrapping_add(pawn_rot_sum)
                             .wrapping_add(ctrl_loc_sum)
@@ -408,12 +681,38 @@ impl GameProcess {
         }
 
         let mut lines = Vec::new();
+        let peer_str = self
+            .peer_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "none".to_string());
         lines.push("================================================================================".to_string());
         lines.push("            SCCT CO-OP ENHANCER - DESYNC DIAGNOSTIC STATE DUMP                 ".to_string());
         lines.push("================================================================================".to_string());
+        lines.push(format!(
+            "Peer Role / PID:        {} (PID: {}, Peer: {})",
+            self.peer_role.as_str(),
+            self.pid,
+            peer_str
+        ));
+        lines.push(format!("BypassFlagActive:       {}", bypass_active));
+        if let Some(ref err) = self.last_resync_error {
+            lines.push(format!("Resync Abort Reason:    {}", err));
+        }
         lines.push(format!("SyncEngine VA:          0x{:08X}", sync_engine_ptr));
         lines.push(format!("Simulation Step:        {}", step));
         lines.push(format!("Simulation Status:      {} (0x{:08X}) [MismatchCount: {}]", status, status, mismatch_count));
+        if let Some(ref summary) = trace_summary {
+            lines.extend(summary.format_summary_lines());
+            lines.push(format!(
+                "Startup Trace File:     {} (records={}, dropped={})",
+                trace_path.display(),
+                summary.write_idx,
+                summary.dropped_records
+            ));
+        } else {
+            lines.push("Mismatched Slots:       (startup trace header unavailable)".to_string());
+            lines.push(format!("Startup Trace File:     {}", trace_path.display()));
+        }
         lines.push(format!(
             "UserChecksum0:          0x{:08X} (ActivePawnTickDeltaSum: {} / 0x{:08X})",
             user_checksum, total_pawn_tick_delta, total_pawn_tick_delta as u32
@@ -477,9 +776,10 @@ impl GameProcess {
         lines.extend(actor_lines);
 
         lines.push("================================================================================".to_string());
-        lines.push("Instructions: Both players should compare this file using a diff tool (e.g. diff,".to_string());
-        lines.push("VS Code, Meld, WinMerge). Any actor with different Location, Rotation, Velocity,".to_string());
-        lines.push("or Flags indicates where the simulation diverged between Host and Guest.".to_string());
+        lines.push("Instructions: Collect BOTH scct_desync_dump and scct_startup_trace from BOTH".to_string());
+        lines.push("Host and Guest, then compare them (diff, VS Code, Meld, WinMerge).".to_string());
+        lines.push("Mismatched Slots identifies whether slot=0 (UserChecksum0/pawn sim) and/or".to_string());
+        lines.push("slot=5 (RNG/full sim) diverged; actor diffs pinpoint the desynced entity.".to_string());
         lines.push("================================================================================".to_string());
 
         let content = lines.join("\n");
@@ -489,58 +789,77 @@ impl GameProcess {
     }
 
     pub fn poll_startup_trace(&mut self, game_root: &Path) -> Option<PathBuf> {
-        if self.trace_buf_va == 0 {
-            return None;
-        }
-        let mut hdr = [0u8; 16];
-        if !self.read_memory(self.trace_buf_va + crate::trace::TRACE_HDR_OFF, &mut hdr) {
-            return None;
-        }
-        let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-        if magic != crate::trace::TRACE_MAGIC {
-            return None;
-        }
-        let write_idx = u32::from_le_bytes(hdr[4..8].try_into().unwrap())
+        let summary = self.read_trace_mismatch_summary()?;
+        let write_idx = summary
+            .write_idx
             .min(crate::trace::TRACE_MAX_RECORDS as u32);
-        if write_idx <= self.trace_flushed_seq {
+        let has_new_records = write_idx > self.trace_flushed_seq;
+        let mismatch_increased = summary.total_mismatches > self.trace_last_mismatch_total;
+        if !has_new_records && !mismatch_increased {
             return None;
         }
 
-        let start = self.trace_flushed_seq;
-        let to_read = (write_idx - start) as usize;
-        let mut raw = vec![0u8; to_read * crate::trace::TRACE_RECORD_SIZE];
-        let rec_va = self.trace_buf_va
-            + crate::trace::TRACE_RECORDS_OFF
-            + (start as usize) * crate::trace::TRACE_RECORD_SIZE;
-        if !self.read_memory(rec_va, &mut raw) {
-            return None;
-        }
-
-        let mut records = Vec::with_capacity(to_read);
-        for chunk in raw.chunks_exact(crate::trace::TRACE_RECORD_SIZE) {
-            let mut w = [0u32; 16];
-            for (i, slot) in w.iter_mut().enumerate() {
-                *slot = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+        let mut records = Vec::new();
+        if has_new_records {
+            let start = self.trace_flushed_seq;
+            let to_read = (write_idx - start) as usize;
+            let mut raw = vec![0u8; to_read * crate::trace::TRACE_RECORD_SIZE];
+            let rec_va = self.trace_buf_va
+                + crate::trace::TRACE_RECORDS_OFF
+                + (start as usize) * crate::trace::TRACE_RECORD_SIZE;
+            if !self.read_memory(rec_va, &mut raw) {
+                return None;
             }
-            if w[15] == 0 {
-                break; // Still being committed
+            records.reserve(to_read);
+            for chunk in raw.as_chunks::<{ crate::trace::TRACE_RECORD_SIZE }>().0 {
+                let mut w = [0u32; 16];
+                for (i, slot) in w.iter_mut().enumerate() {
+                    *slot = u32::from_le_bytes(chunk[i * 4..i * 4 + 4].try_into().unwrap());
+                }
+                if w[15] == 0 {
+                    break; // Still being committed
+                }
+                records.push(crate::trace::TraceRecord::from_words(&w));
             }
-            records.push(crate::trace::TraceRecord::from_words(&w));
-        }
-        if records.is_empty() {
-            return None;
         }
 
-        let trace_path = crate::trace::trace_file_path(game_root);
         let first_flush = self.trace_flushed_seq == 0;
-        let lines = crate::trace::format_trace_lines(&records, &mut self.trace_prev_u0);
+        if first_flush && records.is_empty() && !mismatch_increased {
+            return None;
+        }
+
+        let (trace_path, _) = self.ensure_session_paths(game_root);
+        let new_cmp_mismatches = records
+            .iter()
+            .filter(|r| r.kind == crate::trace::TraceKind::Cmp as u32 && r.arg_a != r.arg_b)
+            .count() as u32;
+        let mut lines = crate::trace::format_trace_lines(&records, &mut self.trace_prev_u0);
+
+        let should_append_latch = (first_flush && summary.total_mismatches > 0 && new_cmp_mismatches < summary.total_mismatches)
+            || (!first_flush
+                && mismatch_increased
+                && (summary.dropped_records > 0
+                    || write_idx >= crate::trace::TRACE_MAX_RECORDS as u32
+                    || new_cmp_mismatches == 0));
+        if should_append_latch {
+            for latch_line in summary.format_summary_lines() {
+                lines.push(format!("# [MISMATCH LATCH] {}", latch_line));
+            }
+        }
+
         self.trace_flushed_seq += records.len() as u32;
+        self.trace_last_mismatch_total = summary.total_mismatches;
 
         if first_flush {
             let bypass_byte = self
                 .read_u8(crate::net::HOOK_SITE_CHECK_SIM_CHECKSUM as usize)
                 .unwrap_or(0);
-            let mut all = crate::trace::trace_header_lines(self.pid, bypass_byte == 0xE9);
+            let mut all = crate::trace::trace_header_lines(
+                self.pid,
+                self.peer_role,
+                self.peer_ip,
+                bypass_byte == 0xE9,
+            );
             all.extend(lines);
             let mut text = all.join("\n");
             text.push('\n');
@@ -563,28 +882,74 @@ impl GameProcess {
         None
     }
 
+    pub fn poll_monitor_once(
+        &mut self,
+        game_root: &Path,
+        desync_dumped: &mut bool,
+        trace_notified: &mut bool,
+    ) -> MonitorPollResult {
+        let mut res = MonitorPollResult {
+            trace_started: None,
+            resync_logs: Vec::new(),
+            desync: None,
+        };
+        if self.resync_coord.is_some()
+            && crate::resync::poll_resync(self, &mut res.resync_logs)
+        {
+            self.resync_aborted = true;
+        }
+        if let Some(trace_path) = self.poll_startup_trace(game_root)
+            && !*trace_notified
+        {
+            *trace_notified = true;
+            res.trace_started = Some(trace_path);
+        }
+        let resync_active = self.resync_coord.is_some() && !self.resync_aborted;
+        if self.monitor_desync_dump && !*desync_dumped && !resync_active && self.is_desync_flagged()
+        {
+            *desync_dumped = true;
+            let _ = self.poll_startup_trace(game_root);
+            let mismatched_slots = self
+                .read_trace_mismatch_summary()
+                .map(|s| s.format_slot_list())
+                .unwrap_or_else(|| "unknown".to_string());
+            let trace_path = self.trace_output_path().map(Path::to_path_buf);
+            res.desync = Some(self.dump_desync_state(game_root).map(|dump_path| DesyncReport {
+                dump_path,
+                trace_path,
+                mismatched_slots,
+            }));
+        }
+        res
+    }
+
     pub fn wait_for_exit_monitoring_desync(mut self, game_root: &Path) {
         let mut desync_dumped = false;
         let mut trace_notified = false;
-        while self.is_alive() {
-            if let Some(trace_path) = self.poll_startup_trace(game_root) {
-                if !trace_notified {
-                    trace_notified = true;
-                    println!(
-                        "  >>> [TRACE] Recording startup sync/tick trace to: {}",
-                        trace_path.display()
-                    );
-                }
+        loop {
+            let alive = self.is_alive();
+            let poll = self.poll_monitor_once(game_root, &mut desync_dumped, &mut trace_notified);
+            if let Some(trace_path) = poll.trace_started {
+                println!(
+                    "  >>> [TRACE] Recording startup sync/tick trace ({}) to: {}",
+                    self.peer_role.as_str(),
+                    trace_path.display()
+                );
             }
-            if !desync_dumped && self.is_desync_flagged() {
-                desync_dumped = true;
-                let _ = self.poll_startup_trace(game_root);
-                match self.dump_desync_state(game_root) {
-                    Ok(dump_path) => {
+            for line in poll.resync_logs {
+                println!("  {}", line);
+            }
+            if let Some(desync_res) = poll.desync {
+                match desync_res {
+                    Ok(report) => {
                         println!("\n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
                         println!("  >>> [DESYNC DETECTED] Simulation lockstep mismatch detected!");
-                        println!("  >>> [DESYNC DUMP] Dumped actor states to: {}", dump_path.display());
-                        println!("  >>> Compare this file with your co-op partner's dump file to find the desynced actor.");
+                        println!("  >>> [MISMATCH SLOTS] {}", report.mismatched_slots);
+                        println!("  >>> [DESYNC DUMP]   Actor state:  {}", report.dump_path.display());
+                        if let Some(ref tp) = report.trace_path {
+                            println!("  >>> [STARTUP TRACE] Sync trace:   {}", tp.display());
+                        }
+                        println!("  >>> Collect BOTH files above from BOTH Host and Guest to compare.");
                         println!("  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
                     }
                     Err(e) => {
@@ -592,24 +957,13 @@ impl GameProcess {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let _ = self.poll_startup_trace(game_root);
-        self.wait_for_exit();
-    }
-}
-
-#[cfg(windows)]
-impl Drop for GameProcess {
-    fn drop(&mut self) {
-        if self.handle_val != 0 {
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(
-                    self.handle_val as windows_sys::Win32::Foundation::HANDLE,
-                );
+            if !alive {
+                break;
             }
-            self.handle_val = 0;
+            let sleep_ms = if self.resync_coord.is_some() { 10 } else { 100 };
+            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
+        self.wait_for_exit();
     }
 }
 
@@ -689,10 +1043,10 @@ unsafe fn write_proc_bytes(
 pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
-    peer_ip: Option<Ipv4Addr>,
-    peer_disco_port: u16,
-    peer_game_port: u16,
+    peer_role: crate::trace::PeerRole,
+    direct_peer: Option<DirectPeerTarget>,
     local_bind_ip: Option<Ipv4Addr>,
+    opts: LaunchRuntimeOptions,
 ) -> Result<GameProcess> {
     use std::ffi::CString;
     use std::ptr::null_mut;
@@ -735,74 +1089,94 @@ pub fn launch_game(
     let h_process = pi.hProcess;
     let h_thread = pi.hThread;
     let pid = pi.dwProcessId;
+    let peer_ip = direct_peer.map(|p| p.ip);
 
     let trace_buf_va = unsafe {
         let zero = 0u32.to_le_bytes();
 
-        // 1. Explicitly zero out inherited socket, keepalive tick, and desync flag locations in .data
-        write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9100, &zero, false);
-        write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9103, &zero, false);
-        write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9100, &zero, false);
-        write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9103, &zero, false);
-        write_proc_bytes(h_process, CAVE_LAST_9103_KEEPALIVE_VA, &zero, false);
-        write_proc_bytes(h_process, CAVE_LAST_9100_KEEPALIVE_VA, &zero, false);
-        write_proc_bytes(h_process, CAVE_DESYNC_FLAG_VA, &[0u8; 8], false);
-
-        // 2. Configure ONLINE_CAVE, JOIN_GAME_PORT_VA, and CAVE_LAN_PEER_VA
-        if let Some(ip) = peer_ip {
-            let disco_port = if peer_disco_port == 0 {
-                crate::net::DISCOVERY_PORT
-            } else {
-                peer_disco_port
-            };
-            let game_port = if peer_game_port == 0 {
-                crate::net::GAME_PORT
-            } else {
-                peer_game_port
-            };
-            let ip_bytes = ip.octets();
-            let disco_be = disco_port.to_be_bytes();
-            let game_le = (game_port as u32).to_le_bytes();
-
-            write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[1u8], true);
-            write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &ip_bytes, true);
-            write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &disco_be, true);
-            write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &game_le, true);
-
-            // Set CAVE_LAN_PEER_VA for route-matched NIC promotion in splintercell3.exe
-            // If peer_ip is a private address, only set it if our local host shares the subnet.
-            // Otherwise, keep it 0.0.0.0 so the probe defaults to 8.8.8.8 and selects the physical gateway.
-            let oct = ip.octets();
-            let is_private = oct[0] == 10
-                || (oct[0] == 172 && (16..=31).contains(&oct[1]))
-                || (oct[0] == 192 && oct[1] == 168);
-            let is_local_routable = !is_private || crate::ip::find_matching_subnet_ip(ip).is_some();
-            let probe_ip = if is_local_routable {
-                ip_bytes
-            } else {
-                [0u8; 4]
-            };
-
-            write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
-        } else {
-            let zero_ip = [0u8; 4];
-            let default_disco_be = crate::net::DISCOVERY_PORT.to_be_bytes();
-            let default_game_le = (crate::net::GAME_PORT as u32).to_le_bytes();
-
-            write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[0u8], true);
-            write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &zero_ip, true);
-            write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &default_disco_be, true);
-            write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
-            write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
+        if opts.install_trace_hooks || opts.auto_resync || opts.monitor_desync_dump {
+            write_proc_bytes(h_process, CAVE_DESYNC_FLAG_VA, &[0u8; 8], false);
         }
 
-        let bind_octets = local_bind_ip
-            .filter(|ip| !ip.is_unspecified())
-            .map(|ip| ip.octets())
-            .unwrap_or([0u8; 4]);
-        write_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &bind_octets, false);
+        // 1. Explicitly zero out inherited socket and keepalive tick locations in .data when LAN globals are enabled
+        if opts.inject_lan_net_globals {
+            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9100, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9103, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9100, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9103, &zero, false);
+            write_proc_bytes(h_process, CAVE_LAST_9103_KEEPALIVE_VA, &zero, false);
+            write_proc_bytes(h_process, CAVE_LAST_9100_KEEPALIVE_VA, &zero, false);
+        }
 
-        let trace_buf_va = crate::trace::install_startup_trace(h_process, write_proc_bytes);
+        // 2. Configure ONLINE_CAVE, JOIN_GAME_PORT_VA, CAVE_LAN_PEER_VA, and CAVE_LOCAL_BIND_IP_VA
+        if let Some(target) = direct_peer {
+            if opts.inject_nat_direct_target {
+                let disco_port = if target.disco_port == 0 {
+                    crate::net::DISCOVERY_PORT
+                } else {
+                    target.disco_port
+                };
+                let game_port = if target.game_port == 0 {
+                    crate::net::GAME_PORT
+                } else {
+                    target.game_port
+                };
+                let ip_bytes = target.ip.octets();
+                let disco_be = disco_port.to_be_bytes();
+                let game_le = (game_port as u32).to_le_bytes();
+
+                write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[1u8], true);
+                write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &ip_bytes, true);
+                write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &disco_be, true);
+                write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &game_le, true);
+            }
+
+            if opts.inject_lan_net_globals {
+                let oct = target.ip.octets();
+                let is_private = oct[0] == 10
+                    || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+                    || (oct[0] == 192 && oct[1] == 168);
+                let is_local_routable =
+                    !is_private || crate::ip::find_matching_subnet_ip(target.ip).is_some();
+                let probe_ip = if is_local_routable { oct } else { [0u8; 4] };
+                write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
+            }
+        } else {
+            let zero_ip = [0u8; 4];
+            if opts.inject_nat_direct_target {
+                let default_disco_be = crate::net::DISCOVERY_PORT.to_be_bytes();
+                let default_game_le = (crate::net::GAME_PORT as u32).to_le_bytes();
+
+                write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[0u8], true);
+                write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &zero_ip, true);
+                write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &default_disco_be, true);
+                write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
+            }
+            if opts.inject_lan_net_globals {
+                write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
+            }
+        }
+
+        if opts.inject_lan_net_globals {
+            let bind_octets = local_bind_ip
+                .filter(|ip| !ip.is_unspecified())
+                .map(|ip| ip.octets())
+                .unwrap_or([0u8; 4]);
+            write_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &bind_octets, false);
+        }
+
+        let trace_buf_va = if opts.install_trace_hooks || opts.auto_resync {
+            crate::trace::install_startup_trace(h_process, write_proc_bytes, opts.auto_resync)
+        } else {
+            0
+        };
+
+        if opts.enable_persistent_quicksave_load {
+            crate::quicksave_persistence::install_quicksave_persistence_hooks(
+                h_process,
+                write_proc_bytes,
+            );
+        }
 
         // 3. Resume the game thread
         ResumeThread(h_thread);
@@ -810,12 +1184,34 @@ pub fn launch_game(
         trace_buf_va
     };
 
+    let resync_coord = if opts.auto_resync {
+        match crate::resync::ResyncCoordinator::new(peer_role, peer_ip, local_bind_ip) {
+            Ok(coord) => Some(coord),
+            Err(e) => {
+                crate::scct_log!("  [RESYNC] Disabled (UDP socket init failed: {:#})", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     Ok(GameProcess {
         pid,
+        peer_role,
+        peer_ip,
         handle_val: h_process as usize,
         trace_buf_va,
         trace_flushed_seq: 0,
         trace_prev_u0: None,
+        trace_last_mismatch_total: 0,
+        trace_path: None,
+        dump_path: None,
+        trace_owner_marker: None,
+        monitor_desync_dump: opts.monitor_desync_dump,
+        resync_coord,
+        resync_aborted: false,
+        last_resync_error: None,
     })
 }
 
@@ -823,21 +1219,91 @@ pub fn launch_game(
 pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
-    _peer_ip: Option<Ipv4Addr>,
-    _peer_disco_port: u16,
-    _peer_game_port: u16,
-    _local_bind_ip: Option<Ipv4Addr>,
+    peer_role: crate::trace::PeerRole,
+    direct_peer: Option<DirectPeerTarget>,
+    local_bind_ip: Option<Ipv4Addr>,
+    opts: LaunchRuntimeOptions,
 ) -> Result<GameProcess> {
+    let peer_ip = direct_peer.map(|p| p.ip);
     let child = std::process::Command::new(exe_path)
         .current_dir(game_dir)
         .spawn()
         .with_context(|| format!("Launching {}", exe_path.display()))?;
 
+    let resync_coord = if opts.auto_resync {
+        crate::resync::ResyncCoordinator::new(peer_role, peer_ip, local_bind_ip).ok()
+    } else {
+        None
+    };
+
     Ok(GameProcess {
         pid: child.id(),
+        peer_role,
+        peer_ip,
         child,
         trace_buf_va: 0,
         trace_flushed_seq: 0,
         trace_prev_u0: None,
+        trace_last_mismatch_total: 0,
+        trace_path: None,
+        dump_path: None,
+        trace_owner_marker: None,
+        monitor_desync_dump: opts.monitor_desync_dump,
+        resync_coord,
+        resync_aborted: false,
+        last_resync_error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_ansi_cstr;
+
+    #[test]
+    fn decode_ansi_cstr_stops_at_single_nul_and_ignores_trailing_bytes() {
+        assert_eq!(
+            decode_ansi_cstr(b"EAIController0\x00\xc8\x97garbage"),
+            "EAIController0"
+        );
+        assert_eq!(
+            decode_ansi_cstr(b"BaseSoldier12\x00x\x1dC\x00h\x00e\x00m\x00i\x00c\x00a\x00l\x00F\x00l\x00a\x00r\x00e\x00"),
+            "BaseSoldier12"
+        );
+        assert_eq!(decode_ansi_cstr(b"EHat6\x00J\x08\xb2\xe0"), "EHat6");
+    }
+
+    #[test]
+    fn decode_ansi_cstr_handles_empty_unterminated_and_latin1() {
+        assert_eq!(decode_ansi_cstr(b"\x00abc"), "");
+        assert_eq!(decode_ansi_cstr(b""), "");
+        assert_eq!(decode_ansi_cstr(b"ESam0"), "ESam0");
+        assert_eq!(decode_ansi_cstr(b"Caf\xe9\x00"), "Café");
+    }
+
+    #[test]
+    fn resolve_session_paths_separates_concurrent_peers_and_cleans_stale_markers() {
+        let dir = std::env::temp_dir().join(format!("scct_session_paths_{}", std::process::id()));
+        let sys_dir = dir.join("System");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&sys_dir).unwrap();
+
+        // Stale marker (pid 999999 reported dead) is cleaned up and primary paths are used
+        let stale = sys_dir.join(".scct_trace_owner_999999");
+        std::fs::write(&stale, b"999999\n").unwrap();
+        let (t1, d1, m1) =
+            super::resolve_session_paths_with(&dir, crate::trace::PeerRole::Host, 1111, |_| false);
+        assert!(!stale.exists());
+        assert_eq!(t1, sys_dir.join("scct_startup_trace.txt"));
+        assert_eq!(d1, sys_dir.join("scct_desync_dump.txt"));
+        assert_eq!(m1, Some(sys_dir.join(".scct_trace_owner_1111")));
+
+        // Second live peer (pid 1111 alive) receives role+pid suffixed paths so it won't overwrite P1
+        let (t2, d2, m2) =
+            super::resolve_session_paths_with(&dir, crate::trace::PeerRole::Guest, 2222, |p| p == 1111);
+        assert_eq!(t2, sys_dir.join("scct_startup_trace_guest_pid2222.txt"));
+        assert_eq!(d2, sys_dir.join("scct_desync_dump_guest_pid2222.txt"));
+        assert_eq!(m2, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

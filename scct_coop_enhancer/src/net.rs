@@ -10,16 +10,17 @@ pub const PE_TEXT_RAW_OFF: u32 = 0x00001000;
 pub const PE_TEXT_RAW_SIZE: u32 = 0x007B6000;
 pub const PE_TEXT_PATCHED_VSIZE: u32 = 0x007B6000;
 pub const PE_DATA_PATCHED_VSIZE: u32 = 0x001A3000;
+pub const PE_TEXT_VANILLA_VSIZE: u32 = 0x007B544A;
+pub const PE_DATA_VANILLA_VSIZE: u32 = 0x001A2389;
 pub const G_LAN_PEER_VA: u32 = 0x113303A0;
 /// Optional explicit local IPv4 bind address (network byte order) injected by the launcher into `.data` `.bss`.
 /// `0` = Auto (all adapters: bind `0.0.0.0`, fan out `:9100` LAN broadcasts on all UP non-loopback non-APIPA interfaces).
 /// Non-zero = bind `:9100`/`:9103`, advertise `StationURL`, and broadcast strictly on this adapter (plus same-PC unicast).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const G_LOCAL_BIND_IP_VA: u32 = 0x113303A4;
-
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const G_LAST_9103_KEEPALIVE_VA: u32 = 0x113303E0;
-#[allow(dead_code)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const G_LAST_9100_KEEPALIVE_VA: u32 = 0x113303E4;
 
 pub const NET_CAVE_VA: u32 = 0x110B6450;
@@ -50,10 +51,8 @@ c404e9f50500009090578d4e08e80e6bcfff5b5f5eb001c20400";
 
 pub const HOOK1_GET_LOCAL_ADAPTER_IP: u32 = 0x110B64E9;
 pub const HOOK2_QUAZAL_INTERFACE_TABLE: u32 = 0x110B6576;
-pub const RECV_FROM_WRAPPER: u32 = 0x110B65F2;
 pub const HOOK3_ON_SESSION_INFO: u32 = 0x110B668A;
 pub const HOOK4_ON_SESSION_ADDRESSES: u32 = 0x110B669E;
-pub const QUAZAL_SOCKET_BIND: u32 = 0x110B66B1;
 
 pub const SOCKET_CAVE_VA: u32 = 0x110B67C0;
 pub const HOOK_DISCOVERY_SOCKET: u32 = 0x110B67C0;
@@ -181,32 +180,14 @@ pub const HOOK_SITE_BROWSE_REPLY_URL: u32 = 0x10DC36CE;
 /// Verifies simulation lockstep synchronization between Host and Guest.
 pub const HOOK_SITE_CHECK_SIM_CHECKSUM: u32 = 0x10DF8750;
 pub const SIM_CHECKSUM_ORIG: &[u8] = &[0x6A, 0x05, 0xE8, 0xC9, 0xFE, 0xFF, 0xFF, 0xC3];
-pub const SIM_CHECKSUM_PATCHED: &[u8] = &[0xB0, 0x01, 0xC3, 0x90, 0x90, 0x90, 0x90, 0x90];
 pub const SIM_CHECKSUM_HOOK_BYTES: &[u8] = &[0xE9, 0x8B, 0xE8, 0x2B, 0x00, 0x90, 0x90, 0x90];
-
-/// Code cave in .text (`0x110B6FE0..0x110B7000`, 32 bytes) for gated simulation checksum check.
-/// Bypasses the warmup false-positive desync disconnect when `0x111F55E0 == 0`, and during
-/// gameplay runs full checksum verification, flagging `0x11330400 = 1` if a real desync occurs.
-pub const SIM_CHECKSUM_CAVE_VA: u32 = 0x110B6FE0;
-pub const CAVE_DESYNC_FLAG_VA: u32 = 0x11330400;
-pub const CAVE_DESYNC_COUNT_VA: u32 = 0x11330404;
-pub const SIM_CHECKSUM_CAVE_BYTES: [u8; 32] = [
-    0x83, 0x3D, 0xE0, 0x55, 0x1F, 0x11, 0x00, // cmp dword ptr ds:[0x111F55E0], 0
-    0x74, 0x13,                               // je 0x110B6FFC (warmup in progress -> al=1)
-    0x6A, 0x05,                               // push 5
-    0xE8, 0x30, 0x16, 0xD4, 0xFF,             // call 0x10DF8620 (SimStation::CheckSimulationChecksum)
-    0x84, 0xC0,                               // test al, al
-    0x75, 0x08,                               // jne 0x110B6FFC (checksum matched -> al=1)
-    0xC6, 0x05, 0x00, 0x04, 0x33, 0x11, 0x01, // mov byte ptr ds:[0x11330400], 1 (flag desync!)
-    0xC3,                                     // ret (returns al=0 -> triggers disconnect popup)
-    0xB0, 0x01,                               // mov al, 1
-    0xC3,                                     // ret (returns al=1 -> synchronized)
-    0x90,                                     // nop
-];
 
 /// Code cave in .text (`0x110B6FE0..0x110B7000`, 32 bytes) for Trace Mode desync bypass:
 /// runs the real `0x10DF8620(5)` check, flags `0x11330400 = 1` & increments `[0x11330404]`
 /// on mismatch so the diagnostic dump still fires, then returns `al = 1` so gameplay continues.
+pub const SIM_CHECKSUM_CAVE_VA: u32 = 0x110B6FE0;
+pub const CAVE_DESYNC_FLAG_VA: u32 = 0x11330400;
+pub const CAVE_DESYNC_COUNT_VA: u32 = 0x11330404;
 pub const STARTUP_CHECKSUM_BYPASS_CAVE_BYTES: [u8; 32] = [
     0x6A, 0x05,                               // push 5
     0xE8, 0x39, 0x16, 0xD4, 0xFF,             // call 0x10DF8620
@@ -283,11 +264,11 @@ pub const ONLINE_CAVE_ENABLED_OFFSET: usize = 0x20;
 pub const ONLINE_CAVE_IP_OFFSET: usize = 0x43;
 /// Big-endian (network order) destination port for the unicast copy. Defaults to 9100.
 pub const ONLINE_CAVE_PORT_OFFSET: usize = 0x4E;
-#[allow(dead_code)]
+#[cfg(any(windows, test))]
 pub const CAVE_ONLINE_ENABLED_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_ENABLED_OFFSET as u32;
-#[allow(dead_code)]
+#[cfg(any(windows, test))]
 pub const CAVE_ONLINE_IP_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_IP_OFFSET as u32;
-#[allow(dead_code)]
+#[cfg(any(windows, test))]
 pub const CAVE_ONLINE_PORT_VA: u32 = ONLINE_CAVE_VA + ONLINE_CAVE_PORT_OFFSET as u32;
 pub const DISCOVERY_PORT: u16 = 9100;
 pub const GAME_PORT: u16 = 9103;
@@ -339,7 +320,8 @@ pub struct PatchSite {
     pub desc: &'static str,
 }
 
-pub fn get_net_sites() -> Vec<PatchSite> {
+/// Returns the 11 Multi-NIC adapter promotion, socket/bind `0.0.0.0`, and LAN sender IP hook sites.
+pub fn get_lan_bind_sites() -> Vec<PatchSite> {
     vec![
         PatchSite {
             va: 0x10EFBA18,
@@ -384,12 +366,6 @@ pub fn get_net_sites() -> Vec<PatchSite> {
             desc: "Quazal SocketDriver::Bind -> HookQuazalBind (0.0.0.0 + punch)",
         },
         PatchSite {
-            va: HOOK_SITE_QUAZAL_POLL,
-            orig: decode_hex("8b8194000000"),
-            new: make_jmp(HOOK_SITE_QUAZAL_POLL, HOOK_QUAZAL_POLL, 6),
-            desc: "Quazal SocketDriver::HasRecvCompleted -> 3s CGNAT keepalive",
-        },
-        PatchSite {
             va: HOOK_SITE_DISCOVERY_SOCKET,
             orig: decode_hex("ff15ac760b11"),
             new: make_call(HOOK_SITE_DISCOVERY_SOCKET, HOOK_DISCOVERY_SOCKET, 6),
@@ -413,6 +389,18 @@ pub fn get_net_sites() -> Vec<PatchSite> {
             new: make_call(HOOK_SITE_QUAZAL_SOCKET, HOOK_QUAZAL_SOCKET, 6),
             desc: "Quazal Net-Z WSASocketW: ingest primed socket if present",
         },
+    ]
+}
+
+/// Returns the 5 Direct-IP broadcast replication & NAT traversal hooks.
+pub fn get_nat_direct_sites() -> Vec<PatchSite> {
+    vec![
+        PatchSite {
+            va: HOOK_SITE_QUAZAL_POLL,
+            orig: decode_hex("8b8194000000"),
+            new: make_jmp(HOOK_SITE_QUAZAL_POLL, HOOK_QUAZAL_POLL, 6),
+            desc: "Quazal SocketDriver::HasRecvCompleted -> 3s CGNAT keepalive",
+        },
         PatchSite {
             va: HOOK_SITE_QUAZAL_WSASENDTO,
             orig: decode_hex("ff15c4760b11"),
@@ -425,7 +413,52 @@ pub fn get_net_sites() -> Vec<PatchSite> {
             new: make_call(HOOK_SITE_BROWSE_REPLY_URL, HOOK_BROWSE_REPLY_URL, 5),
             desc: "Quazal HandleBrowseReply: rewrite SessionDescriptor StationURL IP/port",
         },
+        PatchSite {
+            va: HOOK_SENDTO_STR,
+            orig: decode_hex("ff15a8760b11"),
+            new: make_call(HOOK_SENDTO_STR, ONLINE_CAVE_VA, 6),
+            desc: "GS_Socket::SendTo: replicate UDP 9100 broadcast to Direct IP",
+        },
+        PatchSite {
+            va: HOOK_SENDTO_PROBE,
+            orig: decode_hex("ff15a8760b11"),
+            new: make_call(HOOK_SENDTO_PROBE, ONLINE_CAVE_VA, 6),
+            desc: "GS_Socket::SendToIP: replicate UDP 9100 probe to Direct IP",
+        },
     ]
+}
+
+pub fn get_menu_redirect_site() -> PatchSite {
+    PatchSite {
+        va: HOOK_COOP_ONLINE_MENU,
+        orig: decode_hex("8b5640c68288000000018b4e408b016a01ff503c8b4e14b0015f8841145ec20400"),
+        new: make_jmp(HOOK_COOP_ONLINE_MENU, COOP_LAN_MENU_DEST, 33),
+        desc: "P_MenuCoop Online button -> redirect to LAN room list",
+    }
+}
+
+pub fn get_menu_caption_site() -> PatchSite {
+    PatchSite {
+        va: HOOK_MAIN_MENU_COOP_LAN_CAPTION,
+        orig: decode_hex("6a0153536880430d1168c82c0e116820f40d11e8120918008b4e4883c41850"),
+        new: decode_hex("8b4e4868a06c0b11eb15909090909090909090909090909090909090909090"),
+        desc: "MainMenuCoop LAN button -> display 'ENHANCED COOP'",
+    }
+}
+
+pub fn get_lobby_alttab_unready_site() -> PatchSite {
+    PatchSite {
+        va: HOOK_SETPAUSE_LOBBY_UNREADY,
+        orig: decode_hex(SETPAUSE_LOBBY_UNREADY_ORIG_HEX),
+        new: vec![0x90; SETPAUSE_LOBBY_UNREADY_NOP_LEN],
+        desc: "UGameEngine::SetPause: prevent coop lobby client unreadying on Alt-Tab",
+    }
+}
+
+pub fn get_net_sites() -> Vec<PatchSite> {
+    let mut sites = get_lan_bind_sites();
+    sites.extend(get_nat_direct_sites().into_iter().take(3));
+    sites
 }
 
 pub fn va_to_text_off(va: u32) -> Result<usize> {
@@ -469,6 +502,21 @@ pub fn pe_section_headers(pe: &[u8]) -> Result<HashMap<Vec<u8>, usize>> {
         map.insert(name_trimmed.to_vec(), entry_off);
     }
     Ok(map)
+}
+
+/// Reads the `.text` and `.data` VirtualSize values from a PE executable.
+pub fn read_pe_vanilla_vsizes(pe: &[u8]) -> Result<(u32, u32)> {
+    let secs = pe_section_headers(pe)?;
+    let text_entry = *secs.get(b".text".as_slice()).context("Missing .text section")?;
+    let data_entry = *secs.get(b".data".as_slice()).context("Missing .data section")?;
+    let text_vs = u32::from_le_bytes(pe[text_entry + 8..text_entry + 12].try_into()?);
+    let data_vs = u32::from_le_bytes(pe[data_entry + 8..data_entry + 12].try_into()?);
+    Ok((text_vs, data_vs))
+}
+
+fn pe_has_patched_vsizes(pe: &[u8]) -> bool {
+    read_pe_vanilla_vsizes(pe)
+        .is_ok_and(|(text_vs, data_vs)| text_vs >= PE_TEXT_PATCHED_VSIZE && data_vs >= PE_DATA_PATCHED_VSIZE)
 }
 
 pub fn is_lan_and_zerotier_fix_applied(pe_bytes: &[u8]) -> bool {
@@ -570,20 +618,13 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         );
     }
 
+    let preserve_bypass = exe_path.exists()
+        && fs::read(exe_path)
+            .ok()
+            .is_some_and(|cur| is_startup_checksum_bypass_patched(&cur));
+
     let mut buf =
         fs::read(exe_bak_path).with_context(|| format!("Reading {}", exe_bak_path.display()))?;
-    if is_lan_and_zerotier_fix_applied(&buf) {
-        fs::copy(exe_bak_path, exe_path).with_context(|| {
-            format!(
-                "Copying {} to {}",
-                exe_bak_path.display(),
-                exe_path.display()
-            )
-        })?;
-        crate::scct_log!("  [NET] Applied multi-NIC LAN & STUN fix to splintercell3.exe");
-        crate::patcher::patch_exe_fixes(exe_path, exe_bak_path)?;
-        return Ok(());
-    }
 
     let secs = pe_section_headers(&buf)?;
     let text_off = *secs
@@ -615,24 +656,11 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     if &buf[cave_off..cave_off + cave.len()] != cave.as_slice()
         && buf[cave_off..cave_off + cave.len()].iter().any(|&b| b != 0)
     {
-        let mut prev_v2 = cave.clone();
-        prev_v2[0x00..0x06].copy_from_slice(&decode_hex("535152565755"));
-        prev_v2[0x138..0x13E].copy_from_slice(&decode_hex("837d04007454"));
-        prev_v2[0x26A..0x274].copy_from_slice(&decode_hex("8b5f04c7470400000000"));
-        prev_v2[0x2C2..0x2C9].copy_from_slice(&decode_hex("85db7403895f04"));
-
-        let mut prev_v1 = prev_v2.clone();
-        // Previous NET_CAVE had `66 81 79 02 23 8c 75 17` at 0x110B6625 (+0x1D5)
-        prev_v1[0x1D5..0x1DD].copy_from_slice(&decode_hex("66817902238c7517"));
-        if &buf[cave_off..cave_off + cave.len()] != prev_v2.as_slice()
-            && &buf[cave_off..cave_off + cave.len()] != prev_v1.as_slice()
-        {
-            bail!(
-                "Code cave at 0x{:08X} is non-zero in {}",
-                NET_CAVE_VA,
-                exe_bak_path.display()
-            );
-        }
+        bail!(
+            "Code cave at 0x{:08X} is non-zero in {}",
+            NET_CAVE_VA,
+            exe_bak_path.display()
+        );
     }
 
     let sock_cave = decode_hex(SOCKET_CAVE_HEX);
@@ -642,70 +670,11 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
             .iter()
             .any(|&b| b != 0)
     {
-        let mut old_v4 = sock_cave.clone();
-        old_v4[0xC1..0xCC].copy_from_slice(&decode_hex("8b442408c7400400000000"));
-        old_v4[0x30F..0x315].copy_from_slice(&decode_hex("ff25c4760b11"));
-        old_v4[0x3E7..0x420].copy_from_slice(&decode_hex(
-            "83f8ff743383ec08c7042400000000c7442404000000008d4c240489e2\
-             6a006a00516a006a006a0452680c00009850ff15d0760b1183c408c3",
-        ));
-
-        let old_v1 = decode_hex(
-            "a1d003331185c0740bc705d003331100000000c20c00ff25ac760b1190909090\
-             833dd803331100740ec705d80333110000000031c0c20c00ff25c0760b119090\
-             a1d403331185c0740bc705d403331100000000c21800ff25b8760b1190909090\
-             833ddc033311007505e983feffffc705dc0333110000000056575389ce8b7c24\
-             10e9b1feffff",
+        bail!(
+            "Code cave at 0x{:08X} is non-zero in {}",
+            SOCKET_CAVE_VA,
+            exe_bak_path.display()
         );
-        let old_v2 = decode_hex(
-            "a1d003331185c0740dc705d003331100000000c20c00ff25ac760b1190909090\
-             833dd803331100740fc705d80333110000000031c0c20c00e953000000909090\
-             a1d403331185c0740dc705d403331100000000c21800ff25b8760b1190909090\
-             833ddc033311007505e983feffffc705dc0333110000000056575389ce8b7c24\
-             10e9b1feffff90909090909090909090\
-             803d60670b110074178b44240885c0740f66817802238c7507c7400400000000\
-             ff25c0760b11",
-        );
-        let old_v3 = decode_hex(
-            "a1d003331185c0740dc705d003331100000000c20c00ff25ac760b1190909090\
-             eb6e909090909090909090909090909090909090909090909090909090909090\
-             a1d403331185c0740dc705d403331100000000c21800ff25b8760b1190909090\
-             eb70909090909090909090909090909090909090909090909090909090909090\
-             909090909090909090909090909090908b44240885c0743466817802238c752c\
-             8b442404e881010000833dd803331100740fc705d80333110000000031c0c20c\
-             008b442408c7400400000000ff25c0760b115689ce8b868c000000e84a010000\
-             833ddc03331100750dff74240889f1e8fdfdffffeb17c705dc03331100000000\
-             57538b7c241031dbe92afeffff84c07421803d60670b11007416ff1504730b11\
-             a3e00333118b868c000000e833010000b0015ec20400803d60670b1100743083\
-             3901752b51ff1504730b1189c22b05e00333113db80b000072148915e0033311\
-             8b0c248b818c000000e8f5000000598b8194000000e97cead2ff803d60670b11\
-             007424ff1504730b1189c22b05e40333113db80b0000720f8915e40333118b44\
-             2404e81a010000ff742418ff742418ff742418ff742418ff742418ff742418ff\
-             1580760b1183f80475338b54240885d27455837c240c047c4e813a5343504b75\
-             46f64424100274bf6a006a006a006a0452ff742418ff1580760b11ebaa83f840\
-             7c258b4c241485c9741d6683390275178b510485d2741080fa7f740b83faff74\
-             068915a0033311c2180083f8ff743383ec08c7042400000000c7442404000000\
-             008d4c240489e26a006a00516a006a006a0452680c00009850ff15d0760b1183\
-             c408c383f8ff74588b0d83670b1185c9744e0fb715d67eb51085d2744386f2c1\
-             e21066ba020083ec14891424894c2404c744240800000000c744240c00000000\
-             c7442410ffff000089e18d5424106a10516a006a025250ff15a8760b1183c414\
-             c383f8ff74568b0d83670b1185c9744c0fb7158e670b1185d27441c1e21066ba\
-             020083ec14891424894c2404c744240800000000c744240c00000000c7442410\
-             5343504b89e18d5424106a10516a006a045250ff15a8760b1183c414c3",
-        );
-        let matches_old = [&old_v1, &old_v2, &old_v3, &old_v4].iter().any(|old| {
-            buf[sock_cave_off..sock_cave_off + old.len()] == *old.as_slice()
-                && buf[sock_cave_off + old.len()..sock_cave_off + sock_cave.len()]
-                    .iter()
-                    .all(|&b| b == 0)
-        });
-        if !matches_old {
-            bail!(
-                "Code cave at 0x{:08X} is non-zero in {}",
-                SOCKET_CAVE_VA,
-                exe_bak_path.display()
-            );
-        }
     }
 
     let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
@@ -727,25 +696,13 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
         let so = va_to_text_off(site.va)?;
         let cur = &buf[so..so + site.orig.len()];
         if cur != site.orig.as_slice() && cur != site.new.as_slice() {
-            let old_quazal_bind = make_jmp(0x10DE6510, QUAZAL_SOCKET_BIND, 5);
-            let old_recv_wrap = make_mov_ebp_imm(RECV_FROM_WRAPPER);
-            let old_disc_rf_v3 = make_mov_ebp_imm(0x110B693A);
-            let old_poll_v3 = make_jmp(HOOK_SITE_QUAZAL_POLL, 0x110B68F6, 6);
-            if (site.va == 0x10DE6510 && cur == old_quazal_bind.as_slice())
-                || ((site.va == 0x10EFC62C || site.va == 0x10EFC7AC)
-                    && (cur == old_recv_wrap.as_slice() || cur == old_disc_rf_v3.as_slice()))
-                || (site.va == HOOK_SITE_QUAZAL_POLL && cur == old_poll_v3.as_slice())
-            {
-                // allow upgrading older hook versions cleanly
-            } else {
-                bail!(
-                    "Unexpected bytes at 0x{:08X} in {}: {:02x?} (expected {:02x?})",
-                    site.va,
-                    exe_bak_path.display(),
-                    cur,
-                    site.orig
-                );
-            }
+            bail!(
+                "Unexpected bytes at 0x{:08X} in {}: {:02x?} (expected {:02x?})",
+                site.va,
+                exe_bak_path.display(),
+                cur,
+                site.orig
+            );
         }
     }
 
@@ -753,23 +710,17 @@ pub fn apply_lan_networking_fix(exe_path: &Path, exe_bak_path: &Path) -> Result<
     buf[sock_cave_off..sock_cave_off + sock_cave.len()].copy_from_slice(&sock_cave);
     buf[multi_cave_off..multi_cave_off + multi_cave.len()].copy_from_slice(&multi_cave);
 
-    // Restore SIM_CHECKSUM to vanilla retail unless the Trace Mode bypass flag is intentionally active
-    let bypass_active = is_startup_checksum_bypass_patched(&buf);
     let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
-    if !bypass_active
-        && buf.len() >= sim_chk_off + 8
-        && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
-            || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
-    {
-        buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
-    }
     let sim_cave_off = va_to_text_off(SIM_CHECKSUM_CAVE_VA)?;
-    if !bypass_active
-        && buf.len() >= sim_cave_off + 32
-        && (&buf[sim_cave_off..sim_cave_off + 32] == &SIM_CHECKSUM_CAVE_BYTES
-            || &buf[sim_cave_off..sim_cave_off + 32] == &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES)
-    {
-        buf[sim_cave_off..sim_cave_off + 32].fill(0);
+    if preserve_bypass {
+        patch_startup_checksum_bypass_bytes(&mut buf)?;
+    } else {
+        if buf.len() >= sim_chk_off + 8 {
+            buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
+        }
+        if buf.len() >= sim_cave_off + 32 {
+            buf[sim_cave_off..sim_cave_off + 32].fill(0);
+        }
     }
     for site in &sites {
         let so = va_to_text_off(site.va)?;
@@ -878,6 +829,87 @@ fn revert_text_site_bytes(pe_bytes: &mut [u8], va: u32, orig: &[u8], patched: &[
     true
 }
 
+fn is_cave_bytes_applied(pe_bytes: &[u8], va: u32, expected: &[u8]) -> bool {
+    let Ok(off) = va_to_text_off(va) else {
+        return false;
+    };
+    pe_bytes.len() >= off + expected.len() && &pe_bytes[off..off + expected.len()] == expected
+}
+
+fn are_sites_applied(pe_bytes: &[u8], sites: &[PatchSite]) -> bool {
+    sites
+        .iter()
+        .all(|site| is_text_patch_applied(pe_bytes, site.va, &site.new))
+}
+
+fn sync_cave_bytes(
+    pe_bytes: &mut [u8],
+    va: u32,
+    expected: &[u8],
+    enable: bool,
+    label: &str,
+) -> Result<bool> {
+    let off = va_to_text_off(va)?;
+    if pe_bytes.len() < off + expected.len() {
+        bail!("PE image too short for {} cave @ 0x{:08X}", label, va);
+    }
+    let slice = &mut pe_bytes[off..off + expected.len()];
+    if enable {
+        if slice == expected {
+            return Ok(false);
+        }
+        if slice.iter().any(|&b| b != 0) {
+            bail!(
+                "Code cave for {} at 0x{:08X} contains unexpected non-zero bytes",
+                label,
+                va
+            );
+        }
+        slice.copy_from_slice(expected);
+        Ok(true)
+    } else if slice.iter().any(|&b| b != 0) {
+        slice.fill(0);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn sync_sites_bytes(
+    pe_bytes: &mut [u8],
+    sites: &[PatchSite],
+    enable: bool,
+    label: &str,
+) -> Result<bool> {
+    let mut changed = false;
+    for site in sites {
+        if enable {
+            let so = va_to_text_off(site.va)?;
+            if pe_bytes.len() < so + site.orig.len() {
+                bail!("PE image too short for {} @ 0x{:08X}", label, site.va);
+            }
+            let cur = &pe_bytes[so..so + site.orig.len()];
+            if cur == site.new.as_slice() {
+                continue;
+            }
+            if cur != site.orig.as_slice() {
+                bail!(
+                    "Unexpected bytes at 0x{:08X} for {}: {:02x?} (expected {:02x?})",
+                    site.va,
+                    label,
+                    cur,
+                    site.orig
+                );
+            }
+            pe_bytes[so..so + site.new.len()].copy_from_slice(&site.new);
+            changed = true;
+        } else if revert_text_site_bytes(pe_bytes, site.va, &site.orig, &site.new) {
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Returns whether the optional `HOOK_PAUSE_IS_PLAYER_READY` (`0x109639E0`) patch is applied.
 pub fn is_pause_always_ready_patched(pe_bytes: &[u8]) -> bool {
     let new = decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX);
@@ -952,7 +984,7 @@ pub fn is_startup_checksum_bypass_patched(pe_bytes: &[u8]) -> bool {
     pe_bytes.len() >= chk_off + 8
         && pe_bytes.len() >= cave_off + 32
         && &pe_bytes[chk_off..chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES
-        && &pe_bytes[cave_off..cave_off + 32] == &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES
+        && pe_bytes[cave_off..cave_off + 32] == STARTUP_CHECKSUM_BYPASS_CAVE_BYTES
 }
 
 /// Patches `0x10DF8750` (`SimStation::CheckSimulationChecksum`) to log mismatches without disconnecting (idempotent).
@@ -969,10 +1001,7 @@ pub fn patch_startup_checksum_bypass_bytes(pe_bytes: &mut [u8]) -> Result<usize>
         return Ok(chk_off);
     }
     let cur_site = &pe_bytes[chk_off..chk_off + 8];
-    if cur_site != SIM_CHECKSUM_ORIG
-        && cur_site != SIM_CHECKSUM_HOOK_BYTES
-        && cur_site != SIM_CHECKSUM_PATCHED
-    {
+    if cur_site != SIM_CHECKSUM_ORIG && cur_site != SIM_CHECKSUM_HOOK_BYTES {
         bail!(
             "Unexpected bytes at 0x{:08X} for CheckSimulationChecksum: {:02x?}",
             HOOK_SITE_CHECK_SIM_CHECKSUM,
@@ -980,10 +1009,7 @@ pub fn patch_startup_checksum_bypass_bytes(pe_bytes: &mut [u8]) -> Result<usize>
         );
     }
     let cur_cave = &pe_bytes[cave_off..cave_off + 32];
-    if cur_cave.iter().any(|&b| b != 0)
-        && cur_cave != &SIM_CHECKSUM_CAVE_BYTES
-        && cur_cave != &STARTUP_CHECKSUM_BYPASS_CAVE_BYTES
-    {
+    if cur_cave.iter().any(|&b| b != 0) && cur_cave != STARTUP_CHECKSUM_BYPASS_CAVE_BYTES {
         bail!(
             "Code cave at 0x{:08X} contains unexpected bytes: {:02x?}",
             SIM_CHECKSUM_CAVE_VA,
@@ -1011,7 +1037,38 @@ pub fn revert_startup_checksum_bypass_bytes(pe_bytes: &mut [u8]) -> bool {
     true
 }
 
-pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
+/// Enables or disables the CLI-only startup checksum disconnect bypass (`0x10DF8750` -> `0x110B6FE0`) in `exe_path`.
+pub fn sync_startup_checksum_bypass_in_exe(exe_path: &Path, enable: bool) -> Result<()> {
+    if !exe_path.exists() {
+        return Ok(());
+    }
+    let mut data = fs::read(exe_path).with_context(|| format!("Reading {}", exe_path.display()))?;
+    let changed = if enable {
+        if !is_startup_checksum_bypass_patched(&data) {
+            let off = patch_startup_checksum_bypass_bytes(&mut data)?;
+            crate::scct_log!(
+                "  [EXE] Patched startup checksum disconnect bypass @ 0x{:06X}",
+                off
+            );
+            true
+        } else {
+            false
+        }
+    } else if revert_startup_checksum_bypass_bytes(&mut data) {
+        crate::scct_log!("  [EXE] Reverted startup checksum disconnect bypass");
+        true
+    } else {
+        false
+    };
+    if changed {
+        crate::patcher::clear_readonly_if_needed(exe_path);
+        fs::write(exe_path, &data).with_context(|| format!("Writing {}", exe_path.display()))?;
+    }
+    Ok(())
+}
+
+/// Returns whether only the `ONLINE_CAVE` template and `JOIN_GAME_PORT` push immediate are valid.
+pub fn is_nat_direct_caves_applied(pe_bytes: &[u8]) -> bool {
     let o = match va_to_text_off(ONLINE_CAVE_VA) {
         Ok(off) => off,
         Err(_) => return false,
@@ -1031,42 +1088,67 @@ pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
             return false;
         }
     }
-    let wstr = decode_hex(ENHANCED_COOP_WSTR_HEX);
-    let wstr_off = match va_to_text_off(ENHANCED_COOP_WSTR_VA) {
-        Ok(off) => off,
-        Err(_) => return false,
-    };
-    if pe_bytes.len() < wstr_off + wstr.len()
-        || &pe_bytes[wstr_off..wstr_off + wstr.len()] != wstr.as_slice()
-    {
-        return false;
-    }
     let jp_off = match va_to_text_off(JOIN_GAME_PORT_PUSH_VA) {
         Ok(off) => off,
         Err(_) => return false,
     };
-    if pe_bytes.len() < jp_off + 5
-        || pe_bytes[jp_off] != 0x68
-        || pe_bytes[jp_off + 3..jp_off + 5] != [0, 0]
-    {
-        return false;
-    }
-    for site in get_online_sites() {
-        let so = match va_to_text_off(site.va) {
-            Ok(off) => off,
-            Err(_) => return false,
-        };
-        if pe_bytes.len() < so + site.new.len()
-            || &pe_bytes[so..so + site.new.len()] != site.new.as_slice()
-        {
-            return false;
-        }
-    }
+    pe_bytes.len() >= jp_off + 5
+        && pe_bytes[jp_off] == 0x68
+        && pe_bytes[jp_off + 3..jp_off + 5] == [0, 0]
+}
 
-    if !is_sim_checksum_site_valid(pe_bytes) {
+/// Returns whether the 11 LAN/multi-NIC bind & discovery hooks + caves are applied.
+pub fn is_lan_bind_hooks_applied(pe_bytes: &[u8]) -> bool {
+    let net_cave = decode_hex(NET_CAVE_HEX);
+    let sock_cave = decode_hex(SOCKET_CAVE_HEX);
+    let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
+    is_cave_bytes_applied(pe_bytes, NET_CAVE_VA, &net_cave)
+        && is_cave_bytes_applied(pe_bytes, SOCKET_CAVE_VA, &sock_cave)
+        && is_cave_bytes_applied(pe_bytes, MULTI_NIC_LAN_CAVE_VA, &multi_cave)
+        && are_sites_applied(pe_bytes, &get_lan_bind_sites())
+        && pe_has_patched_vsizes(pe_bytes)
+}
+
+/// Returns whether the 5 Direct-IP broadcast replication & NAT traversal hooks + caves are applied.
+pub fn is_nat_direct_hooks_applied(pe_bytes: &[u8]) -> bool {
+    let sock_cave = decode_hex(SOCKET_CAVE_HEX);
+    let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
+    is_cave_bytes_applied(pe_bytes, SOCKET_CAVE_VA, &sock_cave)
+        && is_cave_bytes_applied(pe_bytes, MULTI_NIC_LAN_CAVE_VA, &multi_cave)
+        && is_nat_direct_caves_applied(pe_bytes)
+        && are_sites_applied(pe_bytes, &get_nat_direct_sites())
+        && pe_has_patched_vsizes(pe_bytes)
+}
+
+/// Returns whether the P_MenuCoop "Online" -> LAN menu redirect hook (`0x10B524CA`) is applied.
+pub fn is_menu_redirect_patched(pe_bytes: &[u8]) -> bool {
+    are_sites_applied(pe_bytes, &[get_menu_redirect_site()])
+}
+
+/// Returns whether the MainMenuCoop "ENHANCED COOP" button caption patch (`0x10B4BB86`) is applied.
+pub fn is_menu_caption_patched(pe_bytes: &[u8]) -> bool {
+    let wstr = decode_hex(ENHANCED_COOP_WSTR_HEX);
+    is_cave_bytes_applied(pe_bytes, ENHANCED_COOP_WSTR_VA, &wstr)
+        && are_sites_applied(pe_bytes, &[get_menu_caption_site()])
+}
+
+/// Returns whether the Alt-Tab coop lobby unready NOP patch (`0x10A3D58B`) is applied.
+pub fn is_lobby_alttab_unready_nop_patched(pe_bytes: &[u8]) -> bool {
+    are_sites_applied(pe_bytes, &[get_lobby_alttab_unready_site()])
+}
+
+pub fn is_online_coop_fix_applied(pe_bytes: &[u8]) -> bool {
+    if !is_nat_direct_caves_applied(pe_bytes) {
         return false;
     }
-    true
+    let wstr = decode_hex(ENHANCED_COOP_WSTR_HEX);
+    if !is_cave_bytes_applied(pe_bytes, ENHANCED_COOP_WSTR_VA, &wstr) {
+        return false;
+    }
+    if !are_sites_applied(pe_bytes, &get_online_sites()) {
+        return false;
+    }
+    is_sim_checksum_site_valid(pe_bytes)
 }
 
 /// Write the peer IP, discovery port, and gameplay port into the patched executable.
@@ -1076,8 +1158,8 @@ pub fn set_direct_target_in_exe(
     disco_port: u16,
     game_port: u16,
 ) -> Result<()> {
-    if !is_online_coop_fix_applied(pe_bytes) {
-        bail!("Online coop fix is not applied to executable");
+    if !is_nat_direct_caves_applied(pe_bytes) {
+        bail!("Direct-IP NAT cave is not applied to executable");
     }
     let o = va_to_text_off(ONLINE_CAVE_VA)?;
     write_online_cave_target(&mut pe_bytes[o..], ip, disco_port);
@@ -1088,6 +1170,187 @@ pub fn set_direct_target_in_exe(
     };
     pe_bytes[jp_off..jp_off + 4].copy_from_slice(&(eff_game_port as u32).to_le_bytes());
     Ok(())
+}
+
+/// Subset of mod feature flags that modify PE code caves and networking/menu hooks in `splintercell3.exe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NetExeFlags {
+    pub lan_bind: bool,
+    pub nat_direct: bool,
+    pub menu_redirect: bool,
+    pub menu_caption: bool,
+    pub lobby_alttab_unready_nop: bool,
+    pub pause_always_ready: bool,
+    pub bypass_checksum_disconnect: bool,
+}
+
+fn sync_online_cave_and_port(
+    pe_bytes: &mut [u8],
+    enable: bool,
+    direct_target: Option<(Ipv4Addr, u16, u16)>,
+) -> Result<bool> {
+    let mut cave = decode_hex(ONLINE_CAVE_HEX);
+    let cave_off = va_to_text_off(ONLINE_CAVE_VA)?;
+    if pe_bytes.len() < cave_off + cave.len() {
+        bail!("PE image too short for ONLINE_CAVE");
+    }
+    let jp_push_off = va_to_text_off(JOIN_GAME_PORT_PUSH_VA)?;
+    let jp_off = va_to_text_off(JOIN_GAME_PORT_VA)?;
+    let mut changed = false;
+
+    if enable {
+        let (ip, dport, gport) = match direct_target {
+            Some((ip, dp, gp)) => (Some(ip), dp, gp),
+            None => (None, DISCOVERY_PORT, GAME_PORT),
+        };
+        write_online_cave_target(&mut cave, ip, dport);
+        if &pe_bytes[cave_off..cave_off + cave.len()] != cave.as_slice() {
+            if !is_nat_direct_caves_applied(pe_bytes)
+                && pe_bytes[cave_off..cave_off + cave.len()].iter().any(|&b| b != 0)
+            {
+                bail!(
+                    "Code cave at 0x{:08X} is non-zero and unrecognized",
+                    ONLINE_CAVE_VA
+                );
+            }
+            pe_bytes[cave_off..cave_off + cave.len()].copy_from_slice(&cave);
+            changed = true;
+        }
+        if pe_bytes.len() < jp_push_off + 5
+            || pe_bytes[jp_push_off] != 0x68
+            || pe_bytes[jp_push_off + 3..jp_push_off + 5] != [0, 0]
+        {
+            bail!(
+                "Unexpected bytes at 0x{:08X} for join port immediate",
+                JOIN_GAME_PORT_PUSH_VA
+            );
+        }
+        let eff_game_port = match ip {
+            Some(_) if gport != 0 => gport,
+            _ => GAME_PORT,
+        };
+        let port_bytes = (eff_game_port as u32).to_le_bytes();
+        if pe_bytes[jp_off..jp_off + 4] != port_bytes {
+            pe_bytes[jp_off..jp_off + 4].copy_from_slice(&port_bytes);
+            changed = true;
+        }
+    } else {
+        if pe_bytes[cave_off..cave_off + cave.len()].iter().any(|&b| b != 0) {
+            pe_bytes[cave_off..cave_off + cave.len()].fill(0);
+            changed = true;
+        }
+        let default_port_bytes = (GAME_PORT as u32).to_le_bytes();
+        if pe_bytes.len() >= jp_off + 4 && pe_bytes[jp_off..jp_off + 4] != default_port_bytes {
+            pe_bytes[jp_off..jp_off + 4].copy_from_slice(&default_port_bytes);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Synchronizes all networking, menu, pause-ready, and checksum-bypass hooks in `pe_bytes` to match `flags`.
+/// Returns `Ok(true)` if any bytes in `pe_bytes` were modified.
+pub fn sync_net_flags_to_exe_bytes(
+    pe_bytes: &mut [u8],
+    flags: &NetExeFlags,
+    direct_target: Option<(Ipv4Addr, u16, u16)>,
+    vanilla_vsizes: Option<(u32, u32)>,
+) -> Result<bool> {
+    let mut changed = false;
+
+    // 1. Revert disabled hook sites BEFORE zeroing code caves they target.
+    if !flags.lan_bind {
+        changed |= sync_sites_bytes(pe_bytes, &get_lan_bind_sites(), false, "LAN/multi-NIC hooks")?;
+    }
+    if !flags.nat_direct {
+        changed |= sync_sites_bytes(pe_bytes, &get_nat_direct_sites(), false, "Direct-IP/NAT hooks")?;
+    }
+    if !flags.menu_redirect {
+        changed |= sync_sites_bytes(pe_bytes, &[get_menu_redirect_site()], false, "Online->LAN menu redirect")?;
+    }
+    if !flags.menu_caption {
+        changed |= sync_sites_bytes(pe_bytes, &[get_menu_caption_site()], false, "ENHANCED COOP caption")?;
+    }
+    if !flags.lobby_alttab_unready_nop {
+        changed |= sync_sites_bytes(pe_bytes, &[get_lobby_alttab_unready_site()], false, "Lobby Alt-Tab unready NOP")?;
+    }
+    if !flags.pause_always_ready {
+        changed |= revert_pause_always_ready_bytes(pe_bytes);
+    }
+    if !flags.bypass_checksum_disconnect {
+        changed |= revert_startup_checksum_bypass_bytes(pe_bytes);
+    }
+
+    // 2. Sync caves (write enabled caves before enabling sites; zero disabled caves after reverting sites).
+    let need_base_caves = flags.lan_bind || flags.nat_direct;
+    let net_cave = decode_hex(NET_CAVE_HEX);
+    let sock_cave = decode_hex(SOCKET_CAVE_HEX);
+    let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
+    changed |= sync_cave_bytes(pe_bytes, NET_CAVE_VA, &net_cave, need_base_caves, "NET_CAVE")?;
+    changed |= sync_cave_bytes(pe_bytes, SOCKET_CAVE_VA, &sock_cave, need_base_caves, "SOCKET_CAVE")?;
+    changed |= sync_cave_bytes(pe_bytes, MULTI_NIC_LAN_CAVE_VA, &multi_cave, need_base_caves, "MULTI_NIC_LAN_CAVE")?;
+    changed |= sync_online_cave_and_port(pe_bytes, flags.nat_direct, direct_target)?;
+
+    let wstr = decode_hex(ENHANCED_COOP_WSTR_HEX);
+    changed |= sync_cave_bytes(pe_bytes, ENHANCED_COOP_WSTR_VA, &wstr, flags.menu_caption, "ENHANCED_COOP_WSTR")?;
+
+    // 3. Apply enabled hook sites.
+    if flags.lan_bind {
+        changed |= sync_sites_bytes(pe_bytes, &get_lan_bind_sites(), true, "LAN/multi-NIC hooks")?;
+    }
+    if flags.nat_direct {
+        changed |= sync_sites_bytes(pe_bytes, &get_nat_direct_sites(), true, "Direct-IP/NAT hooks")?;
+    }
+    if flags.menu_redirect {
+        changed |= sync_sites_bytes(pe_bytes, &[get_menu_redirect_site()], true, "Online->LAN menu redirect")?;
+    }
+    if flags.menu_caption {
+        changed |= sync_sites_bytes(pe_bytes, &[get_menu_caption_site()], true, "ENHANCED COOP caption")?;
+    }
+    if flags.lobby_alttab_unready_nop {
+        changed |= sync_sites_bytes(pe_bytes, &[get_lobby_alttab_unready_site()], true, "Lobby Alt-Tab unready NOP")?;
+    }
+    if flags.pause_always_ready && !is_pause_always_ready_patched(pe_bytes) {
+        patch_pause_always_ready_bytes(pe_bytes)?;
+        changed = true;
+    }
+    if flags.bypass_checksum_disconnect && !is_startup_checksum_bypass_patched(pe_bytes) {
+        patch_startup_checksum_bypass_bytes(pe_bytes)?;
+        changed = true;
+    }
+
+    // 4. Sync PE section VirtualSizes so caves & BSS globals map cleanly when active,
+    //    or restore exact vanilla VirtualSizes when every cave is zeroed.
+    let secs = pe_section_headers(pe_bytes)?;
+    let text_off = *secs.get(b".text".as_slice()).context("Missing .text section")?;
+    let data_off = *secs.get(b".data".as_slice()).context("Missing .data section")?;
+    let cur_text_vs = u32::from_le_bytes(pe_bytes[text_off + 8..text_off + 12].try_into()?);
+    let cur_data_vs = u32::from_le_bytes(pe_bytes[data_off + 8..data_off + 12].try_into()?);
+    let (v_text_vs, v_data_vs) = vanilla_vsizes.unwrap_or((PE_TEXT_VANILLA_VSIZE, PE_DATA_VANILLA_VSIZE));
+
+    let any_text_cave = need_base_caves || flags.menu_caption || flags.bypass_checksum_disconnect;
+    let target_text_vs = if any_text_cave {
+        cur_text_vs.max(PE_TEXT_PATCHED_VSIZE)
+    } else {
+        v_text_vs
+    };
+    if cur_text_vs != target_text_vs {
+        pe_bytes[text_off + 8..text_off + 12].copy_from_slice(&target_text_vs.to_le_bytes());
+        changed = true;
+    }
+
+    let need_data_bss = need_base_caves || flags.bypass_checksum_disconnect;
+    let target_data_vs = if need_data_bss {
+        cur_data_vs.max(PE_DATA_PATCHED_VSIZE)
+    } else {
+        v_data_vs
+    };
+    if cur_data_vs != target_data_vs {
+        pe_bytes[data_off + 8..data_off + 12].copy_from_slice(&target_data_vs.to_le_bytes());
+        changed = true;
+    }
+
+    Ok(changed)
 }
 
 fn write_online_cave_target(cave: &mut [u8], ip: Option<Ipv4Addr>, port: u16) {
@@ -1188,8 +1451,7 @@ pub fn apply_online_coop_fix_with_ports(
     let sim_chk_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM)?;
     if !is_startup_checksum_bypass_patched(&buf)
         && buf.len() >= sim_chk_off + 8
-        && (&buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_PATCHED
-            || &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES)
+        && &buf[sim_chk_off..sim_chk_off + 8] == SIM_CHECKSUM_HOOK_BYTES
     {
         buf[sim_chk_off..sim_chk_off + 8].copy_from_slice(SIM_CHECKSUM_ORIG);
     }
@@ -1359,7 +1621,7 @@ mod tests {
         let sock_cave = decode_hex(SOCKET_CAVE_HEX);
         let multi_cave = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
 
-        assert!(ENHANCED_COOP_WSTR_VA + 28 <= MULTI_NIC_LAN_CAVE_VA);
+        const { assert!(ENHANCED_COOP_WSTR_VA + 28 <= MULTI_NIC_LAN_CAVE_VA); }
         assert!(MULTI_NIC_LAN_CAVE_VA + (multi_cave.len() as u32) <= 0x110B7000);
 
         // Verify NET_CAVE trampolines
@@ -1456,18 +1718,19 @@ mod tests {
             &clean_bytes[ready_off..ready_off + 8],
             decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX).as_slice()
         );
-        // Optional IsPlayerReady toggle is no longer force-applied by online fix
+        // Standard fixes now enable IsPlayerReady and disable AI visibility culling by default
         assert_eq!(
             &buf[ready_off..ready_off + 8],
-            decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX).as_slice()
+            decode_hex(PAUSE_IS_PLAYER_READY_NEW_HEX).as_slice()
         );
-        assert!(!is_pause_always_ready_patched(&buf));
+        assert!(is_pause_always_ready_patched(&buf));
+        assert!(is_ai_visibility_culling_disabled(&buf));
         let mut toggled = buf.clone();
-        assert_eq!(patch_pause_always_ready_bytes(&mut toggled).unwrap(), ready_off);
-        assert!(is_pause_always_ready_patched(&toggled));
-        assert!(is_online_coop_fix_applied(&toggled));
         assert!(revert_pause_always_ready_bytes(&mut toggled));
         assert!(!is_pause_always_ready_patched(&toggled));
+        assert!(is_online_coop_fix_applied(&toggled));
+        assert_eq!(patch_pause_always_ready_bytes(&mut toggled).unwrap(), ready_off);
+        assert!(is_pause_always_ready_patched(&toggled));
         assert!(is_online_coop_fix_applied(&toggled));
         let jp_off = va_to_text_off(JOIN_GAME_PORT_VA).unwrap();
         assert_eq!(&buf[jp_off..jp_off + 4], &2383u32.to_le_bytes());
@@ -1489,24 +1752,6 @@ mod tests {
             &buf[caption_site_off..caption_site_off + 10],
             &[0x8B, 0x4E, 0x48, 0x68, 0xA0, 0x6C, 0x0B, 0x11, 0xEB, 0x15]
         );
-
-        // Verify upgrading an older patched EXE (without SetPause NOPs or .bak) applies the NOPs cleanly
-        let mut legacy_buf = buf.clone();
-        legacy_buf[unready_off..unready_off + SETPAUSE_LOBBY_UNREADY_NOP_LEN]
-            .copy_from_slice(&unready_orig);
-        assert!(!is_online_coop_fix_applied(&legacy_buf));
-        let upgrade_exe = dir.join("test_scct3_upgrade_unready.exe");
-        let missing_bak = dir.join("test_scct3_upgrade_unready.exe.bak");
-        let _ = fs::remove_file(&missing_bak);
-        fs::write(&upgrade_exe, &legacy_buf).unwrap();
-        apply_online_coop_fix(&upgrade_exe, &missing_bak, None).unwrap();
-        let upgraded = fs::read(&upgrade_exe).unwrap();
-        assert!(is_online_coop_fix_applied(&upgraded));
-        assert_eq!(
-            &upgraded[unready_off..unready_off + SETPAUSE_LOBBY_UNREADY_NOP_LEN],
-            &[0x90; SETPAUSE_LOBBY_UNREADY_NOP_LEN]
-        );
-        let _ = fs::remove_file(&upgrade_exe);
 
         // Test clearing IP resets ports back to defaults (9100 / 9103)
         apply_online_coop_fix(&test_exe, &test_bak, None).unwrap();
@@ -1717,5 +1962,106 @@ mod tests {
             assert!(revert_ai_visibility_culling_disabled_bytes(&mut real_exe));
             assert!(!is_ai_visibility_culling_disabled(&real_exe));
         }
+    }
+
+    #[test]
+    fn test_sync_net_flags_granular_and_vanilla_roundtrip() {
+        let pe_off = 0x100usize;
+        let opt_sz = 0xE0usize;
+        let sec_table = pe_off + 0x18 + opt_sz;
+        let mut vanilla = vec![0u8; (PE_TEXT_RAW_OFF + PE_TEXT_RAW_SIZE) as usize];
+        vanilla[0..2].copy_from_slice(b"MZ");
+        vanilla[0x3C..0x40].copy_from_slice(&(pe_off as u32).to_le_bytes());
+        vanilla[pe_off..pe_off + 4].copy_from_slice(b"PE\0\0");
+        vanilla[pe_off + 6..pe_off + 8].copy_from_slice(&2u16.to_le_bytes());
+        vanilla[pe_off + 0x14..pe_off + 0x16].copy_from_slice(&(opt_sz as u16).to_le_bytes());
+        vanilla[pe_off + 0x34..pe_off + 0x38].copy_from_slice(&PE_IMAGE_BASE.to_le_bytes());
+        vanilla[sec_table..sec_table + 5].copy_from_slice(b".text");
+        vanilla[sec_table + 8..sec_table + 12].copy_from_slice(&PE_TEXT_VANILLA_VSIZE.to_le_bytes());
+        vanilla[sec_table + 12..sec_table + 16].copy_from_slice(&PE_TEXT_RVA.to_le_bytes());
+        vanilla[sec_table + 16..sec_table + 20].copy_from_slice(&PE_TEXT_RAW_SIZE.to_le_bytes());
+        vanilla[sec_table + 20..sec_table + 24].copy_from_slice(&PE_TEXT_RAW_OFF.to_le_bytes());
+        let data_sec = sec_table + 40;
+        vanilla[data_sec..data_sec + 5].copy_from_slice(b".data");
+        vanilla[data_sec + 8..data_sec + 12].copy_from_slice(&PE_DATA_VANILLA_VSIZE.to_le_bytes());
+        vanilla[data_sec + 12..data_sec + 16].copy_from_slice(&0x007B7000u32.to_le_bytes());
+
+        // Populate vanilla original bytes for all sites
+        for site in get_lan_bind_sites()
+            .into_iter()
+            .chain(get_nat_direct_sites())
+            .chain([
+                get_menu_redirect_site(),
+                get_menu_caption_site(),
+                get_lobby_alttab_unready_site(),
+            ])
+        {
+            let off = va_to_text_off(site.va).unwrap();
+            vanilla[off..off + site.orig.len()].copy_from_slice(&site.orig);
+        }
+        let jp_push = va_to_text_off(JOIN_GAME_PORT_PUSH_VA).unwrap();
+        vanilla[jp_push] = 0x68;
+        vanilla[jp_push + 1..jp_push + 5].copy_from_slice(&(GAME_PORT as u32).to_le_bytes());
+        let pause_off = va_to_text_off(HOOK_PAUSE_IS_PLAYER_READY).unwrap();
+        let pause_orig = decode_hex(PAUSE_IS_PLAYER_READY_ORIG_HEX);
+        vanilla[pause_off..pause_off + pause_orig.len()].copy_from_slice(&pause_orig);
+        let sim_off = va_to_text_off(HOOK_SITE_CHECK_SIM_CHECKSUM).unwrap();
+        vanilla[sim_off..sim_off + SIM_CHECKSUM_ORIG.len()].copy_from_slice(SIM_CHECKSUM_ORIG);
+
+        let mut work = vanilla.clone();
+        let all_on = NetExeFlags {
+            lan_bind: true,
+            nat_direct: true,
+            menu_redirect: true,
+            menu_caption: true,
+            lobby_alttab_unready_nop: true,
+            pause_always_ready: true,
+            bypass_checksum_disconnect: true,
+        };
+        let target = Some((Ipv4Addr::new(198, 51, 100, 42), 19100, 19103));
+        assert!(sync_net_flags_to_exe_bytes(&mut work, &all_on, target, None).unwrap());
+        assert!(is_lan_bind_hooks_applied(&work));
+        assert!(is_nat_direct_hooks_applied(&work));
+        assert!(is_menu_redirect_patched(&work));
+        assert!(is_menu_caption_patched(&work));
+        assert!(is_lobby_alttab_unready_nop_patched(&work));
+        assert!(is_pause_always_ready_patched(&work));
+        assert!(is_startup_checksum_bypass_patched(&work));
+        assert!(!sync_net_flags_to_exe_bytes(&mut work, &all_on, target, None).unwrap());
+
+        // Toggle only menu + lan off while keeping nat_direct ON -> set_direct_target_in_exe works!
+        let nat_only = NetExeFlags {
+            lan_bind: false,
+            nat_direct: true,
+            menu_redirect: false,
+            menu_caption: false,
+            lobby_alttab_unready_nop: false,
+            pause_always_ready: false,
+            bypass_checksum_disconnect: false,
+        };
+        assert!(sync_net_flags_to_exe_bytes(&mut work, &nat_only, target, None).unwrap());
+        assert!(!is_lan_bind_hooks_applied(&work));
+        assert!(is_nat_direct_hooks_applied(&work));
+        assert!(!is_menu_redirect_patched(&work));
+        assert!(!is_menu_caption_patched(&work));
+        assert!(!is_lobby_alttab_unready_nop_patched(&work));
+        assert!(!is_pause_always_ready_patched(&work));
+        assert!(!is_startup_checksum_bypass_patched(&work));
+        set_direct_target_in_exe(&mut work, Some(Ipv4Addr::new(203, 0, 113, 5)), 9101, 9104)
+            .unwrap();
+
+        // Turn EVERYTHING off -> 100% byte-identical to vanilla
+        let all_off = NetExeFlags {
+            lan_bind: false,
+            nat_direct: false,
+            menu_redirect: false,
+            menu_caption: false,
+            lobby_alttab_unready_nop: false,
+            pause_always_ready: false,
+            bypass_checksum_disconnect: false,
+        };
+        assert!(sync_net_flags_to_exe_bytes(&mut work, &all_off, None, None).unwrap());
+        assert_eq!(work, vanilla);
+        assert!(!sync_net_flags_to_exe_bytes(&mut work, &all_off, None, None).unwrap());
     }
 }

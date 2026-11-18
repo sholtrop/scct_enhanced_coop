@@ -1,6 +1,5 @@
 #![windows_subsystem = "windows"]
 
-mod flags;
 mod gui;
 mod headless;
 mod ip;
@@ -9,6 +8,7 @@ mod levels;
 mod net;
 mod patcher;
 mod quicksave_persistence;
+mod resync;
 mod stun;
 mod trace;
 mod umd;
@@ -20,8 +20,9 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "patch_sp_levels",
-    about = "Convert all 11 SCCT Single Player missions to standalone Coop maps, append them to the Coop Mission Select dropdown, and fix multi-NIC LAN joining."
+    name = "scct_coop_enhancer",
+    version,
+    about = "Splinter Cell: Chaos Theory Enhanced Coop installer and online/LAN launcher: converts all 11 Single Player missions for Co-op, adds 5-character Friend Code NAT traversal, fixes multi-NIC LAN joining, enables persistent co-op quick saves, and fixes sync/desync issues."
 )]
 struct Args {
     /// Path to SCCT game root folder or System folder (auto-detects current folder if omitted)
@@ -68,21 +69,17 @@ struct Args {
     #[arg(long)]
     no_launch: bool,
 
-    /// Apply all experimental gameplay fixes (security camera alarms and non-lethal game over) to splintercell3.exe
+    /// Bypass lockstep checksum disconnect (Trace Mode; CLI-only, default: off)
+    #[arg(long, visible_alias = "bypass-startup-checksum")]
+    bypass_checksum_disconnect: bool,
+
+    /// Automatically resync Host -> Client simulation state in memory on lockstep checksum mismatch
+    #[arg(long, visible_alias = "auto-resync")]
+    resync: bool,
+
+    /// Show advanced developer / debug flag controls in the launcher UI
     #[arg(long)]
-    gameplay_fixes: bool,
-
-    /// Enable an optional patch flag by ID (e.g. --enable-flag camera_alarms)
-    #[arg(long = "enable-flag", value_name = "FLAG")]
-    enable_flags: Vec<String>,
-
-    /// Disable an optional patch flag by ID (e.g. --disable-flag nonlethal_gameover)
-    #[arg(long = "disable-flag", value_name = "FLAG")]
-    disable_flags: Vec<String>,
-
-    /// List all available patch flags
-    #[arg(long)]
-    list_flags: bool,
+    dev: bool,
 
     /// Run in headless CLI mode instead of launching GUI
     #[arg(long)]
@@ -91,32 +88,6 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-
-    if args.list_flags {
-        if flags::ALL_FLAGS.is_empty() {
-            println!("No optional patch flags configured (all fixes, including security camera alarms and non-lethal mission Game Over, are included in the standard installation).");
-        } else {
-            println!("Available patch flags:");
-            for def in flags::ALL_FLAGS {
-                let exp = if def.experimental {
-                    " [EXPERIMENTAL]"
-                } else {
-                    ""
-                };
-                let def_status = if def.default_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                };
-                println!(
-                    "  {:<20} {}{} (default: {})",
-                    def.id, def.name, exp, def_status
-                );
-                println!("                       {}", def.description);
-            }
-        }
-        return Ok(());
-    }
 
     let mode_count = usize::from(args.host) + usize::from(args.join.is_some()) + usize::from(args.lan);
     if mode_count > 1 {
@@ -144,60 +115,6 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        let mut flag_states = flags::load_flag_states(&game_root);
-        if flag_states.is_empty() {
-            flag_states = flags::default_flag_states();
-        }
-        if args.gameplay_fixes {
-            for f in &mut flag_states {
-                f.enabled = true;
-            }
-        }
-        for id in &args.enable_flags {
-            if id.eq_ignore_ascii_case("camera_alarms")
-                || id.eq_ignore_ascii_case("nonlethal_gameover")
-            {
-                println!(
-                    "Note: '{}' is now included in the standard installation and is always enabled.",
-                    id
-                );
-                continue;
-            }
-            if let Some(f) = flag_states
-                .iter_mut()
-                .find(|f| flags::flag_matches_id(f.def.id, id))
-            {
-                f.enabled = true;
-            } else {
-                anyhow::bail!(
-                    "Unknown flag to enable: '{}'. Run with --list-flags to see available flags.",
-                    id
-                );
-            }
-        }
-        for id in &args.disable_flags {
-            if id.eq_ignore_ascii_case("camera_alarms")
-                || id.eq_ignore_ascii_case("nonlethal_gameover")
-            {
-                println!(
-                    "Note: '{}' is now a standard fix and cannot be disabled.",
-                    id
-                );
-                continue;
-            }
-            if let Some(f) = flag_states
-                .iter_mut()
-                .find(|f| flags::flag_matches_id(f.def.id, id))
-            {
-                f.enabled = false;
-            } else {
-                anyhow::bail!(
-                    "Unknown flag to disable: '{}'. Run with --list-flags to see available flags.",
-                    id
-                );
-            }
-        }
-
         let bind_ip = args.bind_ip.filter(|ip| !ip.is_unspecified());
 
         if args.lan {
@@ -207,7 +124,8 @@ fn main() -> Result<()> {
                 stun_port: args.stun_port,
                 api_port: args.api_port,
                 no_launch: args.no_launch,
-                flags: &flag_states,
+                bypass_checksum_disconnect: args.bypass_checksum_disconnect,
+                auto_resync: args.resync,
                 bind_ip,
             };
             headless::run_headless_lan(opts)?;
@@ -221,7 +139,8 @@ fn main() -> Result<()> {
                 stun_port: args.stun_port,
                 api_port: args.api_port,
                 no_launch: args.no_launch,
-                flags: &flag_states,
+                bypass_checksum_disconnect: args.bypass_checksum_disconnect,
+                auto_resync: args.resync,
                 bind_ip,
             };
             headless::run_headless_host(opts)?;
@@ -235,20 +154,21 @@ fn main() -> Result<()> {
                 stun_port: args.stun_port,
                 api_port: args.api_port,
                 no_launch: args.no_launch,
-                flags: &flag_states,
+                bypass_checksum_disconnect: args.bypass_checksum_disconnect,
+                auto_resync: args.resync,
                 bind_ip,
             };
             headless::run_headless_join(opts, code)?;
             return Ok(());
         }
 
-        patcher::apply_all(&game_root, args.no_net_fix, &flag_states)?;
+        patcher::apply_all(&game_root, args.no_net_fix, args.bypass_checksum_disconnect)?;
         return Ok(());
     }
 
     // Default: Launch GUI!
     let initial_bind_ip = args.bind_ip.filter(|ip| !ip.is_unspecified());
-    if let Err(e) = gui::run_gui(args.game_dir.clone(), initial_bind_ip) {
+    if let Err(e) = gui::run_gui(args.game_dir.clone(), initial_bind_ip, args.resync, args.dev) {
         #[cfg(windows)]
         {
             unsafe extern "system" {
@@ -284,4 +204,37 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_dev_flag_defaults_false_and_parses() {
+        let default_args = Args::try_parse_from(["scct_coop_enhancer"]).unwrap();
+        assert!(!default_args.dev);
+        assert!(!default_args.resync);
+        assert!(!default_args.bypass_checksum_disconnect);
+
+        let dev_args = Args::try_parse_from(["scct_coop_enhancer", "--dev"]).unwrap();
+        assert!(dev_args.dev);
+    }
+
+    #[test]
+    fn test_default_mod_flags_all_standard_enabled_except_opt_in_desync_bypass() {
+        let flags = patcher::ModFlags::default();
+        assert_eq!(flags, patcher::ModFlags::standard_coop());
+        assert!(!flags.runtime_bypass_checksum_disconnect);
+        assert!(!flags.coop_aizone_enable);
+        for desc in patcher::FLAG_DESCRIPTORS {
+            let expected = !matches!(desc.short_name, "bypass_checksum_dc" | "coop_aizone");
+            assert_eq!(
+                (desc.get)(&flags),
+                expected,
+                "Unexpected default value for flag {}",
+                desc.short_name
+            );
+        }
+    }
 }

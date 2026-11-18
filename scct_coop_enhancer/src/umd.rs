@@ -1,24 +1,35 @@
-use anyhow::{bail, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::levels::{LevelSpec, DEFAULT_COOP_EMISSION_MANAGER, DEFAULT_COOP_LOADOUTS, LANG_EXTS};
+use crate::levels::{DEFAULT_COOP_EMISSION_MANAGER, DEFAULT_COOP_LOADOUTS, LANG_EXTS, LevelSpec};
 
 pub const UMD_MAGIC: u32 = 0x40FD_724D;
 pub const UMD_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UmdPatchOptions {
+    pub coop_missions_and_loc: bool,
+    pub lan_menu_caption: bool,
+}
+
+impl Default for UmdPatchOptions {
+    fn default() -> Self {
+        Self {
+            coop_missions_and_loc: true,
+            lan_menu_caption: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct UmdFooter {
     pub tag: u32,
     pub toc_offset: u32,
-    #[allow(dead_code)]
-    pub total_size: u32,
-    #[allow(dead_code)]
-    pub version: u32,
-    #[allow(dead_code)]
-    pub magic: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -38,16 +49,15 @@ pub struct ExtractedLevelInfo {
     pub loading_dds: HashMap<u8, Vec<u8>>,
 }
 
-pub fn parse_umd_archive(data: &[u8]) -> Result<(UmdFooter, Vec<UmdEntry>, HashMap<String, usize>)> {
-    if data.len() < 20 {
-        bail!("UMD file too small ({} bytes)", data.len());
+fn parse_umd_footer(footer_bytes: &[u8], expected_total_len: usize) -> Result<UmdFooter> {
+    if footer_bytes.len() != 20 {
+        bail!("Expected 20-byte UMD footer, got {}", footer_bytes.len());
     }
-    let footer_start = data.len() - 20;
-    let tag = u32::from_le_bytes(data[footer_start..footer_start + 4].try_into()?);
-    let toc_offset = u32::from_le_bytes(data[footer_start + 4..footer_start + 8].try_into()?);
-    let total_size = u32::from_le_bytes(data[footer_start + 8..footer_start + 12].try_into()?);
-    let version = u32::from_le_bytes(data[footer_start + 12..footer_start + 16].try_into()?);
-    let magic = u32::from_le_bytes(data[footer_start + 16..footer_start + 20].try_into()?);
+    let tag = u32::from_le_bytes(footer_bytes[0..4].try_into()?);
+    let toc_offset = u32::from_le_bytes(footer_bytes[4..8].try_into()?);
+    let total_size = u32::from_le_bytes(footer_bytes[8..12].try_into()?);
+    let version = u32::from_le_bytes(footer_bytes[12..16].try_into()?);
+    let magic = u32::from_le_bytes(footer_bytes[16..20].try_into()?);
 
     if magic != UMD_MAGIC || version != UMD_VERSION {
         bail!(
@@ -56,25 +66,28 @@ pub fn parse_umd_archive(data: &[u8]) -> Result<(UmdFooter, Vec<UmdEntry>, HashM
             version
         );
     }
-    if total_size as usize != data.len() {
+    if total_size as usize != expected_total_len {
         bail!(
             "UMD total_size ({}) != file size ({})",
             total_size,
-            data.len()
+            expected_total_len
         );
     }
+    Ok(UmdFooter { tag, toc_offset })
+}
 
-    let mut pos = toc_offset as usize;
-    let count = crate::upk::read_compact_index(data, &mut pos)?;
+fn parse_umd_toc_slice(toc_slice: &[u8]) -> Result<(Vec<UmdEntry>, HashMap<String, usize>)> {
+    let mut pos = 0usize;
+    let count = crate::upk::read_compact_index(toc_slice, &mut pos)?;
     let mut entries = Vec::with_capacity(count as usize);
     let mut index_by_lower = HashMap::new();
 
     for idx in 0..count {
-        let name_len = crate::upk::read_compact_index(data, &mut pos)? as usize;
-        if pos + name_len > data.len() {
+        let name_len = crate::upk::read_compact_index(toc_slice, &mut pos)? as usize;
+        if pos + name_len > toc_slice.len() {
             bail!("UMD entry name extends past EOF");
         }
-        let raw_name = data[pos..pos + name_len].to_vec();
+        let raw_name = toc_slice[pos..pos + name_len].to_vec();
         pos += name_len;
         let trimmed_name = if raw_name.ends_with(&[0]) {
             &raw_name[..raw_name.len() - 1]
@@ -83,12 +96,12 @@ pub fn parse_umd_archive(data: &[u8]) -> Result<(UmdFooter, Vec<UmdEntry>, HashM
         };
         let path_str: String = trimmed_name.iter().map(|&b| b as char).collect();
 
-        if pos + 12 > data.len() {
+        if pos + 12 > toc_slice.len() {
             bail!("UMD entry header extends past EOF");
         }
-        let file_off = u32::from_le_bytes(data[pos..pos + 4].try_into()?) as usize;
-        let file_size = u32::from_le_bytes(data[pos + 4..pos + 8].try_into()?) as usize;
-        let flags = u32::from_le_bytes(data[pos + 8..pos + 12].try_into()?);
+        let file_off = u32::from_le_bytes(toc_slice[pos..pos + 4].try_into()?) as usize;
+        let file_size = u32::from_le_bytes(toc_slice[pos + 4..pos + 8].try_into()?) as usize;
+        let flags = u32::from_le_bytes(toc_slice[pos + 8..pos + 12].try_into()?);
         pos += 12;
 
         index_by_lower.insert(path_str.to_lowercase(), idx as usize);
@@ -101,25 +114,140 @@ pub fn parse_umd_archive(data: &[u8]) -> Result<(UmdFooter, Vec<UmdEntry>, HashM
         });
     }
 
-    if pos != data.len() - 20 {
+    if pos != toc_slice.len() {
         bail!("UMD TOC did not end cleanly at 20-byte footer");
     }
 
-    let footer = UmdFooter {
-        tag,
-        toc_offset,
-        total_size,
-        version,
-        magic,
-    };
+    Ok((entries, index_by_lower))
+}
+
+pub fn parse_umd_archive(
+    data: &[u8],
+) -> Result<(UmdFooter, Vec<UmdEntry>, HashMap<String, usize>)> {
+    if data.len() < 20 {
+        bail!("UMD file too small ({} bytes)", data.len());
+    }
+    let footer_start = data.len() - 20;
+    let footer = parse_umd_footer(&data[footer_start..], data.len())?;
+    if (footer.toc_offset as usize) > footer_start {
+        bail!("UMD toc_offset extends past footer");
+    }
+    let (entries, index_by_lower) = parse_umd_toc_slice(&data[footer.toc_offset as usize..footer_start])?;
     Ok((footer, entries, index_by_lower))
 }
 
-pub fn serialize_umd_toc_and_footer(
-    payload: &mut Vec<u8>,
-    entries: &[UmdEntry],
-    tag: u32,
-) {
+type UmdTocData = (File, UmdFooter, Vec<UmdEntry>, HashMap<String, usize>);
+
+fn read_umd_toc_fast(umd_path: &Path) -> Result<UmdTocData> {
+    let mut f = File::open(umd_path).with_context(|| format!("Opening UMD {}", umd_path.display()))?;
+    let total_len = f.metadata()?.len() as usize;
+    if total_len < 20 {
+        bail!("UMD file too small ({} bytes)", total_len);
+    }
+    f.seek(SeekFrom::Start((total_len - 20) as u64))?;
+    let mut footer_bytes = [0u8; 20];
+    f.read_exact(&mut footer_bytes)?;
+    let footer = parse_umd_footer(&footer_bytes, total_len)?;
+    let toc_start = footer.toc_offset as usize;
+    let footer_start = total_len - 20;
+    if toc_start > footer_start {
+        bail!("UMD toc_offset extends past footer");
+    }
+    f.seek(SeekFrom::Start(toc_start as u64))?;
+    let mut toc_buf = vec![0u8; footer_start - toc_start];
+    f.read_exact(&mut toc_buf)?;
+    let (entries, index_by_lower) = parse_umd_toc_slice(&toc_buf)?;
+    Ok((f, footer, entries, index_by_lower))
+}
+
+fn read_umd_entry_slice(f: &mut File, ent: &UmdEntry) -> Result<Vec<u8>> {
+    f.seek(SeekFrom::Start(ent.offset as u64))?;
+    let mut buf = vec![0u8; ent.size];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Fast TOC + seek check of `dynamic-pc.umd` without reading the 583 MB archive into memory.
+pub fn detect_umd_options_fast(umd_path: &Path) -> Option<UmdPatchOptions> {
+    let (mut f, _footer, entries, index_by_lower) = read_umd_toc_fast(umd_path).ok()?;
+
+    let mut coop_missions_and_loc = false;
+    if let Some(&rot_idx) = index_by_lower.get("system\\maprotation.ini")
+        && let Ok(rot_bytes) = read_umd_entry_slice(&mut f, &entries[rot_idx])
+    {
+        let rot_text = String::from_utf8_lossy(&rot_bytes).to_ascii_lowercase();
+        coop_missions_and_loc = rot_text.contains("01_lighthouse_coop");
+    }
+
+    let mut lan_menu_caption = false;
+    for lang in LANG_EXTS {
+        let pg_key = format!("data\\system\\localization\\pregame_pc.{}", lang);
+        if let Some(&pg_idx) = index_by_lower.get(&pg_key)
+            && let Ok(pg_bytes) = read_umd_entry_slice(&mut f, &entries[pg_idx])
+        {
+            let pg_text = pg_bytes.iter().map(|&b| b as char).collect::<String>();
+            if pg_text.contains("LanCaption=ENHANCED COOP") {
+                lan_menu_caption = true;
+                break;
+            }
+        }
+    }
+
+    Some(UmdPatchOptions {
+        coop_missions_and_loc,
+        lan_menu_caption,
+    })
+}
+
+/// Extracts `ExtractedLevelInfo` for `levels` directly via seeks without loading the entire UMD archive.
+pub fn extract_sp_level_info_from_umd(
+    umd_path: &Path,
+    levels: &[LevelSpec],
+) -> Result<HashMap<String, ExtractedLevelInfo>> {
+    let (mut f, _footer, entries, index_by_lower) = read_umd_toc_fast(umd_path)?;
+    let mut extracted = HashMap::new();
+    for spec in levels {
+        let src_map = spec.source_map;
+        let coop_map = spec.coop_map;
+        let ini_key = format!("data\\maps\\{}.ini", src_map.to_lowercase());
+        let &ini_idx = index_by_lower
+            .get(&ini_key)
+            .with_context(|| format!("Missing {} inside {}", ini_key, umd_path.display()))?;
+        let src_ini_bytes = read_umd_entry_slice(&mut f, &entries[ini_idx])?;
+
+        let loc_val = get_ini_key_value(&src_ini_bytes, "General", "LocalizationFile");
+        let canonical_src = loc_val
+            .as_deref()
+            .and_then(|s| s.rsplit('\\').next())
+            .unwrap_or(src_map)
+            .to_string();
+
+        let mut dds_map = HashMap::new();
+        for idx in [1u8, 2u8] {
+            let dds_key = format!(
+                "data\\magma\\datapc\\textures\\genloadings\\{}_loading_{}.dds",
+                src_map.to_lowercase(),
+                idx
+            );
+            if let Some(&d_idx) = index_by_lower.get(&dds_key) {
+                dds_map.insert(idx, read_umd_entry_slice(&mut f, &entries[d_idx])?);
+            }
+        }
+
+        extracted.insert(
+            coop_map.to_string(),
+            ExtractedLevelInfo {
+                spec: *spec,
+                canonical_src,
+                src_ini: src_ini_bytes,
+                loading_dds: dds_map,
+            },
+        );
+    }
+    Ok(extracted)
+}
+
+pub fn serialize_umd_toc_and_footer(payload: &mut Vec<u8>, entries: &[UmdEntry], tag: u32) {
     let new_toc_offset = payload.len() as u32;
     payload.extend_from_slice(&crate::upk::write_compact_index(entries.len() as i32));
     for ent in entries {
@@ -135,49 +263,6 @@ pub fn serialize_umd_toc_and_footer(
     payload.extend_from_slice(&new_total_size.to_le_bytes());
     payload.extend_from_slice(&UMD_VERSION.to_le_bytes());
     payload.extend_from_slice(&UMD_MAGIC.to_le_bytes());
-}
-
-fn replace_in_place(slice: &mut [u8], target: &[u8], replacement: &[u8]) {
-    assert_eq!(target.len(), replacement.len());
-    let tlen = target.len();
-    let mut i = 0;
-    while i + tlen <= slice.len() {
-        if &slice[i..i + tlen] == target {
-            slice[i..i + tlen].copy_from_slice(replacement);
-            i += tlen;
-        } else {
-            i += 1;
-        }
-    }
-}
-
-pub fn normalize_umd_payload_baseline(
-    payload: &mut [u8],
-    entries: &[UmdEntry],
-    index_by_lower: &HashMap<String, usize>,
-) {
-    for vpath in &["system\\maprotation.ini", "data\\maps\\00_training_coop.ini"] {
-        if let Some(&idx) = index_by_lower.get(*vpath) {
-            let ent = &entries[idx];
-            let off = ent.offset;
-            let size = ent.size;
-            if off + size <= payload.len() {
-                let slice = &mut payload[off..off + size];
-                replace_in_place(slice, b"01_Lighthouse   ", b"00_Training_COOP");
-            }
-        }
-    }
-
-    let fra_path = "data\\system\\localization\\00_training_coop.fra";
-    if let Some(&idx) = index_by_lower.get(fra_path) {
-        let ent = &entries[idx];
-        let off = ent.offset;
-        let size = ent.size;
-        if off + size <= payload.len() {
-            let slice = &mut payload[off..off + size];
-            replace_in_place(slice, b"MapName=LIGHTHOUSE       .", b"MapName=ENTRAINEMENT COOP.");
-        }
-    }
 }
 
 pub fn get_ini_key_value(ini_bytes: &[u8], section: &str, key: &str) -> Option<String> {
@@ -207,10 +292,7 @@ pub fn get_ini_key_value(ini_bytes: &[u8], section: &str, key: &str) -> Option<S
     None
 }
 
-pub fn append_missions_to_map_rotation(
-    rot_bytes: &[u8],
-    coop_map_names: &[&str],
-) -> Vec<u8> {
+pub fn append_missions_to_map_rotation(rot_bytes: &[u8], coop_map_names: &[&str]) -> Vec<u8> {
     let text = rot_bytes.iter().map(|&b| b as char).collect::<String>();
 
     let idx_re = Regex::new(r"(?im)^MissionCoop\[(\d+)\]\s*=").unwrap();
@@ -251,10 +333,7 @@ pub fn append_missions_to_map_rotation(
     combined.chars().map(|c| c as u8).collect()
 }
 
-pub fn append_loading_screen_sections(
-    ls_bytes: &[u8],
-    levels: &[LevelSpec],
-) -> Vec<u8> {
+pub fn append_loading_screen_sections(ls_bytes: &[u8], levels: &[LevelSpec]) -> Vec<u8> {
     let raw_lower = ls_bytes.to_ascii_lowercase();
 
     let extract_section_lines = |sec_name_lower: &[u8]| -> Vec<Vec<u8>> {
@@ -271,10 +350,7 @@ pub fn append_loading_screen_sections(
             None => return Vec::new(),
         };
 
-        let end = match ls_bytes[idx + 1..]
-            .windows(3)
-            .position(|w| w == b"\r\n[")
-        {
+        let end = match ls_bytes[idx + 1..].windows(3).position(|w| w == b"\r\n[") {
             Some(p) => idx + 1 + p,
             None => ls_bytes.len(),
         };
@@ -425,12 +501,23 @@ pub fn build_appended_coop_ini(
     let re_loc = Regex::new(r"(?im)^LocalizationFile=.*$").unwrap();
     let re_flag = Regex::new(r"(?im)^Flag=.*\r?\n").unwrap();
 
-    text = re_map.replace_all(&text, format!("MapName={}", coop_map)).to_string();
-    text = re_start.replace_all(&text, format!("StartMap={}", coop_map)).to_string();
-    text = re_ident.replace_all(&text, format!("Identity={}", identity)).to_string();
+    text = re_map
+        .replace_all(&text, format!("MapName={}", coop_map))
+        .to_string();
+    text = re_start
+        .replace_all(&text, format!("StartMap={}", coop_map))
+        .to_string();
+    text = re_ident
+        .replace_all(&text, format!("Identity={}", identity))
+        .to_string();
     text = re_mp.replace_all(&text, "Multiplayer=true").to_string();
     text = re_xbl.replace_all(&text, "XboxLiveContent=0").to_string();
-    text = re_loc.replace_all(&text, format!("LocalizationFile=Localization\\{}", source_map)).to_string();
+    text = re_loc
+        .replace_all(
+            &text,
+            format!("LocalizationFile=Localization\\{}", source_map),
+        )
+        .to_string();
     text = re_flag.replace_all(&text, "").to_string();
 
     text = remove_sec(&text, "LOADOUT_STEALTH");
@@ -439,13 +526,20 @@ pub fn build_appended_coop_ini(
     if !text.to_uppercase().contains("[LOADOUT_HOST]") {
         let em_replacement = format!(
             "{}\r\n\r\n{}\r\n",
-            DEFAULT_COOP_EMISSION_MANAGER.replace('\n', "\r\n").trim_end_matches(&['\r', '\n'][..]),
-            DEFAULT_COOP_LOADOUTS.replace('\n', "\r\n").trim_end_matches(&['\r', '\n'][..])
+            DEFAULT_COOP_EMISSION_MANAGER
+                .replace('\n', "\r\n")
+                .trim_end_matches(&['\r', '\n'][..]),
+            DEFAULT_COOP_LOADOUTS
+                .replace('\n', "\r\n")
+                .trim_end_matches(&['\r', '\n'][..])
         );
         text = replace_sec(&text, "Echelon.EMissionManager", &em_replacement);
     }
 
-    text = text.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n");
+    text = text
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n");
     if !text.ends_with("\r\n") {
         text.push_str("\r\n");
     }
@@ -527,7 +621,12 @@ fn append_virtual_file(
     let old_sz = entries[ent_idx].size;
     entries[ent_idx].offset = new_off;
     entries[ent_idx].size = new_bytes.len();
-    (entries[ent_idx].path.clone(), new_off, old_sz, new_bytes.len())
+    (
+        entries[ent_idx].path.clone(),
+        new_off,
+        old_sz,
+        new_bytes.len(),
+    )
 }
 
 fn upsert_virtual_file(
@@ -568,16 +667,34 @@ pub fn patch_pregame_pc_coop_menu_caption(loc_bytes: &[u8]) -> Vec<u8> {
     new_text.chars().map(|c| c as u8).collect()
 }
 
-pub fn patch_umd_for_all_sp_levels(
+/// Patches or restores `dynamic-pc.umd` according to `opts`.
+/// When both options are `false`, restores vanilla `umd_bak_path -> umd_path`.
+pub fn patch_umd_with_options(
     umd_path: &Path,
     umd_bak_path: &Path,
     levels: &[LevelSpec],
-) -> Result<HashMap<String, ExtractedLevelInfo>> {
+    opts: &UmdPatchOptions,
+) -> Result<Option<HashMap<String, ExtractedLevelInfo>>> {
+    if !opts.coop_missions_and_loc && !opts.lan_menu_caption {
+        if umd_bak_path.exists() {
+            std::fs::copy(umd_bak_path, umd_path)?;
+            crate::scct_log!(
+                "  [UMD] Restored vanilla {} from {}",
+                umd_path.display(),
+                umd_bak_path.display()
+            );
+        }
+        return Ok(None);
+    }
+
     if !umd_bak_path.exists() {
         if !umd_path.exists() {
             bail!("Missing UMD archive: {}", umd_path.display());
         }
-        crate::scct_log!("  [BAK] Creating clean UMD backup -> {} ...", umd_bak_path.display());
+        crate::scct_log!(
+            "  [BAK] Creating clean UMD backup -> {} ...",
+            umd_bak_path.display()
+        );
         std::fs::copy(umd_path, umd_bak_path)?;
     }
 
@@ -585,187 +702,225 @@ pub fn patch_umd_for_all_sp_levels(
     let (footer, mut entries, mut index_by_lower) = parse_umd_archive(&raw_umd)?;
     let mut payload = raw_umd[..footer.toc_offset as usize].to_vec();
 
-    normalize_umd_payload_baseline(&mut payload, &entries, &index_by_lower);
-    validate_level_specs(levels, &payload, &entries, &index_by_lower)?;
+    let extracted_opt = if opts.coop_missions_and_loc {
+        validate_level_specs(levels, &payload, &entries, &index_by_lower)?;
 
-    let mut extracted = HashMap::new();
-    for spec in levels {
-        let src_map = spec.source_map;
-        let coop_map = spec.coop_map;
-        let ini_idx = index_by_lower[&format!("data\\maps\\{}.ini", src_map.to_lowercase())];
-        let ini_ent = &entries[ini_idx];
-        let src_ini_bytes = payload[ini_ent.offset..ini_ent.offset + ini_ent.size].to_vec();
+        let mut extracted = HashMap::new();
+        for spec in levels {
+            let src_map = spec.source_map;
+            let coop_map = spec.coop_map;
+            let ini_idx = index_by_lower[&format!("data\\maps\\{}.ini", src_map.to_lowercase())];
+            let ini_ent = &entries[ini_idx];
+            let src_ini_bytes = payload[ini_ent.offset..ini_ent.offset + ini_ent.size].to_vec();
 
-        let loc_val = get_ini_key_value(&src_ini_bytes, "General", "LocalizationFile");
-        let canonical_src = loc_val
-            .as_deref()
-            .and_then(|s| s.rsplit('\\').next())
-            .unwrap_or(src_map)
-            .to_string();
+            let loc_val = get_ini_key_value(&src_ini_bytes, "General", "LocalizationFile");
+            let canonical_src = loc_val
+                .as_deref()
+                .and_then(|s| s.rsplit('\\').next())
+                .unwrap_or(src_map)
+                .to_string();
 
-        let mut dds_map = HashMap::new();
-        for idx in [1u8, 2u8] {
-            let dds_key = format!(
-                "data\\magma\\datapc\\textures\\genloadings\\{}_loading_{}.dds",
-                src_map.to_lowercase(),
-                idx
-            );
-            if let Some(&d_idx) = index_by_lower.get(&dds_key) {
-                let d_ent = &entries[d_idx];
-                dds_map.insert(idx, payload[d_ent.offset..d_ent.offset + d_ent.size].to_vec());
+            let mut dds_map = HashMap::new();
+            for idx in [1u8, 2u8] {
+                let dds_key = format!(
+                    "data\\magma\\datapc\\textures\\genloadings\\{}_loading_{}.dds",
+                    src_map.to_lowercase(),
+                    idx
+                );
+                if let Some(&d_idx) = index_by_lower.get(&dds_key) {
+                    let d_ent = &entries[d_idx];
+                    dds_map.insert(
+                        idx,
+                        payload[d_ent.offset..d_ent.offset + d_ent.size].to_vec(),
+                    );
+                }
             }
+
+            extracted.insert(
+                coop_map.to_string(),
+                ExtractedLevelInfo {
+                    spec: *spec,
+                    canonical_src,
+                    src_ini: src_ini_bytes,
+                    loading_dds: dds_map,
+                },
+            );
         }
 
-        extracted.insert(
-            coop_map.to_string(),
-            ExtractedLevelInfo {
-                spec: *spec,
-                canonical_src,
-                src_ini: src_ini_bytes,
-                loading_dds: dds_map,
-            },
-        );
-    }
-
-    let rot_idx = index_by_lower["system\\maprotation.ini"];
-    let rot_ent = &entries[rot_idx];
-    let orig_rot = payload[rot_ent.offset..rot_ent.offset + rot_ent.size].to_vec();
-    let coop_names: Vec<&str> = levels.iter().map(|s| s.coop_map).collect();
-    let new_rot = append_missions_to_map_rotation(&orig_rot, &coop_names);
-    let (rpath, roff, rold, rnew) = append_virtual_file(
-        &mut payload,
-        &mut entries,
-        &index_by_lower,
-        "system\\maprotation.ini",
-        &new_rot,
-    );
-    crate::scct_log!(
-        "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, +{} Coop missions)",
-        rpath,
-        roff,
-        rold,
-        rnew,
-        coop_names.len()
-    );
-
-    for lang in LANG_EXTS {
-        let ls_key = format!("data\\system\\localization\\loadingscreens.{}", lang);
-        if !index_by_lower.contains_key(&ls_key) {
-            continue;
-        }
-        let ls_idx = index_by_lower[&ls_key];
-        let ls_ent = &entries[ls_idx];
-        let orig_ls = payload[ls_ent.offset..ls_ent.offset + ls_ent.size].to_vec();
-        let new_ls = append_loading_screen_sections(&orig_ls, levels);
-        let (lpath, loff, lold, lnew) = append_virtual_file(
+        let rot_idx = index_by_lower["system\\maprotation.ini"];
+        let rot_ent = &entries[rot_idx];
+        let orig_rot = payload[rot_ent.offset..rot_ent.offset + rot_ent.size].to_vec();
+        let coop_names: Vec<&str> = levels.iter().map(|s| s.coop_map).collect();
+        let new_rot = append_missions_to_map_rotation(&orig_rot, &coop_names);
+        let (rpath, roff, rold, rnew) = append_virtual_file(
             &mut payload,
             &mut entries,
             &index_by_lower,
-            &ls_key,
-            &new_ls,
+            "system\\maprotation.ini",
+            &new_rot,
         );
         crate::scct_log!(
-            "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes)",
-            lpath, loff, lold, lnew
+            "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, +{} Coop missions)",
+            rpath,
+            roff,
+            rold,
+            rnew,
+            coop_names.len()
         );
-    }
 
-    // Update Seoul 1 and Seoul 2 mission display names in localization files
-    let seoul_missions = [("08_seoulone", "SEOUL 1"), ("09_seoultwo", "SEOUL 2")];
-    let re_map = Regex::new(r"(?im)^MapName=.*$").unwrap();
-    for lang in LANG_EXTS {
-        for (stem, name_en) in seoul_missions {
-            let loc_key = format!("data\\system\\localization\\{}.{}", stem, lang);
-            if !index_by_lower.contains_key(&loc_key) {
+        for lang in LANG_EXTS {
+            let ls_key = format!("data\\system\\localization\\loadingscreens.{}", lang);
+            if !index_by_lower.contains_key(&ls_key) {
                 continue;
             }
-            let loc_idx = index_by_lower[&loc_key];
-            let loc_ent = &entries[loc_idx];
-            let orig_bytes = payload[loc_ent.offset..loc_ent.offset + loc_ent.size].to_vec();
-            let text = orig_bytes.iter().map(|&b| b as char).collect::<String>();
-
-            let display_name = match *lang {
-                "esp" => if name_en == "SEOUL 1" { "SEÚL 1" } else { "SEÚL 2" },
-                "ita" => if name_en == "SEOUL 1" { "SEUL 1" } else { "SEUL 2" },
-                _ => name_en,
-            };
-
-            let new_text = re_map.replace(&text, format!("MapName={}", display_name)).to_string();
-            let new_bytes: Vec<u8> = new_text.chars().map(|c| c as u8).collect();
+            let ls_idx = index_by_lower[&ls_key];
+            let ls_ent = &entries[ls_idx];
+            let orig_ls = payload[ls_ent.offset..ls_ent.offset + ls_ent.size].to_vec();
+            let new_ls = append_loading_screen_sections(&orig_ls, levels);
             let (lpath, loff, lold, lnew) = append_virtual_file(
                 &mut payload,
                 &mut entries,
                 &index_by_lower,
-                &loc_key,
-                &new_bytes,
+                &ls_key,
+                &new_ls,
             );
             crate::scct_log!(
-                "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, MapName={})",
-                lpath, loff, lold, lnew, display_name
+                "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes)",
+                lpath,
+                loff,
+                lold,
+                lnew
             );
         }
-    }
 
-    // Clone level localization files (Data\System\Localization\<canonical_src>.<lang> -> <coop_map>.<lang>)
-    // so AEComputer ([Computer]/[Email]) and ECustomObjectiveInteraction ([Interaction]) resolve in-game text.
-    let mut cloned_loc_count = 0usize;
-    for spec in levels {
-        let coop_map = spec.coop_map;
-        let Some(info) = extracted.get(coop_map) else {
-            continue;
-        };
-        let src_stem_lower = info.canonical_src.to_lowercase();
+        // Update Seoul 1 and Seoul 2 mission display names in localization files
+        let seoul_missions = [("08_seoulone", "SEOUL 1"), ("09_seoultwo", "SEOUL 2")];
+        let re_map = Regex::new(r"(?im)^MapName=.*$").unwrap();
         for lang in LANG_EXTS {
-            let src_loc_key = format!("data\\system\\localization\\{}.{}", src_stem_lower, lang);
-            let Some(&src_idx) = index_by_lower.get(&src_loc_key) else {
-                continue;
-            };
-            let src_ent = &entries[src_idx];
-            let src_bytes = payload[src_ent.offset..src_ent.offset + src_ent.size].to_vec();
-            let dst_canonical = format!("Data\\System\\Localization\\{}.{}", coop_map, lang);
-            upsert_virtual_file(
-                &mut payload,
-                &mut entries,
-                &mut index_by_lower,
-                &dst_canonical,
-                &src_bytes,
-            );
-            cloned_loc_count += 1;
-        }
-    }
-    crate::scct_log!(
-        "  [UMD] Added {} Data\\System\\Localization\\*_COOP.<lang> entries for computers, emails, and interactions",
-        cloned_loc_count
-    );
+            for (stem, name_en) in seoul_missions {
+                let loc_key = format!("data\\system\\localization\\{}.{}", stem, lang);
+                if !index_by_lower.contains_key(&loc_key) {
+                    continue;
+                }
+                let loc_idx = index_by_lower[&loc_key];
+                let loc_ent = &entries[loc_idx];
+                let orig_bytes = payload[loc_ent.offset..loc_ent.offset + loc_ent.size].to_vec();
+                let text = orig_bytes.iter().map(|&b| b as char).collect::<String>();
 
-    // Update Coop menu LAN button caption -> ENHANCED COOP in PreGame_PC localization files
-    for lang in LANG_EXTS {
-        let pg_key = format!("data\\system\\localization\\pregame_pc.{}", lang);
-        if let Some(&pg_idx) = index_by_lower.get(&pg_key) {
-            let pg_ent = &entries[pg_idx];
-            let orig_pg = payload[pg_ent.offset..pg_ent.offset + pg_ent.size].to_vec();
-            let new_pg = patch_pregame_pc_coop_menu_caption(&orig_pg);
-            if new_pg != orig_pg {
+                let display_name = match *lang {
+                    "esp" => {
+                        if name_en == "SEOUL 1" {
+                            "SEÚL 1"
+                        } else {
+                            "SEÚL 2"
+                        }
+                    }
+                    "ita" => {
+                        if name_en == "SEOUL 1" {
+                            "SEUL 1"
+                        } else {
+                            "SEUL 2"
+                        }
+                    }
+                    _ => name_en,
+                };
+
+                let new_text = re_map
+                    .replace(&text, format!("MapName={}", display_name))
+                    .to_string();
+                let new_bytes: Vec<u8> = new_text.chars().map(|c| c as u8).collect();
                 let (lpath, loff, lold, lnew) = append_virtual_file(
                     &mut payload,
                     &mut entries,
                     &index_by_lower,
-                    &pg_key,
-                    &new_pg,
+                    &loc_key,
+                    &new_bytes,
                 );
                 crate::scct_log!(
-                    "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, LanCaption=ENHANCED COOP)",
-                    lpath, loff, lold, lnew
+                    "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, MapName={})",
+                    lpath,
+                    loff,
+                    lold,
+                    lnew,
+                    display_name
                 );
+            }
+        }
+
+        // Clone level localization files (Data\System\Localization\<canonical_src>.<lang> -> <coop_map>.<lang>)
+        // so AEComputer ([Computer]/[Email]) and ECustomObjectiveInteraction ([Interaction]) resolve in-game text.
+        let mut cloned_loc_count = 0usize;
+        for spec in levels {
+            let coop_map = spec.coop_map;
+            let Some(info) = extracted.get(coop_map) else {
+                continue;
+            };
+            let src_stem_lower = info.canonical_src.to_lowercase();
+            for lang in LANG_EXTS {
+                let src_loc_key = format!("data\\system\\localization\\{}.{}", src_stem_lower, lang);
+                let Some(&src_idx) = index_by_lower.get(&src_loc_key) else {
+                    continue;
+                };
+                let src_ent = &entries[src_idx];
+                let src_bytes = payload[src_ent.offset..src_ent.offset + src_ent.size].to_vec();
+                let dst_canonical = format!("Data\\System\\Localization\\{}.{}", coop_map, lang);
+                upsert_virtual_file(
+                    &mut payload,
+                    &mut entries,
+                    &mut index_by_lower,
+                    &dst_canonical,
+                    &src_bytes,
+                );
+                cloned_loc_count += 1;
+            }
+        }
+        crate::scct_log!(
+            "  [UMD] Added {} Data\\System\\Localization\\*_COOP.<lang> entries for computers, emails, and interactions",
+            cloned_loc_count
+        );
+
+        Some(extracted)
+    } else {
+        None
+    };
+
+    if opts.lan_menu_caption {
+        // Update Coop menu LAN button caption -> ENHANCED COOP in PreGame_PC localization files
+        for lang in LANG_EXTS {
+            let pg_key = format!("data\\system\\localization\\pregame_pc.{}", lang);
+            if let Some(&pg_idx) = index_by_lower.get(&pg_key) {
+                let pg_ent = &entries[pg_idx];
+                let orig_pg = payload[pg_ent.offset..pg_ent.offset + pg_ent.size].to_vec();
+                let new_pg = patch_pregame_pc_coop_menu_caption(&orig_pg);
+                if new_pg != orig_pg {
+                    let (lpath, loff, lold, lnew) = append_virtual_file(
+                        &mut payload,
+                        &mut entries,
+                        &index_by_lower,
+                        &pg_key,
+                        &new_pg,
+                    );
+                    crate::scct_log!(
+                        "  [UMD] Updated {} @ 0x{:08X} ({} -> {} bytes, LanCaption=ENHANCED COOP)",
+                        lpath,
+                        loff,
+                        lold,
+                        lnew
+                    );
+                }
             }
         }
     }
 
     serialize_umd_toc_and_footer(&mut payload, &entries, footer.tag);
     std::fs::write(umd_path, &payload)?;
-    crate::scct_log!("  [UMD] Wrote {} ({} bytes)", umd_path.display(), payload.len());
+    crate::scct_log!(
+        "  [UMD] Wrote {} ({} bytes)",
+        umd_path.display(),
+        payload.len()
+    );
 
-    Ok(extracted)
+    Ok(extracted_opt)
 }
 
 #[cfg(test)]
@@ -814,5 +969,96 @@ mod tests {
         assert_eq!(old2, 26);
         assert_eq!(new2, 28);
     }
-}
 
+    #[test]
+    fn test_umd_fast_detection_and_selective_patch_options() {
+        let mut payload = vec![0u8; 4];
+        let mut entries = Vec::new();
+        let mut index_by_lower = HashMap::new();
+
+        upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "System\\MapRotation.ini",
+            b"[MapRotation]\r\nMaps=01_Panama\r\n",
+        );
+        upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\System\\Localization\\PreGame_PC.int",
+            b"[MainMenuCoop]\r\nLanCaption=LAN\r\n",
+        );
+        upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\Maps\\01_Lighthouse.ini",
+            b"[General]\r\nLocalizationFile=..\\System\\Localization\\01_Lighthouse\r\n",
+        );
+        upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\System\\Localization\\01_Lighthouse.int",
+            b"[Level]\r\nMapName=LIGHTHOUSE\r\n",
+        );
+        upsert_virtual_file(
+            &mut payload,
+            &mut entries,
+            &mut index_by_lower,
+            "Data\\Magma\\DataPC\\Textures\\GenLoadings\\01_Lighthouse_loading_1.dds",
+            b"DDS1",
+        );
+        serialize_umd_toc_and_footer(&mut payload, &entries, 0x12345678);
+
+        let temp_dir = std::env::temp_dir().join(format!("scct_umd_opts_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let umd_path = temp_dir.join("dynamic-pc.umd");
+        let bak_path = temp_dir.join("dynamic-pc.umd.bak");
+        std::fs::write(&umd_path, &payload).unwrap();
+
+        let vanilla_opts = detect_umd_options_fast(&umd_path).unwrap();
+        assert!(!vanilla_opts.coop_missions_and_loc);
+        assert!(!vanilla_opts.lan_menu_caption);
+
+        // Extract SP info directly via fast seeks
+        let info = extract_sp_level_info_from_umd(&umd_path, &crate::levels::SP_COOP_LEVELS[..1])
+            .unwrap();
+        assert!(info.contains_key("01_Lighthouse_COOP"));
+
+        // Patch caption only
+        let cap_only = UmdPatchOptions {
+            coop_missions_and_loc: false,
+            lan_menu_caption: true,
+        };
+        let res = patch_umd_with_options(
+            &umd_path,
+            &bak_path,
+            &crate::levels::SP_COOP_LEVELS[..1],
+            &cap_only,
+        )
+        .unwrap();
+        assert!(res.is_none());
+        let det1 = detect_umd_options_fast(&umd_path).unwrap();
+        assert!(!det1.coop_missions_and_loc);
+        assert!(det1.lan_menu_caption);
+
+        // Restore vanilla
+        let none_opts = UmdPatchOptions {
+            coop_missions_and_loc: false,
+            lan_menu_caption: false,
+        };
+        patch_umd_with_options(
+            &umd_path,
+            &bak_path,
+            &crate::levels::SP_COOP_LEVELS[..1],
+            &none_opts,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&umd_path).unwrap(), payload);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}

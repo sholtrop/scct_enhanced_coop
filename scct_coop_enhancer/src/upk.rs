@@ -164,10 +164,6 @@ pub struct ExportEntry {
 
 #[derive(Debug, Clone)]
 pub struct UpkTables {
-    #[allow(dead_code)]
-    pub version: u16,
-    #[allow(dead_code)]
-    pub lic_mode: u16,
     pub name_count: usize,
     pub name_offset: usize,
     pub names_end: usize,
@@ -176,10 +172,6 @@ pub struct UpkTables {
     pub import_offset: usize,
     pub imports_end: usize,
     pub imports: Vec<ImportEntry>,
-    #[allow(dead_code)]
-    pub export_count: usize,
-    #[allow(dead_code)]
-    pub export_offset: usize,
     pub exports_end: usize,
     pub exports: Vec<ExportEntry>,
 }
@@ -192,8 +184,6 @@ pub fn parse_upk_tables(data: &[u8]) -> Result<UpkTables> {
     if magic != UPK_MAGIC {
         bail!("Invalid UPK magic: 0x{:08X}", magic);
     }
-    let version = u16::from_le_bytes(data[4..6].try_into()?);
-    let lic_mode = u16::from_le_bytes(data[6..8].try_into()?);
 
     let name_count = u32::from_le_bytes(data[0x10..0x14].try_into()?) as usize;
     let name_offset = u32::from_le_bytes(data[0x14..0x18].try_into()?) as usize;
@@ -259,8 +249,6 @@ pub fn parse_upk_tables(data: &[u8]) -> Result<UpkTables> {
     let exports_end = off;
 
     Ok(UpkTables {
-        version,
-        lic_mode,
         name_count,
         name_offset,
         names_end,
@@ -269,8 +257,6 @@ pub fn parse_upk_tables(data: &[u8]) -> Result<UpkTables> {
         import_offset,
         imports_end,
         imports,
-        export_count,
-        export_offset,
         exports_end,
         exports,
     })
@@ -319,16 +305,7 @@ pub fn parse_state_frame_end(data: &[u8], offset: usize) -> Result<usize> {
 #[derive(Debug, Clone)]
 pub struct RawProperty {
     pub name: String,
-    #[allow(dead_code)]
-    pub name_idx: i32,
-    #[allow(dead_code)]
     pub ptype: u8,
-    #[allow(dead_code)]
-    pub struct_name: Option<String>,
-    #[allow(dead_code)]
-    pub prop_start: usize,
-    #[allow(dead_code)]
-    pub val_end: usize,
     pub raw_full: Vec<u8>,
     pub raw_header: Vec<u8>,
     pub raw_val: Vec<u8>,
@@ -362,12 +339,8 @@ pub fn parse_tagged_properties_raw(
         let psize_code = (info >> 4) & 0x07;
         let array_flag = (info >> 7) & 0x01;
 
-        let mut struct_name = None;
         if ptype == 10 {
-            let s_idx = read_compact_index(data, &mut off)?;
-            if (s_idx as usize) < names.len() {
-                struct_name = Some(names[s_idx as usize].0.clone());
-            }
+            let _struct_name_idx = read_compact_index(data, &mut off)?;
         }
 
         let size: usize = match psize_code {
@@ -412,11 +385,7 @@ pub fn parse_tagged_properties_raw(
 
         props.push(RawProperty {
             name: prop_name.clone(),
-            name_idx,
             ptype,
-            struct_name,
-            prop_start,
-            val_end,
             raw_full: data[prop_start..val_end].to_vec(),
             raw_header: data[prop_start..val_start].to_vec(),
             raw_val: data[val_start..val_end].to_vec(),
@@ -425,28 +394,29 @@ pub fn parse_tagged_properties_raw(
     bail!("Reached end_offset without finding None terminator");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpkPatchOptions {
+    pub detach_speakers: bool,
+    pub coop_player_mesh: bool,
+    pub use_default_sound_map_false: bool,
+}
+
+impl Default for UpkPatchOptions {
+    fn default() -> Self {
+        Self {
+            detach_speakers: true,
+            coop_player_mesh: true,
+            use_default_sound_map_false: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MapPatchSummary {
     pub size: usize,
-    #[allow(dead_code)]
-    pub p1_name: String,
-    #[allow(dead_code)]
-    pub p2_name: String,
     pub p1_loc: (f32, f32, f32),
     pub p2_loc: (f32, f32, f32),
-    #[allow(dead_code)]
-    pub havok_offset: usize,
     pub detached_speakers: Vec<String>,
-}
-
-#[allow(dead_code)]
-pub fn patch_sp_map_to_coop(
-    input_path: &Path,
-    output_path: &Path,
-    p1_offset: (f32, f32, f32),
-    spawn_offset: (f32, f32, f32),
-) -> Result<MapPatchSummary> {
-    patch_sp_map_to_coop_with_options(input_path, output_path, p1_offset, spawn_offset, true)
 }
 
 struct SpeakerZoneMatch {
@@ -542,14 +512,20 @@ fn inspect_speaker_pawn_with_zone(
     })
 }
 
-/// Returns `true` if the given `.scl` map still has any HQ/speaker pawn with `CurrentEAIZone`.
-pub fn map_has_attached_speaker_pawns(map_path: &Path) -> Result<bool> {
-    let data =
-        fs::read(map_path).with_context(|| format!("Reading map {}", map_path.display()))?;
-    let upk = parse_upk_tables(&data)?;
-    Ok(upk.exports.iter().any(|e| {
-        inspect_speaker_pawn_with_zone(&data, &upk.names, &upk.imports, &upk.exports, e).is_some()
-    }))
+#[cfg(test)]
+pub fn patch_sp_map_to_coop(
+    input_path: &Path,
+    output_path: &Path,
+    p1_offset: (f32, f32, f32),
+    spawn_offset: (f32, f32, f32),
+) -> Result<MapPatchSummary> {
+    patch_sp_map_to_coop_with_options(
+        input_path,
+        output_path,
+        p1_offset,
+        spawn_offset,
+        &UpkPatchOptions::default(),
+    )
 }
 
 pub fn patch_sp_map_to_coop_with_options(
@@ -557,7 +533,7 @@ pub fn patch_sp_map_to_coop_with_options(
     output_path: &Path,
     p1_offset: (f32, f32, f32),
     spawn_offset: (f32, f32, f32),
-    detach_speakers: bool,
+    options: &UpkPatchOptions,
 ) -> Result<MapPatchSummary> {
     let orig_data =
         fs::read(input_path).with_context(|| format!("Reading map {}", input_path.display()))?;
@@ -595,16 +571,6 @@ pub fn patch_sp_map_to_coop_with_options(
 
     let idx_b_multiplayer_map =
         ensure_name(&mut names, &mut name_to_idx, "bMultiplayerMap", 0x00070010);
-    let idx_use_default_sound_map = ensure_name(
-        &mut names,
-        &mut name_to_idx,
-        "UseDefaultSoundMap",
-        0x00070010,
-    );
-    let idx_sam_mesh = ensure_name(&mut names, &mut name_to_idx, "SamMesh", 0x00070010);
-    let idx_start_mesh = ensure_name(&mut names, &mut name_to_idx, "StartMesh", 0x00070010);
-    let idx_coop_player = ensure_name(&mut names, &mut name_to_idx, "COOP_Player", 0x00070010);
-    let idx_coop_anims = ensure_name(&mut names, &mut name_to_idx, "CoopAnims", 0x00070010);
     let idx_spot_id = ensure_name(&mut names, &mut name_to_idx, "spotID", 0x00070010);
     let idx_next_navigation_point = ensure_name(
         &mut names,
@@ -626,34 +592,43 @@ pub fn patch_sp_map_to_coop_with_options(
     }
     let idx_p2_obj_name = ensure_name(&mut names, &mut name_to_idx, &p2_obj_name, 0x00070010);
 
-    let idx_core = *name_to_idx
-        .get("Core")
-        .context("Missing 'Core' in Name Table")? as i32;
-    let idx_engine = *name_to_idx
-        .get("Engine")
-        .context("Missing 'Engine' in Name Table")? as i32;
-    let idx_package = *name_to_idx
-        .get("Package")
-        .context("Missing 'Package' in Name Table")? as i32;
-    let idx_skeletal_mesh = *name_to_idx
-        .get("SkeletalMesh")
-        .context("Missing 'SkeletalMesh' in Name Table")? as i32;
+    let coop_mesh_indices = if options.coop_player_mesh {
+        let idx_sam_mesh = ensure_name(&mut names, &mut name_to_idx, "SamMesh", 0x00070010);
+        let idx_start_mesh = ensure_name(&mut names, &mut name_to_idx, "StartMesh", 0x00070010);
+        let idx_coop_player = ensure_name(&mut names, &mut name_to_idx, "COOP_Player", 0x00070010);
+        let idx_coop_anims = ensure_name(&mut names, &mut name_to_idx, "CoopAnims", 0x00070010);
+        let idx_core = *name_to_idx
+            .get("Core")
+            .context("Missing 'Core' in Name Table")? as i32;
+        let idx_engine = *name_to_idx
+            .get("Engine")
+            .context("Missing 'Engine' in Name Table")? as i32;
+        let idx_package = *name_to_idx
+            .get("Package")
+            .context("Missing 'Package' in Name Table")? as i32;
+        let idx_skeletal_mesh = *name_to_idx
+            .get("SkeletalMesh")
+            .context("Missing 'SkeletalMesh' in Name Table")? as i32;
 
-    imports.push(ImportEntry {
-        class_pkg: idx_core,
-        class_name: idx_package,
-        package_index: 0,
-        obj_name: idx_coop_anims,
-    });
-    let coop_anims_pkg_ref = -(imports.len() as i32);
+        imports.push(ImportEntry {
+            class_pkg: idx_core,
+            class_name: idx_package,
+            package_index: 0,
+            obj_name: idx_coop_anims,
+        });
+        let coop_anims_pkg_ref = -(imports.len() as i32);
 
-    imports.push(ImportEntry {
-        class_pkg: idx_engine,
-        class_name: idx_skeletal_mesh,
-        package_index: coop_anims_pkg_ref,
-        obj_name: idx_coop_player,
-    });
-    let coop_player_mesh_ref = -(imports.len() as i32);
+        imports.push(ImportEntry {
+            class_pkg: idx_engine,
+            class_name: idx_skeletal_mesh,
+            package_index: coop_anims_pkg_ref,
+            obj_name: idx_coop_player,
+        });
+        let coop_player_mesh_ref = -(imports.len() as i32);
+        Some((idx_sam_mesh, idx_start_mesh, coop_player_mesh_ref))
+    } else {
+        None
+    };
 
     let mut levelinfo_pos = None;
     let mut pstart1_pos = None;
@@ -695,20 +670,29 @@ pub fn patch_sp_map_to_coop_with_options(
         if p.name == "UseDefaultSoundMap" {
             has_use_default_sound_map = true;
         }
-        if p.name != "SamMesh" && p.name != "bMultiplayerMap" {
+        let strip_sam_mesh = options.coop_player_mesh && p.name == "SamMesh";
+        if !strip_sam_mesh && p.name != "bMultiplayerMap" {
             filtered_li_head.extend_from_slice(&p.raw_full);
         }
     }
     let mut li_coop_props = serialize_bool_property(idx_b_multiplayer_map, true);
-    if !has_use_default_sound_map {
+    if options.use_default_sound_map_false && !has_use_default_sound_map {
         // Penthouse (and any map missing it) needs UseDefaultSoundMap = False so
         // SoundMapName is not overwritten to <Map>_COOP, which DareAudio cannot find in MAPS.SM0.
+        let idx_use_default_sound_map = ensure_name(
+            &mut names,
+            &mut name_to_idx,
+            "UseDefaultSoundMap",
+            0x00070010,
+        );
         li_coop_props.extend_from_slice(&serialize_bool_property(idx_use_default_sound_map, false));
     }
-    li_coop_props.extend_from_slice(&serialize_object_property(
-        idx_sam_mesh,
-        coop_player_mesh_ref,
-    ));
+    if let Some((idx_sam_mesh, _, coop_player_mesh_ref)) = coop_mesh_indices {
+        li_coop_props.extend_from_slice(&serialize_object_property(
+            idx_sam_mesh,
+            coop_player_mesh_ref,
+        ));
+    }
 
     let mut patched_levelinfo_bytes = Vec::new();
     patched_levelinfo_bytes.extend_from_slice(&orig_data[li_start..li_prop_start]);
@@ -732,7 +716,8 @@ pub fn patch_sp_map_to_coop_with_options(
 
     let mut ps1_kept = Vec::new();
     for p in &ps1_props {
-        if p.name != "StartMesh" && p.name != "nextNavigationPoint" && p.name != "spotID" {
+        let strip_start_mesh = options.coop_player_mesh && p.name == "StartMesh";
+        if !strip_start_mesh && p.name != "nextNavigationPoint" && p.name != "spotID" {
             if p.name == "Location" && p.raw_val.len() == 12 && p1_offset != (0.0, 0.0, 0.0) {
                 let x = f32::from_le_bytes(p.raw_val[0..4].try_into()?);
                 let y = f32::from_le_bytes(p.raw_val[4..8].try_into()?);
@@ -748,10 +733,12 @@ pub fn patch_sp_map_to_coop_with_options(
         }
     }
     let mut ps1_extra = serialize_object_property(idx_next_navigation_point, new_pstart2_exp_idx);
-    ps1_extra.extend_from_slice(&serialize_object_property(
-        idx_start_mesh,
-        coop_player_mesh_ref,
-    ));
+    if let Some((_, idx_start_mesh, coop_player_mesh_ref)) = coop_mesh_indices {
+        ps1_extra.extend_from_slice(&serialize_object_property(
+            idx_start_mesh,
+            coop_player_mesh_ref,
+        ));
+    }
 
     let mut patched_ps1_bytes = Vec::new();
     patched_ps1_bytes.extend_from_slice(ps1_state_frame);
@@ -761,12 +748,17 @@ pub fn patch_sp_map_to_coop_with_options(
 
     // 3. Build Player 2's EchelonPlayerStartCoop
     let mut ps2_chunks = serialize_int_property(idx_spot_id, 2);
-    ps2_chunks.extend_from_slice(&serialize_object_property(
-        idx_start_mesh,
-        coop_player_mesh_ref,
-    ));
+    if let Some((_, idx_start_mesh, coop_player_mesh_ref)) = coop_mesh_indices {
+        ps2_chunks.extend_from_slice(&serialize_object_property(
+            idx_start_mesh,
+            coop_player_mesh_ref,
+        ));
+    }
 
-    let p2_strip_set: HashSet<&str> = P2_STRIP_PROPS.iter().copied().collect();
+    let mut p2_strip_set: HashSet<&str> = P2_STRIP_PROPS.iter().copied().collect();
+    if !options.coop_player_mesh {
+        p2_strip_set.remove("StartMesh");
+    }
     let mut p1_loc: Option<(f32, f32, f32)> = None;
     let mut p2_loc: Option<(f32, f32, f32)> = None;
 
@@ -858,10 +850,9 @@ pub fn patch_sp_map_to_coop_with_options(
     let mut detached_speakers = Vec::new();
     let mut patched_speakers: Vec<(usize, Vec<u8>)> = Vec::new();
 
-    if detach_speakers {
+    if options.detach_speakers {
         for (pos, e) in exports.iter().enumerate() {
-            let Some(m) =
-                inspect_speaker_pawn_with_zone(&orig_data, &names, &imports, &exports, e)
+            let Some(m) = inspect_speaker_pawn_with_zone(&orig_data, &names, &imports, &exports, e)
             else {
                 continue;
             };
@@ -941,7 +932,6 @@ pub fn patch_sp_map_to_coop_with_options(
             out_stream.extend_from_slice(&write_compact_index(exp.serial_offset));
         }
     }
-    let new_exports_end = out_stream.len();
 
     let havok_stream = &orig_data[upk.exports_end..];
     if havok_stream.len() < 4 || &havok_stream[..4] != HAVOK_MAGIC {
@@ -974,12 +964,85 @@ pub fn patch_sp_map_to_coop_with_options(
 
     Ok(MapPatchSummary {
         size: out_stream.len(),
-        p1_name: names[exports[ps1_idx].obj_name as usize].0.clone(),
-        p2_name: p2_obj_name,
         p1_loc,
         p2_loc,
-        havok_offset: new_exports_end,
         detached_speakers,
+    })
+}
+
+fn check_map_uses_coop_player_mesh(map_path: &Path) -> Option<bool> {
+    let data = fs::read(map_path).ok()?;
+    let upk = parse_upk_tables(&data).ok()?;
+    Some(
+        upk.names.iter().any(|(n, _)| n == "CoopAnims")
+            && upk.names.iter().any(|(n, _)| n == "COOP_Player"),
+    )
+}
+
+fn check_bank_speakers_detached(map_path: &Path) -> Option<bool> {
+    let data = fs::read(map_path).ok()?;
+    let upk = parse_upk_tables(&data).ok()?;
+    let still_attached = upk.exports.iter().any(|e| {
+        inspect_speaker_pawn_with_zone(&data, &upk.names, &upk.imports, &upk.exports, e).is_some()
+    });
+    Some(!still_attached)
+}
+
+fn check_penthouse_has_use_default_sound_map(map_path: &Path) -> Option<bool> {
+    let data = fs::read(map_path).ok()?;
+    let upk = parse_upk_tables(&data).ok()?;
+    let li = upk.exports.iter().find(|e| {
+        let oname = &upk.names[e.obj_name as usize].0;
+        let cname = resolve_class_name(&upk.names, &upk.imports, &upk.exports, e.class_idx);
+        cname == "EchelonLevelInfo" || oname == "LevelInfo0"
+    })?;
+    let li_start = li.serial_offset as usize;
+    let li_end = li_start + (li.serial_size as usize);
+    let li_prop_start = parse_state_frame_end(&data, li_start).ok()?;
+    let (props, _, _) = parse_tagged_properties_raw(&upk.names, &data, li_prop_start, li_end).ok()?;
+    Some(props.iter().any(|p| p.name == "UseDefaultSoundMap"))
+}
+
+/// Inspects already-installed `*_COOP.scl` maps in `maps_dir` to recover which `UpkPatchOptions`
+/// were used to generate them, or returns `None` if no `*_COOP.scl` files exist.
+pub fn detect_upk_options_from_maps(maps_dir: &Path) -> Option<UpkPatchOptions> {
+    let mut coop_player_mesh = None;
+    let mut first_coop_map = None;
+    for lvl in crate::levels::SP_COOP_LEVELS {
+        let p = maps_dir.join(format!("{}.scl", lvl.coop_map));
+        if p.exists() {
+            if first_coop_map.is_none() {
+                first_coop_map = Some(p.clone());
+            }
+            if lvl.source_map == "01_Lighthouse" {
+                coop_player_mesh = check_map_uses_coop_player_mesh(&p);
+                break;
+            }
+        }
+    }
+    let fallback_map = first_coop_map.as_deref()?;
+    if coop_player_mesh.is_none() {
+        coop_player_mesh = check_map_uses_coop_player_mesh(fallback_map);
+    }
+
+    let bank_coop = maps_dir.join("03_Bank_COOP.scl");
+    let detach_speakers = if bank_coop.exists() {
+        check_bank_speakers_detached(&bank_coop)
+    } else {
+        None
+    };
+
+    let penthouse_coop = maps_dir.join("04_Penthouse_COOP.scl");
+    let use_default_sound_map_false = if penthouse_coop.exists() {
+        check_penthouse_has_use_default_sound_map(&penthouse_coop)
+    } else {
+        None
+    };
+
+    Some(UpkPatchOptions {
+        detach_speakers: detach_speakers.unwrap_or(true),
+        coop_player_mesh: coop_player_mesh.unwrap_or(true),
+        use_default_sound_map_false: use_default_sound_map_false.unwrap_or(true),
     })
 }
 
@@ -1056,44 +1119,41 @@ mod tests {
     }
 
     #[test]
-    fn test_patch_sp_map_preserves_speaker_pawn_when_detach_disabled() {
-        let candidates = [
+    fn test_patch_sp_map_with_options_disabled() {
+        let bank_candidates = [
             PathBuf::from("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
             PathBuf::from("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps/03_Bank.scl"),
         ];
-        let bank_src = candidates.into_iter().find(|p| p.exists());
-        let Some(bank_src) = bank_src else {
-            eprintln!("Skipping test_patch_sp_map_preserves_speaker_pawn_when_detach_disabled (clean 03_Bank.scl not found)");
+        let Some(bank_src) = bank_candidates.into_iter().find(|p| p.exists()) else {
+            eprintln!("Skipping test_patch_sp_map_with_options_disabled (clean 03_Bank.scl not found)");
             return;
         };
 
-        let temp_dir =
-            std::env::temp_dir().join(format!("scct_upk_keep_zone_test_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("scct_upk_opts_test_{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
-        let kept_map = temp_dir.join("03_Bank_COOP_keep.scl");
-        let detached_map = temp_dir.join("03_Bank_COOP_detach.scl");
+        let out_bank = temp_dir.join("03_Bank_COOP.scl");
 
-        let summary_keep = patch_sp_map_to_coop_with_options(
+        let opts_off = UpkPatchOptions {
+            detach_speakers: false,
+            coop_player_mesh: false,
+            use_default_sound_map_false: false,
+        };
+        let summary = patch_sp_map_to_coop_with_options(
             &bank_src,
-            &kept_map,
+            &out_bank,
             (0.0, 0.0, 0.0),
             (-55.0, -65.0, 8.0),
-            false,
+            &opts_off,
         )
-        .expect("patch_sp_map_to_coop_with_options(false) failed");
-        assert!(summary_keep.detached_speakers.is_empty());
-        assert!(map_has_attached_speaker_pawns(&kept_map).unwrap());
+        .expect("patch_sp_map_to_coop_with_options failed");
 
-        let summary_detach = patch_sp_map_to_coop_with_options(
-            &bank_src,
-            &detached_map,
-            (0.0, 0.0, 0.0),
-            (-55.0, -65.0, 8.0),
-            true,
-        )
-        .expect("patch_sp_map_to_coop_with_options(true) failed");
-        assert!(!summary_detach.detached_speakers.is_empty());
-        assert!(!map_has_attached_speaker_pawns(&detached_map).unwrap());
+        assert!(summary.detached_speakers.is_empty());
+        assert_eq!(check_map_uses_coop_player_mesh(&out_bank), Some(false));
+        assert_eq!(check_bank_speakers_detached(&out_bank), Some(false));
+
+        let detected = detect_upk_options_from_maps(&temp_dir).expect("detected");
+        assert!(!detected.detach_speakers);
+        assert!(!detected.coop_player_mesh);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

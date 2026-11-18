@@ -7,6 +7,7 @@ on:
       - master
     paths:
       - 'scct_coop_enhancer/**'
+      - 'images/scct_ec_logo.png'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/enhancer.yml'
@@ -27,20 +28,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: scct_coop_enhancer.exe
             asset_name: scct_coop_enhancer-windows-amd64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: scct_coop_enhancer
-            asset_name: scct_coop_enhancer-linux-amd64
 
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxinerama-dev libxkbcommon-dev libwayland-dev
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -124,13 +115,6 @@ jobs:
 
             #### Downloads:
             - **Windows**: `scct_coop_enhancer-windows-amd64.exe`
-            - **Linux**: `scct_coop_enhancer-linux-amd64`
-
-            > **Note for Linux**: Make executable after downloading:
-            > ```bash
-            > chmod +x scct_coop_enhancer-linux-amd64
-            > ./scct_coop_enhancer-linux-amd64
-            > ```
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

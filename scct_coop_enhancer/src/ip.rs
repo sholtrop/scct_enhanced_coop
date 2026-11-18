@@ -106,7 +106,7 @@ pub fn get_all_local_ips() -> Vec<Ipv4Addr> {
             while !unicast.is_null() {
                 let addr = unsafe { &*unicast };
                 let sa = addr.Address.lpSockaddr;
-                if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET as u16 {
+                if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
                     let sin = unsafe { &*(sa as *const SOCKADDR_IN) };
                     let ip_be = unsafe { sin.sin_addr.S_un.S_addr };
                     let ip = Ipv4Addr::from(u32::from_be(ip_be));

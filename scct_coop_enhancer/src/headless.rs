@@ -5,11 +5,12 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use crate::flags::{FlagState, sync_all_flags};
-use crate::launcher::launch_game;
-use crate::net::update_direct_target_in_exe;
+use crate::launcher::{DirectPeerTarget, LaunchRuntimeOptions, launch_game};
+use crate::net::{sync_startup_checksum_bypass_in_exe, update_direct_target_in_exe};
 use crate::patcher::find_child_ci;
-use crate::quicksave_persistence::spawn_quicksave_persistence;
+use crate::quicksave_persistence::{
+    PersistentQuickSaveHandle, restore_latest_quick_saves, spawn_quicksave_persistence,
+};
 use crate::stun::{
     PollPeerResult, notify_server_disconnect, poll_server_for_peer, punch_udp_holes,
     register_with_server, resolve_peer_endpoint, stun_query,
@@ -21,7 +22,8 @@ pub struct HeadlessOptions<'a> {
     pub stun_port: u16,
     pub api_port: u16,
     pub no_launch: bool,
-    pub flags: &'a [FlagState],
+    pub bypass_checksum_disconnect: bool,
+    pub auto_resync: bool,
     pub bind_ip: Option<Ipv4Addr>,
 }
 
@@ -120,9 +122,6 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
             opts.game_root.display()
         );
     }
-
-    // Sync any configured patch flags
-    sync_all_flags(opts.game_root, opts.flags)?;
 
     let (sock_disco, sock_game) = bind_local_sockets(opts.bind_ip)?;
     let (mut disco_ext, mut game_ext, my_local_ip) = discover_endpoints(
@@ -230,7 +229,7 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
         peer_disco_port,
         peer_game_port,
     )?;
-    sync_all_flags(opts.game_root, opts.flags)?;
+    sync_startup_checksum_bypass_in_exe(&exe_path, opts.bypass_checksum_disconnect)?;
 
     if opts.no_launch {
         println!("  [READY] Peer target written to splintercell3.exe (--no-launch specified).");
@@ -242,16 +241,23 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
         return Ok(());
     }
 
-    let quicksave_guard = spawn_quicksave_persistence(opts.game_root.to_path_buf());
+    let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
 
     println!("  [LAUNCH] Launching Chaos Theory Co-op...");
     let proc = launch_game(
         &exe_path,
         opts.game_root,
-        Some(peer_ip),
-        peer_disco_port,
-        peer_game_port,
+        crate::trace::PeerRole::Host,
+        Some(DirectPeerTarget {
+            ip: peer_ip,
+            disco_port: peer_disco_port,
+            game_port: peer_game_port,
+        }),
         opts.bind_ip,
+        LaunchRuntimeOptions {
+            auto_resync: opts.auto_resync,
+            ..LaunchRuntimeOptions::default()
+        },
     )?;
 
     println!("  [RUNNING] Game running (PID: {})!", proc.pid);
@@ -283,9 +289,6 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
             opts.game_root.display()
         );
     }
-
-    // Sync any configured patch flags
-    sync_all_flags(opts.game_root, opts.flags)?;
 
     let (sock_disco, sock_game) = bind_local_sockets(opts.bind_ip)?;
     let (disco_ext, game_ext, my_local_ip) = discover_endpoints(
@@ -349,7 +352,7 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
         peer_disco_port,
         peer_game_port,
     )?;
-    sync_all_flags(opts.game_root, opts.flags)?;
+    sync_startup_checksum_bypass_in_exe(&exe_path, opts.bypass_checksum_disconnect)?;
 
     if opts.no_launch {
         println!("  [READY] Host target written to splintercell3.exe (--no-launch specified).");
@@ -361,16 +364,23 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
         return Ok(());
     }
 
-    let quicksave_guard = spawn_quicksave_persistence(opts.game_root.to_path_buf());
+    let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
 
     println!("  [LAUNCH] Launching Chaos Theory Co-op...");
     let proc = launch_game(
         &exe_path,
         opts.game_root,
-        Some(peer_ip),
-        peer_disco_port,
-        peer_game_port,
+        crate::trace::PeerRole::Guest,
+        Some(DirectPeerTarget {
+            ip: peer_ip,
+            disco_port: peer_disco_port,
+            game_port: peer_game_port,
+        }),
         opts.bind_ip,
+        LaunchRuntimeOptions {
+            auto_resync: opts.auto_resync,
+            ..LaunchRuntimeOptions::default()
+        },
     )?;
 
     println!("  [RUNNING] Game running (PID: {})!", proc.pid);
@@ -388,6 +398,23 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
     Ok(())
 }
 
+fn prepare_and_watch_quicksaves(game_root: &Path) -> PersistentQuickSaveHandle {
+    match restore_latest_quick_saves(game_root) {
+        Ok(report) if report.restored_count > 0 => {
+            println!(
+                "  [QUICKSAVE] Restored {} previous co-op quick save(s) to {}",
+                report.restored_count,
+                report.profile_dir.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("  [QUICKSAVE] Could not restore previous co-op quick saves: {:#}", e);
+        }
+        _ => {}
+    }
+    spawn_quicksave_persistence(game_root.to_path_buf())
+}
+
 pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
     let sys_dir = find_child_ci(opts.game_root, "System");
     let exe_path = find_child_ci(&sys_dir, "splintercell3.exe");
@@ -401,7 +428,7 @@ pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
     let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
     crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None)
         .context("Failed to prepare splintercell3.exe for LAN mode")?;
-    sync_all_flags(opts.game_root, opts.flags)?;
+    sync_startup_checksum_bypass_in_exe(&exe_path, opts.bypass_checksum_disconnect)?;
 
     let adapter_desc = match opts.bind_ip {
         Some(ip) => format!("{}", ip),
@@ -416,7 +443,7 @@ pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
         return Ok(());
     }
 
-    let quicksave_guard = spawn_quicksave_persistence(opts.game_root.to_path_buf());
+    let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
 
     println!(
         "  [LAUNCH] Launching Chaos Theory in LAN mode (adapter: {})...",
@@ -425,10 +452,13 @@ pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
     let proc = launch_game(
         &exe_path,
         opts.game_root,
+        crate::trace::PeerRole::LanOrDirect,
         None,
-        crate::net::DISCOVERY_PORT,
-        crate::net::GAME_PORT,
         opts.bind_ip,
+        LaunchRuntimeOptions {
+            auto_resync: opts.auto_resync,
+            ..LaunchRuntimeOptions::default()
+        },
     )?;
 
     println!("  [RUNNING] Game running (PID: {})!", proc.pid);
@@ -469,7 +499,8 @@ mod tests {
             stun_port: 3478,
             api_port: 8080,
             no_launch: true,
-            flags: &[],
+            bypass_checksum_disconnect: false,
+            auto_resync: false,
             bind_ip: None,
         };
         let err = run_headless_join(opts, "   ").unwrap_err();
@@ -485,7 +516,8 @@ mod tests {
             stun_port: 3478,
             api_port: 8080,
             no_launch: true,
-            flags: &[],
+            bypass_checksum_disconnect: false,
+            auto_resync: false,
             bind_ip: None,
         };
         let err = run_headless_host(opts).unwrap_err();
@@ -501,7 +533,8 @@ mod tests {
             stun_port: 3478,
             api_port: 8080,
             no_launch: true,
-            flags: &[],
+            bypass_checksum_disconnect: false,
+            auto_resync: false,
             bind_ip: Some(Ipv4Addr::new(192, 168, 178, 202)),
         };
         let err = run_headless_lan(opts).unwrap_err();

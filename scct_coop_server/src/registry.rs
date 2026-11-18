@@ -168,15 +168,14 @@ impl FriendCodeRegistry {
                 Some("host") => {
                     session.host_last_seen = now;
                     // If guest was paired, verify guest heartbeat liveness (12s timeout)
-                    if session.guest_endpoints.is_some() {
-                        if let Some(gls) = session.guest_last_seen {
-                            if now.duration_since(gls) > Duration::from_secs(12) {
-                                session.disconnected = true;
-                                session.disconnect_reason =
-                                    Some("Friend timed out (no response)".to_string());
-                                return PollResult::Disconnected(session.disconnect_reason.clone());
-                            }
-                        }
+                    if session.guest_endpoints.is_some()
+                        && let Some(gls) = session.guest_last_seen
+                        && now.duration_since(gls) > Duration::from_secs(12)
+                    {
+                        session.disconnected = true;
+                        session.disconnect_reason =
+                            Some("Friend timed out (no response)".to_string());
+                        return PollResult::Disconnected(session.disconnect_reason.clone());
                     }
                 }
                 Some("guest") => {
