@@ -8,9 +8,10 @@ COPY . .
 
 RUN cargo build --release -p scct_coop_server
 
-FROM alpine:latest
+FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates && \
+RUN apk upgrade --no-cache && \
+    apk add --no-cache ca-certificates && \
     adduser -D -u 1000 -g appuser appuser
 
 WORKDIR /app
