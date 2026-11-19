@@ -50,16 +50,16 @@ You must have a valid copy of Splinter Cell Chaos Theory for it to work, e.g. vi
 
 ## FAQ
 
-Q: We get disconnected, what to do about that?
+**Q**: We get disconnected, what to do about that?
 
-A: Disconnects can happen for two reasons
+**A**: Disconnects can happen for two reasons
 
 1. Network issues. If this happens while playing via internet (i.e. friend code), you can try Hamachi/Zerotier and play via (virtual) LAN.
 2. Your game and your friend's game have diverged. This is usually a bug. In this case, SCCT Enhanced Coop will make a dump for you that can help identify the issue. Please [make an issue](https://github.com/sholtrop/scct_enhanced_coop/issues) and attach `System/scct_startup_trace*.txt` and `System/scct_desync_dump*.txt` from both peers to it. I will see if I can reproduce and fix it.
 
-Q: We get stuck or soft-locked in a level
+**Q**: We get stuck or soft-locked in a level
 
-A: Please [make an issue](https://github.com/sholtrop/scct_enhanced_coop/issues) describing it. As a workaround, in some cases, one of you can deliberately fall to their death so the other can resurrect them.
+**A**: Please [make an issue](https://github.com/sholtrop/scct_enhanced_coop/issues) describing it. As a workaround, in some cases, one of you can deliberately fall to their death so the other can resurrect them.
 
 ## Developing
 
@@ -67,7 +67,7 @@ To develop and test locally, it can be convenient to run two instances of SCCT l
 
 1. Download [Sandboxie](https://sandboxie-plus.com/).
 2. Make a HyperV virtual switch with its own IP address.
-3. Download [Fusion Fix](https://fusionfix.io/games/scct/) and configure it to run SCCT in _borderless fullscreen_.
+3. Download [Fusion Fix](https://fusionfix.io/games/scct/) and configure it to run SCCT in _borderless fullscreen_. Important because if the game alt-tabs, you will get desynchronized and disconnected.
 4. Start two `scct_coop_enhancer` instances: one normally and one inside Sandboxie
 5. Make sure they both use their own IP address. One can use your regular IP address, the other your HyperV virtual switch's IP address.
 6. Launch two SCCT instances
