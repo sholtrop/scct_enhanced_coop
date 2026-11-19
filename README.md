@@ -27,7 +27,7 @@ All features:
 You must have a valid copy of Splinter Cell Chaos Theory for it to work, e.g. via Steam.
 
 1. (Both) Download the latest SCCT Coop Enhancer version from [the releases](https://github.com/sholtrop/scct_enhanced_coop/releases):
-   `scct_coop_enhancer-windows-amd64.exe`.
+   `scct_coop_enhancer-<version>.exe` (e.g. `scct_coop_enhancer-1.0.0.exe`).
 
 2. (Both) Run the executable. You will get a Windows Defender warning about this being a trojan. That is expected; this mod edits SCCT's memory and opens network ports. That triggers Windows Defender. If this happens, you will have to exempt this .exe in Windows Defender.
 
