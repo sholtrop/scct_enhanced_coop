@@ -72,6 +72,8 @@ To develop and test locally, it can be convenient to run two instances of SCCT l
 5. Make sure they both use their own IP address. One can use your regular IP address, the other your HyperV virtual switch's IP address.
 6. Launch two SCCT instances
 
+You can use the information and Python scripts in `research` to validate your work or feed it into an LLM.
+
 ## Technical docs
 
 This _SCCT Enhanced Coop_ mod consists of two parts:
