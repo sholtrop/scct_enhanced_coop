@@ -1,15 +1,6 @@
 name: Build & Publish Server Docker Image
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'scct_coop_server/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/server.yml'
   workflow_dispatch:
 
 permissions:

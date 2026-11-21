@@ -1,16 +1,6 @@
 name: Build & Release Enhancer
 
 on:
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'scct_coop_enhancer/**'
-      - 'images/scct_ec_logo.png'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/enhancer.yml'
   workflow_dispatch:
 
 permissions:
