@@ -1223,6 +1223,20 @@ pub fn trace_header_lines(
     ]
 }
 
+/// Recovers the page-aligned trace allocation base VA from an already-patched `jmp rel32` hook site.
+pub fn recover_trace_base_from_jmp(site_va: u32, site_bytes: &[u8]) -> Option<u32> {
+    if site_bytes.len() < 5 || site_bytes[0] != 0xE9 {
+        return None;
+    }
+    let rel = i32::from_le_bytes(site_bytes[1..5].try_into().ok()?);
+    let stub_va = site_va.wrapping_add(5).wrapping_add(rel as u32);
+    let base_va = stub_va & !0xFFF;
+    if base_va == 0 || stub_va.wrapping_sub(base_va) as usize >= TRACE_CODE_LIMIT {
+        return None;
+    }
+    Some(base_va)
+}
+
 #[cfg(windows)]
 pub unsafe fn install_startup_trace(
     h_process: windows_sys::Win32::Foundation::HANDLE,
@@ -1235,6 +1249,54 @@ pub unsafe fn install_startup_trace(
     };
 
     unsafe {
+        // Idempotent re-attach check: if trace hooks are already installed in a live process,
+        // recover the existing trace buffer VA and sync the resync-enabled flag without leaking memory.
+        for &(va, orig_len) in &[
+            (HOOK_TRACE_TICK_VA, HOOK_TRACE_TICK_ORIG.len()),
+            (HOOK_TRACE_CMP_VA, HOOK_TRACE_CMP_ORIG.len()),
+            (HOOK_TRACE_RESET_VA, HOOK_TRACE_RESET_ORIG.len()),
+            (HOOK_TRACE_SEND_VA, HOOK_TRACE_SEND_ORIG.len()),
+        ] {
+            let mut cur = [0u8; 8];
+            let mut nread = 0usize;
+            let ok = ReadProcessMemory(
+                h_process,
+                va as *const _,
+                cur.as_mut_ptr() as *mut _,
+                orig_len,
+                &mut nread,
+            );
+            if ok != 0
+                && nread == orig_len
+                && let Some(existing_base) = recover_trace_base_from_jmp(va, &cur[..orig_len])
+            {
+                let mut magic_bytes = [0u8; 4];
+                let mut mread = 0usize;
+                let magic_ok = ReadProcessMemory(
+                    h_process,
+                    (existing_base as usize + TRACE_HDR_OFF) as *const _,
+                    magic_bytes.as_mut_ptr() as *mut _,
+                    4,
+                    &mut mread,
+                );
+                if magic_ok != 0 && mread == 4 && u32::from_le_bytes(magic_bytes) == TRACE_MAGIC {
+                    let enabled_va =
+                        existing_base as usize + TRACE_HDR_OFF + TRACE_HDR_RESYNC_ENABLED_OFF;
+                    write_fn(
+                        h_process,
+                        enabled_va,
+                        &u32::from(resync_enabled).to_le_bytes(),
+                        false,
+                    );
+                    crate::scct_log!(
+                        "  [TRACE] Re-attached to existing startup trace hooks (buffer @ 0x{:08X})",
+                        existing_base
+                    );
+                    return existing_base as usize;
+                }
+            }
+        }
+
         let alloc = VirtualAllocEx(
             h_process,
             std::ptr::null(),
@@ -1361,6 +1423,20 @@ mod tests {
         assert_eq!(summary.total_mismatches, 0);
         assert!(!summary.has_slot5_mismatch());
         assert_eq!(summary.format_slot_list(), "none recorded");
+
+        // Verify idempotent re-attach base recovery from jmp rel32 hook bytes
+        assert_eq!(
+            recover_trace_base_from_jmp(HOOK_TRACE_TICK_VA, &jmp_tick),
+            Some(base)
+        );
+        assert_eq!(
+            recover_trace_base_from_jmp(HOOK_TRACE_RESET_VA, &jmp_reset),
+            Some(base)
+        );
+        assert_eq!(
+            recover_trace_base_from_jmp(HOOK_TRACE_TICK_VA, HOOK_TRACE_TICK_ORIG),
+            None
+        );
     }
 
     #[test]

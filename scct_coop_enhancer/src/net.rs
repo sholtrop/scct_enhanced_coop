@@ -40,7 +40,7 @@ feffff85c074128d75048b0e85c974093901743683c604ebf18b4d008b0185c0\
 3da9fe750583c604ebe58b5500894d008916618b450031dbe93af3d2ffe928f4\
 d2ffff742418ff742418ff742418ff742418ff742418ff742418ff1580760b11\
 83f8407c3151528b4c241c85c9742566833902751f90909090909090908b5104\
-85d2741080fa7f740b83faff74068915a00333115a59c21800a1a003331185c0\
+85d27410909090909083faff74068915a00333115a59c21800a1a003331185c0\
 741e50ff15b0760b1185c074138d5764e80c0000008d97e5000000e801000000\
 c389c6b9100000008a1e881a84db740946424975f3c642ff00c36089dfe8b7ff\
 ffff618b44246c6a20e9d549a6ff6089f7e8a3ffffff6183c4248b36e9a94ea6\
@@ -103,20 +103,20 @@ d2ff803d60670b11007424ff1504730b1189c22b05e40333113db80b0000720f\
 8915e40333118b442404e86f020000ff742418ff742418ff742418ff742418ff\
 742418ff742418ff1580760b1183f80475338b54240885d27455837c240c047c\
 4e813a5343504b7546f64424100274bf6a006a006a006a0452ff742418ff1580\
-760b11ebaa83f8407c258b4c241485c9741d6683390275178b510485d2741080\
-fa7f740b83faff74068915a0033311c21800803d60670b110074748b44241885\
+760b11ebaa83f8407c258b4c241485c9741d6683390275178b510485d2741090\
+9090909083faff74068915a0033311c21800803d60670b110074748b44241885\
 c0746c66817802238c75648b500483faff740485d275588b0d83670b1185c974\
 4e0fb7158e670b1185d274438b44240885c0743bc1e21066ba020083ec108914\
 24894c2404c744240800000000c744240c0000000089e18b5424146a10516a00\
-ff30ff700452ff15a8760b1183c410e9de0200009053565783ec2089ce89fb89\
+ff30ff700452e9e100000090909090e9de0200009053565783ec2089ce89fb89\
 e1e8da67cfff31c08944241089442414894424188944241c31ff85db742b8b4b\
-2885c9742489e050e873bccdff84c074188b44240485c074103c7f740c83f8ff\
+2885c9742489e050e873bccdff84c074188b44240485c074109090909083f8ff\
 740789c7a3a0033311803d60670b1100743ca183670b1185c0750689f885c074\
 5d0fb715d67eb51085d27505ba8f23000086f266c70424020066895424028944\
 240489e05089f1e884bfcdffeb3085ff742c89f1e897b6cdff6685c07505b88f\
 23000086e066c7042402006689442402897c240489e05089f1e852bfcdff8b06\
-83c4205f5e5bc3e9b90100009090909090909090909090909090909090909090\
-9090909090909090909090909090909090909090909090909090909090909090\
+83c4205f5e5bc3e9b9010000ff15a8760b1183c41085c07818833da403331100\
+740f8b54241085d27402890231c0c22400e9dc01000090909090909090909090\
 83f8ff74588b0d83670b1185c9744e0fb715d67eb51085d2744386f2c1e21066\
 ba020083ec14891424894c2404c744240800000000c744240c00000000c74424\
 10ffff000089e18d5424106a10516a006a025250ff15a8760b1183c414c383f8\
@@ -145,7 +145,7 @@ pub const MULTI_NIC_WSASENDTO_TAIL_VA: u32 = 0x110B6DB2;
 pub const MULTI_NIC_LAN_CAVE_HEX: &str = "\
 a1a403331185c07401c3535152565755e981f7ffffa1a403331185c0740f8b4d\
 00890131c0894504e9f5f8ffff837d04000f8597f8ffffe9e6f8ffff8b5f04a1\
-a4033311894704e9b8f9ffffa1a403331185c0750a89d885c00f84faf9ffff89\
+a4033311894704e9b8f9ffffa1a403331185c0750a39470475089385c0740389\
 4704e9f2f9ffff8b4424088b15a403331189500485d20f8450fbffffff74240c\
 50ff74240cff15c0760b1183f8ff75108b442408c7400400000000e92cfbffff\
 31c0c20c0083f8ff74475389c383ec0831c0890424894424048d4c240489e250\
@@ -1474,6 +1474,26 @@ pub fn update_direct_ip_in_exe(
     apply_online_coop_fix(exe_path, exe_bak_path, target_ip)
 }
 
+pub fn is_net_cave_signature_present(
+    net_cave: &[u8],
+    online_cave_head: &[u8],
+    sock_cave: &[u8],
+    multi_cave: &[u8],
+) -> bool {
+    let expected_net = decode_hex(NET_CAVE_HEX);
+    let expected_online = decode_hex(&ONLINE_CAVE_HEX[..ONLINE_CAVE_ENABLED_OFFSET * 2]);
+    let expected_sock = decode_hex(SOCKET_CAVE_HEX);
+    let expected_multi = decode_hex(MULTI_NIC_LAN_CAVE_HEX);
+    net_cave.len() >= expected_net.len()
+        && online_cave_head.len() >= expected_online.len()
+        && sock_cave.len() >= expected_sock.len()
+        && multi_cave.len() >= expected_multi.len()
+        && net_cave[..expected_net.len()] == expected_net[..]
+        && online_cave_head[..expected_online.len()] == expected_online[..]
+        && sock_cave[..expected_sock.len()] == expected_sock[..]
+        && multi_cave[..expected_multi.len()] == expected_multi[..]
+}
+
 pub fn update_direct_target_in_exe(
     exe_path: &Path,
     exe_bak_path: &Path,
@@ -1652,9 +1672,10 @@ mod tests {
             make_jmp(SOCKET_CAVE_VA + 0x30F, MULTI_NIC_WSASENDTO_TAIL_VA, 6).as_slice()
         );
         assert_eq!(
-            &sock_cave[0x3E7..0x420],
-            make_jmp(SOCKET_CAVE_VA + 0x3E7, MULTI_NIC_PREP_SOCKET_VA, 57).as_slice()
+            &sock_cave[0x3E7..0x3EC],
+            make_jmp(SOCKET_CAVE_VA + 0x3E7, MULTI_NIC_PREP_SOCKET_VA, 5).as_slice()
         );
+        assert_eq!(&sock_cave[0x416..0x420], &[0x90; 10]);
 
         // Verify Hook2 jump-back targets land on `popa` (0x110B65E2) in NET_CAVE,
         // avoiding the `mov [esi], edx` corruption of InterfaceTable->m_count at 0x110B65E0.
@@ -1666,6 +1687,86 @@ mod tests {
             &multi_cave[0x37..0x3C],
             make_jmp(MULTI_NIC_LAN_CAVE_VA + 0x37, 0x110B65E2, 5).as_slice()
         );
+
+        // Verify MULTI_NIC_QBIND_FINISH_VA preserves non-zero getsockname() IPs (e.g. ForceBindIP)
+        // when G_LOCAL_BIND_IP_VA == 0, while still falling back to saved ebx when getsockname is 0.
+        let qfinish_off = (MULTI_NIC_QBIND_FINISH_VA - MULTI_NIC_LAN_CAVE_VA) as usize;
+        assert_eq!(
+            &multi_cave[qfinish_off..qfinish_off + 27],
+            &[
+                0xA1, 0xA4, 0x03, 0x33, 0x11, // mov eax, ds:[0x113303a4]
+                0x85, 0xC0,                   // test eax, eax
+                0x75, 0x0A,                   // jne +0x0A (0x110B6D1F)
+                0x39, 0x47, 0x04,             // cmp [edi+4], eax (eax==0)
+                0x75, 0x08,                   // jne +0x08 (0x110B6D22: keep ForceBindIP IP)
+                0x93,                         // xchg eax, ebx
+                0x85, 0xC0,                   // test eax, eax
+                0x74, 0x03,                   // je  +0x03 (0x110B6D22)
+                0x89, 0x47, 0x04,             // mov [edi+4], eax
+                0xE9, 0xF2, 0xF9, 0xFF, 0xFF, // jmp 0x110B6719
+            ]
+        );
+
+        // Verify loopback (127.x.x.x) filters are NOPped in NET_CAVE recvfrom, SOCKET_CAVE recvfrom,
+        // and HOOK_BROWSE_REPLY_URL while keeping 0.0.0.0 and 255.255.255.255 filters intact.
+        let net_loopback_off = (0x110B6634 - NET_CAVE_VA) as usize;
+        assert_eq!(&net_cave[net_loopback_off..net_loopback_off + 5], &[0x90; 5]);
+        assert_eq!(
+            &net_cave[net_loopback_off + 5..net_loopback_off + 10],
+            &[0x83, 0xFA, 0xFF, 0x74, 0x06]
+        );
+
+        let sock_recv_loopback_off = (0x110B6A3F - SOCKET_CAVE_VA) as usize;
+        assert_eq!(
+            &sock_cave[sock_recv_loopback_off..sock_recv_loopback_off + 5],
+            &[0x90; 5]
+        );
+        assert_eq!(
+            &sock_cave[sock_recv_loopback_off + 5..sock_recv_loopback_off + 10],
+            &[0x83, 0xFA, 0xFF, 0x74, 0x06]
+        );
+
+        let loopback_filter_off = (0x110B6B19 - SOCKET_CAVE_VA) as usize;
+        assert_eq!(
+            &sock_cave[loopback_filter_off..loopback_filter_off + 4],
+            &[0x90, 0x90, 0x90, 0x90]
+        );
+        assert_eq!(
+            &sock_cave[loopback_filter_off + 4..loopback_filter_off + 9],
+            &[0x83, 0xF8, 0xFF, 0x74, 0x07]
+        );
+
+        // Verify HOOK_QUAZAL_WSASENDTO pinned-IP unicast short-circuit trampoline (0x110B6AC6 -> 0x110B6BAC)
+        let sendto_tramp_off = (0x110B6AC6 - SOCKET_CAVE_VA) as usize;
+        assert_eq!(
+            &sock_cave[sendto_tramp_off..sendto_tramp_off + 9],
+            &[0xE9, 0xE1, 0x00, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90]
+        );
+        let sendto_helper_off = (0x110B6BAC - SOCKET_CAVE_VA) as usize;
+        assert_eq!(
+            &sock_cave[sendto_helper_off..sendto_helper_off + 42],
+            decode_hex(
+                "ff15a8760b1183c41085c07818833da403331100740f8b54241085d27402890231c0c22400e9dc010000"
+            )
+            .as_slice()
+        );
+
+        // Verify full live-process PE cave signature detection helper catches outdated caves too
+        let online_cave = decode_hex(ONLINE_CAVE_HEX);
+        assert!(is_net_cave_signature_present(
+            &net_cave,
+            &online_cave[..ONLINE_CAVE_ENABLED_OFFSET],
+            &sock_cave,
+            &multi_cave,
+        ));
+        let mut outdated_sock = sock_cave.clone();
+        outdated_sock[sock_recv_loopback_off] = 0x80;
+        assert!(!is_net_cave_signature_present(
+            &net_cave,
+            &online_cave[..ONLINE_CAVE_ENABLED_OFFSET],
+            &outdated_sock,
+            &multi_cave,
+        ));
     }
 
     #[test]

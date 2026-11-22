@@ -1879,7 +1879,16 @@ fn sync_mod_flags_inner(
     } else {
         orig_exe.clone()
     };
-    flags.apply_to_exe_bytes(&mut exe_bytes, direct_target, vanilla_vsizes)?;
+    if let Err(err) = flags.apply_to_exe_bytes(&mut exe_bytes, direct_target, vanilla_vsizes) {
+        if !force_reinstall && exe_bak_path.exists() {
+            // Upgrade cleanly from an older mod cave revision using the vanilla .bak copy.
+            exe_bytes = std::fs::read(&exe_bak_path)
+                .with_context(|| format!("Reading {}", exe_bak_path.display()))?;
+            flags.apply_to_exe_bytes(&mut exe_bytes, direct_target, vanilla_vsizes)?;
+        } else {
+            return Err(err);
+        }
+    }
     if exe_bytes != orig_exe {
         if !exe_bak_path.exists() {
             std::fs::copy(&exe_path, &exe_bak_path)?;
@@ -2781,6 +2790,17 @@ mod tests {
         patch_pause_always_ready_bytes(&mut via_gameplay).unwrap();
         patch_exe_fixes(&test_exe, &test_bak).unwrap();
         assert_eq!(via_gameplay, std::fs::read(&test_exe).unwrap());
+
+        // Verify upgrading from an older mod cave revision succeeds cleanly via .bak fallback
+        sync_mod_flags(&dir, &std_flags, None).unwrap();
+        let mut stale_cave_exe = std::fs::read(&test_exe).unwrap();
+        let stale_off = crate::net::va_to_text_off(crate::net::MULTI_NIC_LAN_CAVE_VA + 0x55).unwrap();
+        stale_cave_exe[stale_off] ^= 0xFF;
+        std::fs::write(&test_exe, &stale_cave_exe).unwrap();
+        sync_mod_flags(&dir, &std_flags, None).unwrap();
+        assert!(crate::net::is_lan_bind_hooks_applied(
+            &std::fs::read(&test_exe).unwrap()
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
