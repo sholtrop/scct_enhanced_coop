@@ -805,6 +805,49 @@ pub unsafe fn install_quicksave_persistence_hooks(
     };
 
     unsafe {
+        // Idempotent re-attach check: if all 3 Quick Load hook sites already start with `jmp rel32`,
+        // hooks are already active in this running process (avoid allocating a duplicate page).
+        let hook_sites = [
+            (HOOK_PAUSE_QUICKLOAD_VA, HOOK_PAUSE_QUICKLOAD_ORIG),
+            (HOOK_GAMEOVER_QUICKLOAD_VA, HOOK_GAMEOVER_QUICKLOAD_ORIG),
+            (HOOK_COOP_QUICKLOAD_LEN_VA, HOOK_COOP_QUICKLOAD_LEN_ORIG),
+        ];
+        let mut already_hooked = 0usize;
+        let mut eligible = 0usize;
+        for (va, orig) in hook_sites {
+            let mut cur = [0u8; 6];
+            let mut nread = 0usize;
+            let ok = ReadProcessMemory(
+                h_process,
+                va as *const _,
+                cur.as_mut_ptr() as *mut _,
+                orig.len(),
+                &mut nread,
+            );
+            if ok != 0 && nread == orig.len() {
+                if cur[0] == 0xE9 {
+                    already_hooked += 1;
+                } else if cur == orig {
+                    eligible += 1;
+                }
+            }
+        }
+        if already_hooked == hook_sites.len() {
+            crate::scct_log!(
+                "  [QUICKSAVE] Quick Load persistence hooks already active ({}/{})",
+                already_hooked,
+                hook_sites.len()
+            );
+            return true;
+        }
+        if eligible == 0 {
+            crate::scct_log!(
+                "  [QUICKSAVE] Skipping Quick Load persistence hooks (0/{} matching sites)",
+                hook_sites.len()
+            );
+            return false;
+        }
+
         let alloc = VirtualAllocEx(
             h_process,
             std::ptr::null(),

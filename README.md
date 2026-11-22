@@ -95,6 +95,18 @@ scct_coop_enhancer --join <CODE>
 # Launch the game in LAN mode headlessly with multi-NIC fixes applied
 scct_coop_enhancer --lan
 
+# Nucleus Co-op companion mode (watches for Nucleus-launched instances & pairs them on 127.0.0.2 <-> 127.0.0.3)
+scct_coop_enhancer --nucleus
+
+# Nucleus Co-op using Nucleus's own ForceBindIP / KM-TEST loopback adapters instead of built-in pairing
+scct_coop_enhancer --nucleus --respect-nucleus-net
+
+# Nucleus Co-op with two explicit local adapter/alias IPs
+scct_coop_enhancer --nucleus --pair-ips 192.168.178.202,192.168.178.203
+
+# Attach to already-running splintercell3.exe process(es) (also combinable with --host / --join / --lan)
+scct_coop_enhancer --attach
+
 # Configure peer target without auto-launching game (e.g. for Proton / Wine / Steam custom launch)
 scct_coop_enhancer --host --no-launch
 scct_coop_enhancer --join <CODE> --no-launch

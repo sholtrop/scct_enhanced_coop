@@ -1,10 +1,60 @@
 use crate::quicksave_persistence::PersistentQuickSaveHandle;
 use eframe::egui::{self, Color32, RichText, ScrollArea, Vec2};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NucleusNetModeChoice {
+    PreserveNucleusLan,
+    BuiltInLoopbackPair,
+    ExplicitPair,
+}
+
+impl NucleusNetModeChoice {
+    fn label(self) -> &'static str {
+        match self {
+            NucleusNetModeChoice::BuiltInLoopbackPair => {
+                "Built-in Loopback Pair (127.0.0.2 <-> 127.0.0.3) — Recommended"
+            }
+            NucleusNetModeChoice::ExplicitPair => "Custom Adapter IP Pair",
+            NucleusNetModeChoice::PreserveNucleusLan => {
+                "Respect Nucleus Network (ForceBindIP / Loopback Adapters only)"
+            }
+        }
+    }
+}
+
+pub struct NucleusWatcherHandle {
+    stop_tx: Sender<()>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for NucleusWatcherHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NucleusWatcherHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NucleusWatcherHandle {
+    pub fn stop(&mut self) {
+        let _ = self.stop_tx.send(());
+        if let Some(h) = self.join_handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Drop for NucleusWatcherHandle {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum InstallState {
@@ -290,6 +340,7 @@ pub enum GuiEvent {
     },
     MatchFailed(String),
     PeerDisconnected(String),
+    GameAttached(u32),
     GameExited(u32),
     DesyncDetected(crate::launcher::DesyncReport),
     DesyncDumpFailed(String),
@@ -306,8 +357,15 @@ pub struct PatcherApp {
     receiver: Receiver<GuiEvent>,
     sender: Sender<GuiEvent>,
 
-    // Running game process
-    running_game_pid: Option<u32>,
+    // Running / attached game processes (supports multiple simultaneous Nucleus Co-op instances)
+    active_game_pids: Arc<Mutex<HashSet<u32>>>,
+
+    // Nucleus Co-op / External Attach Mode
+    nucleus_net_mode: NucleusNetModeChoice,
+    nucleus_pair_ip1: String,
+    nucleus_pair_ip2: String,
+    nucleus_watcher: Option<NucleusWatcherHandle>,
+    nucleus_next_slot: usize,
 
     // Friend Code Matchmaking
     match_state: MatchState,
@@ -370,6 +428,16 @@ impl PatcherApp {
         let (sender, receiver) = channel();
         let initial_bind_ip = initial_bind_ip.filter(|ip| !ip.is_unspecified());
 
+        let available_local_ips = crate::ip::get_all_local_ips();
+        let default_ip1 = available_local_ips
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "127.0.0.2".to_string());
+        let default_ip2 = available_local_ips
+            .get(1)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "127.0.0.3".to_string());
+
         let mut app = Self {
             game_dir_input: String::new(),
             resolved_root: None,
@@ -380,7 +448,12 @@ impl PatcherApp {
             log_lines: Vec::new(),
             receiver,
             sender,
-            running_game_pid: None,
+            active_game_pids: Arc::new(Mutex::new(HashSet::new())),
+            nucleus_net_mode: NucleusNetModeChoice::BuiltInLoopbackPair,
+            nucleus_pair_ip1: default_ip1,
+            nucleus_pair_ip2: default_ip2,
+            nucleus_watcher: None,
+            nucleus_next_slot: 0,
             match_state: MatchState::Idle,
             guest_code_input: String::new(),
             cancel_tx: None,
@@ -391,7 +464,7 @@ impl PatcherApp {
             server_host: crate::stun::DEFAULT_SERVER_HOST.to_string(),
             stun_port: crate::stun::DEFAULT_STUN_PORT,
             api_port: crate::stun::DEFAULT_API_PORT,
-            available_local_ips: crate::ip::get_all_local_ips(),
+            available_local_ips,
             selected_bind_ip: initial_bind_ip,
             auto_resync: initial_auto_resync,
             dev_mode,
@@ -615,6 +688,44 @@ impl PatcherApp {
     fn stop_session_monitor(&mut self) {
         if let Some(mut mon) = self.session_monitor.take() {
             mon.stop();
+        }
+    }
+
+    fn stop_nucleus_watcher(&mut self) {
+        if let Some(mut watcher) = self.nucleus_watcher.take() {
+            watcher.stop();
+        }
+    }
+
+    fn active_pids_sorted(&self) -> Vec<u32> {
+        let mut pids: Vec<u32> = self
+            .active_game_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        pids.sort_unstable();
+        pids
+    }
+
+    fn selected_nucleus_net_mode(&self) -> anyhow::Result<crate::launcher::NucleusNetMode> {
+        match self.nucleus_net_mode {
+            NucleusNetModeChoice::PreserveNucleusLan => {
+                Ok(crate::launcher::NucleusNetMode::PreserveNucleusLan)
+            }
+            NucleusNetModeChoice::BuiltInLoopbackPair => {
+                Ok(crate::launcher::NucleusNetMode::BuiltInLoopbackPair)
+            }
+            NucleusNetModeChoice::ExplicitPair => {
+                let raw = format!(
+                    "{},{}",
+                    self.nucleus_pair_ip1.trim(),
+                    self.nucleus_pair_ip2.trim()
+                );
+                let (ip1, ip2) = crate::launcher::parse_ip_pair(&raw)?;
+                Ok(crate::launcher::NucleusNetMode::ExplicitPair(ip1, ip2))
+            }
         }
     }
 
@@ -1077,7 +1188,10 @@ impl PatcherApp {
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
-                self.running_game_pid = Some(pid);
+                self.active_game_pids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid);
                 if let MatchState::Matched {
                     ref mut game_launched,
                     ..
@@ -1109,6 +1223,433 @@ impl PatcherApp {
                     .push(format!(">>> [LAUNCH ERROR] Failed to launch game: {:#}", e));
             }
         }
+        ctx.request_repaint();
+    }
+
+    fn attach_matched_game(&mut self, ctx: &egui::Context) {
+        let (is_host, peer_ip, peer_disco_port, peer_game_port, already_launched) =
+            match self.match_state {
+                MatchState::Matched {
+                    is_host,
+                    peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    game_launched,
+                    ..
+                } => (
+                    is_host,
+                    peer_ip,
+                    peer_disco_port,
+                    peer_game_port,
+                    game_launched,
+                ),
+                _ => return,
+            };
+
+        if already_launched {
+            self.log_lines
+                .push("  [ATTACH] Game already attached/running for this session!".to_string());
+            return;
+        }
+
+        let Some(root) = self.resolved_root.clone() else {
+            self.log_lines
+                .push("  [ATTACH] ERROR: Game folder not selected!".to_string());
+            return;
+        };
+
+        let running = crate::launcher::find_running_scct_processes();
+        let active_snapshot = self.active_pids_sorted();
+        let target = running
+            .iter()
+            .find(|info| !active_snapshot.contains(&info.pid))
+            .or_else(|| running.first());
+        let Some(info) = target else {
+            self.log_lines.push(
+                ">>> [ATTACH] No running splintercell3.exe found. Start Chaos Theory first (e.g. via Steam or Nucleus), then click Attach."
+                    .to_string(),
+            );
+            ctx.request_repaint();
+            return;
+        };
+
+        self.stop_keepalive();
+        self.restore_quick_saves_before_launch(&root);
+
+        let peer_role = if is_host {
+            crate::trace::PeerRole::Host
+        } else {
+            crate::trace::PeerRole::Guest
+        };
+        let launch_opts = self.build_launch_runtime_options();
+        match crate::launcher::attach_game(
+            info.pid,
+            peer_role,
+            Some(crate::launcher::DirectPeerTarget {
+                ip: peer_ip,
+                disco_port: peer_disco_port,
+                game_port: peer_game_port,
+            }),
+            self.selected_bind_ip,
+            launch_opts,
+        ) {
+            Ok((mut proc, updated_info)) => {
+                proc.reserve_session_paths(&root);
+                let pid = proc.pid;
+                self.active_game_pids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid);
+                if let MatchState::Matched {
+                    ref mut game_launched,
+                    ..
+                } = self.match_state
+                {
+                    *game_launched = true;
+                }
+                spawn_game_monitor(proc, self.sender.clone(), ctx.clone(), root.clone());
+                self.log_lines.push(format!(
+                    ">>> [ATTACH] Attached to {} and injected peer target!",
+                    updated_info.summary_line()
+                ));
+                if !updated_info.has_mod_net_caves {
+                    self.log_lines.push(
+                        ">>> [ATTACH WARNING] Running EXE lacks SCCT Enhanced Coop PE network caves. Install Mod before launching the game (and clear Nucleus cached content if using Nucleus)."
+                            .to_string(),
+                    );
+                }
+                self.log_lines.push(
+                    ">>> In game, enter Coop -> Enhanced Coop (if already in the Coop menu, back out to Main Menu and re-enter)."
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                self.log_lines
+                    .push(format!(">>> [ATTACH ERROR] Failed to attach PID {}: {:#}", info.pid, e));
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn attach_running_games_once(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.resolved_root.clone() else {
+            self.log_lines
+                .push("  [ATTACH] ERROR: Game folder not selected!".to_string());
+            return;
+        };
+        let net_mode = match self.selected_nucleus_net_mode() {
+            Ok(m) => m,
+            Err(e) => {
+                self.log_lines
+                    .push(format!(">>> [NUCLEUS ERROR] Invalid IP pair: {:#}", e));
+                return;
+            }
+        };
+
+        let _ = crate::launcher::prepare_exe_for_nucleus_lan(
+            &root,
+            self.patch_flags.runtime_bypass_checksum_disconnect,
+        );
+        self.restore_quick_saves_before_launch(&root);
+
+        let running = crate::launcher::find_running_scct_processes();
+        if running.is_empty() {
+            self.log_lines.push(
+                ">>> [ATTACH] No running splintercell3.exe instances found. Start Nucleus Co-op first, or use 'Watch & Auto-Attach'."
+                    .to_string(),
+            );
+            ctx.request_repaint();
+            return;
+        }
+
+        let launch_opts = self.build_launch_runtime_options();
+        let mut attached_count = 0usize;
+        let mut reconfigured_count = 0usize;
+        for (slot, info) in running.into_iter().enumerate() {
+            let already_tracked = self
+                .active_game_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&info.pid);
+            let mut plan = crate::launcher::plan_nucleus_instance(slot, net_mode, &info);
+            if matches!(net_mode, crate::launcher::NucleusNetMode::PreserveNucleusLan)
+                && self.selected_bind_ip.is_some()
+            {
+                plan.local_bind_ip = self.selected_bind_ip;
+            }
+            if already_tracked {
+                match crate::launcher::reconfigure_running_game_network(
+                    info.pid,
+                    plan.direct_peer,
+                    plan.local_bind_ip,
+                    launch_opts,
+                ) {
+                    Ok(updated_info) => {
+                        reconfigured_count += 1;
+                        self.log_lines.push(format!(
+                            ">>> [NUCLEUS] Re-applied network mode to Instance #{} — {}",
+                            slot + 1,
+                            updated_info.summary_line()
+                        ));
+                        if !updated_info.has_mod_net_caves {
+                            self.log_lines.push(
+                                ">>> [NUCLEUS WARNING] Running EXE has missing or outdated PE network caves! Close both games, delete Nucleus's cached 'content' folder for Chaos Theory, click Reinstall, then relaunch Nucleus."
+                                    .to_string(),
+                            );
+                        }
+                        if let Some(warn) = plan.warning {
+                            self.log_lines.push(format!(">>> [NUCLEUS NOTE] {}", warn));
+                        }
+                    }
+                    Err(e) => {
+                        self.log_lines.push(format!(
+                            ">>> [NUCLEUS ERROR] Failed to re-apply network mode to PID {}: {:#}",
+                            info.pid, e
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            match crate::launcher::attach_game(
+                info.pid,
+                plan.role,
+                plan.direct_peer,
+                plan.local_bind_ip,
+                launch_opts,
+            ) {
+                Ok((mut proc, updated_info)) => {
+                    proc.reserve_session_paths(&root);
+                    let pid = proc.pid;
+                    self.active_game_pids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(pid);
+                    spawn_game_monitor(proc, self.sender.clone(), ctx.clone(), root.clone());
+                    attached_count += 1;
+                    self.log_lines.push(format!(
+                        ">>> [NUCLEUS] Attached Instance #{} — {}",
+                        slot + 1,
+                        updated_info.summary_line()
+                    ));
+                    if !updated_info.has_mod_net_caves {
+                        self.log_lines.push(
+                            ">>> [NUCLEUS WARNING] Running EXE has missing or outdated PE network caves! Close both games, delete Nucleus's cached 'content' folder for Chaos Theory, click Reinstall, then relaunch Nucleus."
+                                .to_string(),
+                        );
+                    }
+                    if let Some(warn) = plan.warning {
+                        self.log_lines.push(format!(">>> [NUCLEUS NOTE] {}", warn));
+                    }
+                }
+                Err(e) => {
+                    self.log_lines.push(format!(
+                        ">>> [NUCLEUS ERROR] Failed to attach PID {}: {:#}",
+                        info.pid, e
+                    ));
+                }
+            }
+        }
+        self.nucleus_next_slot = attached_count + reconfigured_count;
+
+        if attached_count > 0 || reconfigured_count > 0 {
+            self.log_lines.push(
+                ">>> [NUCLEUS] Ready! In both game windows, go to Co-op -> Enhanced Coop (if already inside the Co-op menu, back out to Main Menu and re-enter so sockets rebind)."
+                    .to_string(),
+            );
+        }
+        ctx.request_repaint();
+    }
+
+    fn start_nucleus_watcher(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.resolved_root.clone() else {
+            self.log_lines
+                .push("  [NUCLEUS] ERROR: Game folder not selected!".to_string());
+            return;
+        };
+        let net_mode = match self.selected_nucleus_net_mode() {
+            Ok(m) => m,
+            Err(e) => {
+                self.log_lines
+                    .push(format!(">>> [NUCLEUS ERROR] Invalid IP pair: {:#}", e));
+                return;
+            }
+        };
+        self.stop_nucleus_watcher();
+
+        match crate::launcher::prepare_exe_for_nucleus_lan(
+            &root,
+            self.patch_flags.runtime_bypass_checksum_disconnect,
+        ) {
+            Ok(true) => {
+                self.log_lines.push(
+                    ">>> [NUCLEUS] Cleared stale online Friend-Code target on disk for LAN/Nucleus."
+                        .to_string(),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => {
+                self.log_lines.push(format!(
+                    ">>> [NUCLEUS] Warning pre-cleaning splintercell3.exe on disk: {:#}",
+                    e
+                ));
+            }
+        }
+        self.restore_quick_saves_before_launch(&root);
+
+        let (stop_tx, stop_rx) = channel::<()>();
+        let active_pids = Arc::clone(&self.active_game_pids);
+        let tx = self.sender.clone();
+        let ctx_clone = ctx.clone();
+        let launch_opts = self.build_launch_runtime_options();
+        let bind_ip = self.selected_bind_ip;
+
+        // If any instances are already attached from a previous mode, re-apply the selected mode right away.
+        let mut initial_slot = 0usize;
+        let existing_running = crate::launcher::find_running_scct_processes();
+        for info in existing_running {
+            let already_tracked = active_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&info.pid);
+            if !already_tracked {
+                continue;
+            }
+            let mut plan = crate::launcher::plan_nucleus_instance(initial_slot, net_mode, &info);
+            if matches!(net_mode, crate::launcher::NucleusNetMode::PreserveNucleusLan)
+                && bind_ip.is_some()
+            {
+                plan.local_bind_ip = bind_ip;
+            }
+            match crate::launcher::reconfigure_running_game_network(
+                info.pid,
+                plan.direct_peer,
+                plan.local_bind_ip,
+                launch_opts,
+            ) {
+                Ok(updated_info) => {
+                    self.log_lines.push(format!(
+                        ">>> [NUCLEUS] Re-applied network mode to Instance #{} — {}",
+                        initial_slot + 1,
+                        updated_info.summary_line()
+                    ));
+                }
+                Err(e) => {
+                    self.log_lines.push(format!(
+                        ">>> [NUCLEUS ERROR] Failed to re-apply network mode to PID {}: {:#}",
+                        info.pid, e
+                    ));
+                }
+            }
+            initial_slot += 1;
+        }
+        self.nucleus_next_slot = initial_slot;
+
+        self.log_lines.push(format!(
+            ">>> [NUCLEUS] Watching for splintercell3.exe launches ({})... Click Play in Nucleus Co-op now!",
+            self.nucleus_net_mode.label()
+        ));
+
+        let join_handle = thread::spawn(move || {
+            let mut pending: HashMap<u32, Instant> = HashMap::new();
+            let mut failed_pids: HashSet<u32> = HashSet::new();
+            let mut next_slot = initial_slot;
+
+            loop {
+                let running = crate::launcher::find_running_scct_processes();
+                let live_set: HashSet<u32> = running.iter().map(|i| i.pid).collect();
+                pending.retain(|pid, _| live_set.contains(pid));
+                failed_pids.retain(|pid| live_set.contains(pid));
+
+                for info in running {
+                    let already_active = active_pids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&info.pid);
+                    if already_active || failed_pids.contains(&info.pid) {
+                        continue;
+                    }
+                    let first_seen = *pending.entry(info.pid).or_insert_with(Instant::now);
+                    if first_seen.elapsed() < Duration::from_millis(1500)
+                        || !crate::launcher::is_process_initialized_for_attach(info.pid)
+                    {
+                        continue;
+                    }
+                    pending.remove(&info.pid);
+
+                    // Reset slot numbering cleanly when starting a fresh Nucleus Co-op session
+                    if active_pids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty()
+                    {
+                        next_slot = 0;
+                    }
+
+                    let mut plan = crate::launcher::plan_nucleus_instance(next_slot, net_mode, &info);
+                    if matches!(net_mode, crate::launcher::NucleusNetMode::PreserveNucleusLan)
+                        && bind_ip.is_some()
+                    {
+                        plan.local_bind_ip = bind_ip;
+                    }
+                    match crate::launcher::attach_game(
+                        info.pid,
+                        plan.role,
+                        plan.direct_peer,
+                        plan.local_bind_ip,
+                        launch_opts,
+                    ) {
+                        Ok((mut proc, updated_info)) => {
+                            proc.reserve_session_paths(&root);
+                            let pid = proc.pid;
+                            active_pids
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(pid);
+                            let _ = tx.send(GuiEvent::GameAttached(pid));
+                            let _ = tx.send(GuiEvent::Log(format!(
+                                ">>> [NUCLEUS] Auto-attached Instance #{} — {}",
+                                next_slot + 1,
+                                updated_info.summary_line()
+                            )));
+                            if !updated_info.has_mod_net_caves {
+                                let _ = tx.send(GuiEvent::Log(
+                                    ">>> [NUCLEUS WARNING] Running EXE lacks SCCT Enhanced Coop PE network caves! Delete Nucleus's cached 'content' folder for Chaos Theory, run Install Mod, then relaunch Nucleus."
+                                        .to_string(),
+                                ));
+                            }
+                            if let Some(warn) = plan.warning {
+                                let _ = tx.send(GuiEvent::Log(format!(
+                                    ">>> [NUCLEUS NOTE] {}",
+                                    warn
+                                )));
+                            }
+                            spawn_game_monitor(proc, tx.clone(), ctx_clone.clone(), root.clone());
+                            next_slot += 1;
+                            ctx_clone.request_repaint();
+                        }
+                        Err(e) => {
+                            failed_pids.insert(info.pid);
+                            let _ = tx.send(GuiEvent::Log(format!(
+                                ">>> [NUCLEUS ERROR] Failed to attach PID {}: {:#}",
+                                info.pid, e
+                            )));
+                            ctx_clone.request_repaint();
+                        }
+                    }
+                }
+
+                match stop_rx.recv_timeout(Duration::from_millis(250)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        });
+
+        self.nucleus_watcher = Some(NucleusWatcherHandle {
+            stop_tx,
+            join_handle: Some(join_handle),
+        });
         ctx.request_repaint();
     }
 
@@ -1149,7 +1690,10 @@ impl PatcherApp {
         ) {
             Ok(proc) => {
                 let pid = proc.pid;
-                self.running_game_pid = Some(pid);
+                self.active_game_pids
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(pid);
                 spawn_game_monitor(proc, self.sender.clone(), ctx.clone(), root.clone());
                 let adapter_desc = match self.selected_bind_ip {
                     Some(ip) => format!("bound to adapter {}", ip),
@@ -1260,16 +1804,36 @@ impl eframe::App for PatcherApp {
                     self.disconnect_notice = Some(reason);
                     self.match_state = MatchState::Idle;
                 }
+                GuiEvent::GameAttached(pid) => {
+                    self.active_game_pids
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(pid);
+                }
                 GuiEvent::GameExited(pid) => {
-                    if self.running_game_pid == Some(pid) {
-                        self.running_game_pid = None;
+                    let remaining_active = {
+                        let mut set = self
+                            .active_game_pids
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        set.remove(&pid);
+                        set.len()
+                    };
+                    if remaining_active == 0 {
+                        self.nucleus_next_slot = 0;
                     }
                     self.log_lines.push(format!(
                         ">>> Splinter Cell Chaos Theory (PID: {}) has exited.",
                         pid
                     ));
                     self.flush_quicksaves_on_game_exit();
-                    if let MatchState::Matched { ref code, .. } = self.match_state {
+                    if remaining_active == 0
+                        && let MatchState::Matched {
+                            ref code,
+                            game_launched: true,
+                            ..
+                        } = self.match_state
+                    {
                         let code_clone = code.clone();
                         let host = self.server_host.clone();
                         let port = self.api_port;
@@ -1661,6 +2225,7 @@ impl eframe::App for PatcherApp {
 
                 let mut action_cancel = false;
                 let mut action_launch = false;
+                let mut action_attach_match = false;
 
                 match &mut self.match_state {
                     MatchState::Idle => {
@@ -1899,18 +2464,39 @@ impl eframe::App for PatcherApp {
                             ui.add_space(8.0);
 
                             if !is_launched {
-                                let launch_btn = egui::Button::new(
-                                    RichText::new("🚀 Launch Game (Co-op)")
-                                        .size(14.5)
-                                        .strong()
-                                        .color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(32, 140, 60))
-                                .min_size(Vec2::new(ui.available_width(), 38.0));
+                                ui.columns(2, |cols| {
+                                    let launch_btn = egui::Button::new(
+                                        RichText::new("🚀 Launch Game (Co-op)")
+                                            .size(14.0)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(32, 140, 60))
+                                    .min_size(Vec2::new(cols[0].available_width(), 38.0));
 
-                                if ui.add(launch_btn).clicked() {
-                                    action_launch = true;
-                                }
+                                    if cols[0].add(launch_btn).clicked() {
+                                        action_launch = true;
+                                    }
+
+                                    let attach_btn = egui::Button::new(
+                                        RichText::new("🔗 Attach to Running Game")
+                                            .size(13.5)
+                                            .strong()
+                                            .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(45, 95, 160))
+                                    .min_size(Vec2::new(cols[1].available_width(), 38.0));
+
+                                    if cols[1]
+                                        .add(attach_btn)
+                                        .on_hover_text(
+                                            "Inject peer address & runtime hooks into an already-running splintercell3.exe (e.g. launched via Steam or Nucleus Co-op)",
+                                        )
+                                        .clicked()
+                                    {
+                                        action_attach_match = true;
+                                    }
+                                });
                             } else {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -1954,6 +2540,9 @@ impl eframe::App for PatcherApp {
                 if action_launch {
                     self.launch_match_game(ctx);
                 }
+                if action_attach_match {
+                    self.attach_matched_game(ctx);
+                }
 
                 ui.add_space(4.0);
 
@@ -1994,6 +2583,171 @@ impl eframe::App for PatcherApp {
             });
 
             ui.add_space(6.0);
+
+            // =================================================================
+            // Nucleus Co-op / External Launcher (Live Attach Mode)
+            // =================================================================
+            if self.installed_version.is_some() {
+                let active_pids = self.active_pids_sorted();
+                let is_watching = self.nucleus_watcher.is_some();
+                let nucleus_frame = egui::Frame::group(ui.style())
+                    .fill(Color32::from_rgb(20, 24, 30))
+                    .inner_margin(10.0);
+
+                let mut action_toggle_watch = false;
+                let mut action_attach_now = false;
+
+                nucleus_frame.show(ui, |ui| {
+                    let header_text = if is_watching {
+                        format!(
+                            "🖥 Nucleus Co-op / Attach Mode — Watching (Attached: {})",
+                            active_pids.len()
+                        )
+                    } else if !active_pids.is_empty() {
+                        format!(
+                            "🖥 Nucleus Co-op / Attach Mode (Attached PIDs: {:?})",
+                            active_pids
+                        )
+                    } else {
+                        "🖥 Nucleus Co-op / External Launcher (Attach Mode)".to_string()
+                    };
+                    egui::CollapsingHeader::new(RichText::new(header_text).size(13.5).strong())
+                        .id_salt("nucleus_coop_attach_section")
+                        .default_open(is_watching || !active_pids.is_empty())
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Use when Nucleus Co-op (or Steam) launches splintercell3.exe itself. Start 'Watch & Auto-Attach' before clicking Play in Nucleus, or click 'Attach Now' at the Main Menu.",
+                                )
+                                .size(11.5)
+                                .color(Color32::from_rgb(180, 190, 205)),
+                            );
+                            ui.add_space(4.0);
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("Nucleus Networking:")
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(180, 180, 180)),
+                                );
+                                egui::ComboBox::from_id_salt("nucleus_net_mode_combo")
+                                    .selected_text(self.nucleus_net_mode.label())
+                                    .width(380.0)
+                                    .show_ui(ui, |ui| {
+                                        for choice in [
+                                            NucleusNetModeChoice::BuiltInLoopbackPair,
+                                            NucleusNetModeChoice::ExplicitPair,
+                                            NucleusNetModeChoice::PreserveNucleusLan,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut self.nucleus_net_mode,
+                                                choice,
+                                                choice.label(),
+                                            );
+                                        }
+                                    });
+                            });
+
+                            if self.nucleus_net_mode == NucleusNetModeChoice::ExplicitPair {
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Instance 1 IP:").size(11.5));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.nucleus_pair_ip1)
+                                            .desired_width(120.0)
+                                            .hint_text("192.168.178.202"),
+                                    );
+                                    ui.label(RichText::new("Instance 2 IP:").size(11.5));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.nucleus_pair_ip2)
+                                            .desired_width(120.0)
+                                            .hint_text("192.168.178.203"),
+                                    );
+                                    if self.available_local_ips.len() >= 2
+                                        && ui
+                                            .button(RichText::new("Use Detected NICs").size(11.0))
+                                            .clicked()
+                                    {
+                                        self.nucleus_pair_ip1 =
+                                            self.available_local_ips[0].to_string();
+                                        self.nucleus_pair_ip2 =
+                                            self.available_local_ips[1].to_string();
+                                    }
+                                });
+                            }
+
+                            ui.add_space(5.0);
+                            ui.columns(2, |cols| {
+                                let (watch_label, watch_fill) = if is_watching {
+                                    (
+                                        "⏹ Stop Watching (Nucleus Mode)",
+                                        Color32::from_rgb(165, 60, 50),
+                                    )
+                                } else {
+                                    (
+                                        "👁 Watch & Auto-Attach (Nucleus Mode)",
+                                        Color32::from_rgb(35, 100, 180),
+                                    )
+                                };
+                                let watch_btn = egui::Button::new(
+                                    RichText::new(watch_label)
+                                        .size(12.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(watch_fill)
+                                .min_size(Vec2::new(cols[0].available_width(), 32.0));
+                                if cols[0].add(watch_btn).clicked() {
+                                    action_toggle_watch = true;
+                                }
+
+                                let attach_btn = egui::Button::new(
+                                    RichText::new("🔗 Attach / Re-apply to Running Game(s)")
+                                        .size(12.5)
+                                        .strong()
+                                        .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(45, 115, 85))
+                                .min_size(Vec2::new(cols[1].available_width(), 32.0));
+                                if cols[1].add(attach_btn).clicked() {
+                                    action_attach_now = true;
+                                }
+                            });
+
+                            if !active_pids.is_empty() {
+                                ui.add_space(4.0);
+                                let pid_list = active_pids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "✔ Attached & monitoring splintercell3.exe PID(s): {}",
+                                        pid_list
+                                    ))
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(120, 230, 140)),
+                                );
+                            }
+                        });
+                });
+
+                if action_toggle_watch {
+                    if is_watching {
+                        self.stop_nucleus_watcher();
+                        self.log_lines
+                            .push(">>> [NUCLEUS] Stopped watching for new game launches.".to_string());
+                    } else {
+                        self.start_nucleus_watcher(ctx);
+                    }
+                }
+                if action_attach_now {
+                    self.attach_running_games_once(ctx);
+                }
+
+                ui.add_space(6.0);
+            }
 
             if self.dev_mode {
                 // =================================================================
@@ -2079,6 +2833,7 @@ impl eframe::App for PatcherApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.stop_nucleus_watcher();
         self.stop_persistent_quick_saves();
         self.cancel_matching();
     }
@@ -2086,6 +2841,7 @@ impl eframe::App for PatcherApp {
 
 impl Drop for PatcherApp {
     fn drop(&mut self) {
+        self.stop_nucleus_watcher();
         self.stop_persistent_quick_saves();
         self.cancel_matching();
     }
@@ -2627,6 +3383,7 @@ mod tests {
         assert_eq!(install_button_label(&app.state), "🎮 Install Mod");
         assert!(!install_button_label(&app.state).contains("Installed Successfully"));
 
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2655,7 +3412,44 @@ mod tests {
         assert_eq!(app.installed_version, None);
         assert_eq!(app.state, InstallState::Failed);
 
+        drop(app);
         std::fs::remove_dir_all(installed_root).unwrap();
         std::fs::remove_dir_all(vanilla_root).unwrap();
+    }
+
+    #[test]
+    fn nucleus_net_mode_selection_and_multi_pid_tracking() {
+        let mut app = PatcherApp::init_state(None, None, false, false, false);
+        assert_eq!(
+            app.selected_nucleus_net_mode().unwrap(),
+            crate::launcher::NucleusNetMode::BuiltInLoopbackPair
+        );
+
+        app.nucleus_net_mode = super::NucleusNetModeChoice::PreserveNucleusLan;
+        assert_eq!(
+            app.selected_nucleus_net_mode().unwrap(),
+            crate::launcher::NucleusNetMode::PreserveNucleusLan
+        );
+
+        app.nucleus_net_mode = super::NucleusNetModeChoice::ExplicitPair;
+        app.nucleus_pair_ip1 = "192.168.178.202".to_string();
+        app.nucleus_pair_ip2 = "192.168.178.203".to_string();
+        assert_eq!(
+            app.selected_nucleus_net_mode().unwrap(),
+            crate::launcher::NucleusNetMode::ExplicitPair(
+                std::net::Ipv4Addr::new(192, 168, 178, 202),
+                std::net::Ipv4Addr::new(192, 168, 178, 203),
+            )
+        );
+
+        app.nucleus_pair_ip2 = "192.168.178.202".to_string();
+        assert!(app.selected_nucleus_net_mode().is_err());
+
+        {
+            let mut set = app.active_game_pids.lock().unwrap();
+            set.insert(9002);
+            set.insert(4001);
+        }
+        assert_eq!(app.active_pids_sorted(), vec![4001, 9002]);
     }
 }

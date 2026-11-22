@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::Path;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::launcher::{DirectPeerTarget, LaunchRuntimeOptions, launch_game};
+use crate::launcher::{
+    DirectPeerTarget, GameProcess, LaunchRuntimeOptions, NucleusNetMode, RunningGameInfo,
+    attach_game, find_running_scct_processes, is_process_initialized_for_attach, launch_game,
+    plan_nucleus_instance, prepare_exe_for_nucleus_lan,
+};
 use crate::net::{sync_startup_checksum_bypass_in_exe, update_direct_target_in_exe};
 use crate::patcher::find_child_ci;
 use crate::quicksave_persistence::{
@@ -25,6 +30,19 @@ pub struct HeadlessOptions<'a> {
     pub bypass_checksum_disconnect: bool,
     pub auto_resync: bool,
     pub bind_ip: Option<Ipv4Addr>,
+    pub attach: bool,
+    pub watch: bool,
+    pub target_pids: &'a [u32],
+}
+
+pub struct AttachModeOptions<'a> {
+    pub game_root: &'a Path,
+    pub bypass_checksum_disconnect: bool,
+    pub auto_resync: bool,
+    pub bind_ip: Option<Ipv4Addr>,
+    pub net_mode: NucleusNetMode,
+    pub watch: bool,
+    pub target_pids: &'a [u32],
 }
 
 struct SessionGuard<'a> {
@@ -221,6 +239,39 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
     drop(sock_disco);
     drop(sock_game);
 
+    let direct_target = DirectPeerTarget {
+        ip: peer_ip,
+        disco_port: peer_disco_port,
+        game_port: peer_game_port,
+    };
+
+    if opts.attach {
+        let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
+        let proc = attach_single_peer_process(
+            opts.game_root,
+            crate::trace::PeerRole::Host,
+            Some(direct_target),
+            opts.bind_ip,
+            opts.auto_resync,
+            opts.watch,
+            opts.target_pids,
+        )?;
+        println!("  [ATTACHED] Host target injected into running Chaos Theory (PID: {})!", proc.pid);
+        println!("\n  ================================================================");
+        println!("  Instructions:");
+        println!("    In game, select: Co-op -> Enhanced Coop -> Host Game");
+        println!("    (If already inside the Co-op menu, back out to Main Menu and re-enter)");
+        println!("    Waiting for game to exit...");
+        println!("  ================================================================\n");
+
+        proc.wait_for_exit_monitoring_desync(opts.game_root);
+        drop(quicksave_guard);
+        guard.finish();
+
+        println!("  [EXIT] Game exited. Co-op session closed cleanly.");
+        return Ok(());
+    }
+
     let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
     update_direct_target_in_exe(
         &exe_path,
@@ -248,11 +299,7 @@ pub fn run_headless_host(opts: HeadlessOptions) -> Result<()> {
         &exe_path,
         opts.game_root,
         crate::trace::PeerRole::Host,
-        Some(DirectPeerTarget {
-            ip: peer_ip,
-            disco_port: peer_disco_port,
-            game_port: peer_game_port,
-        }),
+        Some(direct_target),
         opts.bind_ip,
         LaunchRuntimeOptions {
             auto_resync: opts.auto_resync,
@@ -344,6 +391,39 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
     drop(sock_disco);
     drop(sock_game);
 
+    let direct_target = DirectPeerTarget {
+        ip: peer_ip,
+        disco_port: peer_disco_port,
+        game_port: peer_game_port,
+    };
+
+    if opts.attach {
+        let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
+        let proc = attach_single_peer_process(
+            opts.game_root,
+            crate::trace::PeerRole::Guest,
+            Some(direct_target),
+            opts.bind_ip,
+            opts.auto_resync,
+            opts.watch,
+            opts.target_pids,
+        )?;
+        println!("  [ATTACHED] Host target injected into running Chaos Theory (PID: {})!", proc.pid);
+        println!("\n  ================================================================");
+        println!("  Instructions:");
+        println!("    In game, select: Co-op -> Enhanced Coop to join your friend's game");
+        println!("    (If already inside the Co-op menu, back out to Main Menu and re-enter)");
+        println!("    Waiting for game to exit...");
+        println!("  ================================================================\n");
+
+        proc.wait_for_exit_monitoring_desync(opts.game_root);
+        drop(quicksave_guard);
+        guard.finish();
+
+        println!("  [EXIT] Game exited. Co-op session closed cleanly.");
+        return Ok(());
+    }
+
     let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
     update_direct_target_in_exe(
         &exe_path,
@@ -371,11 +451,7 @@ pub fn run_headless_join(opts: HeadlessOptions, target_code: &str) -> Result<()>
         &exe_path,
         opts.game_root,
         crate::trace::PeerRole::Guest,
-        Some(DirectPeerTarget {
-            ip: peer_ip,
-            disco_port: peer_disco_port,
-            game_port: peer_game_port,
-        }),
+        Some(direct_target),
         opts.bind_ip,
         LaunchRuntimeOptions {
             auto_resync: opts.auto_resync,
@@ -416,6 +492,18 @@ fn prepare_and_watch_quicksaves(game_root: &Path) -> PersistentQuickSaveHandle {
 }
 
 pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
+    if opts.attach {
+        return run_headless_attach(AttachModeOptions {
+            game_root: opts.game_root,
+            bypass_checksum_disconnect: opts.bypass_checksum_disconnect,
+            auto_resync: opts.auto_resync,
+            bind_ip: opts.bind_ip,
+            net_mode: NucleusNetMode::PreserveNucleusLan,
+            watch: opts.watch,
+            target_pids: opts.target_pids,
+        });
+    }
+
     let sys_dir = find_child_ci(opts.game_root, "System");
     let exe_path = find_child_ci(&sys_dir, "splintercell3.exe");
     if !exe_path.exists() {
@@ -475,6 +563,357 @@ pub fn run_headless_lan(opts: HeadlessOptions) -> Result<()> {
     Ok(())
 }
 
+fn log_attach_diagnostics(info: &RunningGameInfo, warning: Option<&str>) {
+    println!("  [ATTACH] {}", info.summary_line());
+    if !info.has_mod_net_caves {
+        eprintln!(
+            "  [WARNING] PID {} does not have SCCT Enhanced Coop PE network caves loaded!",
+            info.pid
+        );
+        if let Some(ref p) = info.exe_path {
+            eprintln!("            Executable: {}", p.display());
+        }
+        eprintln!(
+            "            If using Nucleus Co-op, delete Nucleus's cached 'content' folder for Chaos Theory, run Install Mod first, then relaunch Nucleus."
+        );
+    }
+    if let Some(warn) = warning {
+        println!("  [NOTE] {}", warn);
+    }
+}
+
+fn attach_single_peer_process(
+    game_root: &Path,
+    peer_role: crate::trace::PeerRole,
+    direct_peer: Option<DirectPeerTarget>,
+    bind_ip: Option<Ipv4Addr>,
+    auto_resync: bool,
+    watch: bool,
+    target_pids: &[u32],
+) -> Result<GameProcess> {
+    let pid = if let Some(&explicit) = target_pids.first() {
+        explicit
+    } else {
+        let mut announced_wait = false;
+        loop {
+            let running = find_running_scct_processes();
+            if let Some(first) = running.first() {
+                if !watch || is_process_initialized_for_attach(first.pid) {
+                    break first.pid;
+                }
+            }
+            if !watch {
+                bail!(
+                    "No running splintercell3.exe process found. Launch Chaos Theory first, or pass --watch."
+                );
+            }
+            if !announced_wait {
+                println!("  [WATCH] Waiting for splintercell3.exe to start...");
+                announced_wait = true;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+    };
+
+    let (mut proc, info) = attach_game(
+        pid,
+        peer_role,
+        direct_peer,
+        bind_ip,
+        LaunchRuntimeOptions {
+            auto_resync,
+            ..LaunchRuntimeOptions::default()
+        },
+    )?;
+    proc.reserve_session_paths(game_root);
+    log_attach_diagnostics(&info, None);
+    Ok(proc)
+}
+
+struct MonitoredInstance {
+    proc: GameProcess,
+    desync_dumped: bool,
+    trace_notified: bool,
+}
+
+fn format_nucleus_mode(mode: NucleusNetMode, bind_ip: Option<Ipv4Addr>) -> String {
+    match mode {
+        NucleusNetMode::PreserveNucleusLan => match bind_ip {
+            Some(ip) => format!("LAN Attach (explicit bind IP: {})", ip),
+            None => "Respect Nucleus Network (ForceBindIP / KM-TEST Loopback / LAN)".to_string(),
+        },
+        NucleusNetMode::BuiltInLoopbackPair => {
+            "Built-in Loopback Pair (127.0.0.2 <-> 127.0.0.3)".to_string()
+        }
+        NucleusNetMode::ExplicitPair(ip1, ip2) => format!("Custom IP Pair ({} <-> {})", ip1, ip2),
+    }
+}
+
+pub fn run_headless_attach(opts: AttachModeOptions) -> Result<()> {
+    match prepare_exe_for_nucleus_lan(opts.game_root, opts.bypass_checksum_disconnect) {
+        Ok(true) => {
+            println!("  [NET] Cleared any stale online Friend-Code target on disk for LAN/Nucleus.");
+        }
+        Ok(false) => {
+            println!("  [NET] Skipping disk EXE pre-clean (already running or vanilla); runtime memory will be synced on attach.");
+        }
+        Err(e) => {
+            eprintln!("  [NET] Warning: could not pre-clean splintercell3.exe on disk: {:#}", e);
+        }
+    }
+
+    let quicksave_guard = prepare_and_watch_quicksaves(opts.game_root);
+
+    println!("\n======================================================================");
+    println!(
+        "  Splinter Cell: Chaos Theory - {}",
+        if opts.watch {
+            "Nucleus Co-op Companion (Watch & Attach)"
+        } else {
+            "Live Process Attach"
+        }
+    );
+    println!("======================================================================");
+    println!(
+        "  Network Mode: {}",
+        format_nucleus_mode(opts.net_mode, opts.bind_ip)
+    );
+    if !opts.target_pids.is_empty() {
+        println!("  Target PIDs:  {:?}", opts.target_pids);
+    }
+    if opts.watch {
+        println!("  Watching for splintercell3.exe instances (Press Ctrl+C to stop)...");
+    }
+    println!("======================================================================\n");
+
+    let mut attached: Vec<MonitoredInstance> = Vec::new();
+    let mut known_pids: HashSet<u32> = HashSet::new();
+    let mut pending_new_pids: HashMap<u32, Instant> = HashMap::new();
+    let mut next_slot: usize = 0;
+    let mut ever_attached = false;
+    let mut idle_notice_printed = false;
+    let mut last_scan = Instant::now() - Duration::from_secs(1);
+
+    let pid_matches = |pid: u32| opts.target_pids.is_empty() || opts.target_pids.contains(&pid);
+
+    // Initial scan: attach immediately to any already-running splintercell3.exe instances.
+    let initial = find_running_scct_processes();
+    for info in initial {
+        if !pid_matches(info.pid) {
+            continue;
+        }
+        if !known_pids.insert(info.pid) {
+            continue;
+        }
+        let mut plan = plan_nucleus_instance(next_slot, opts.net_mode, &info);
+        if matches!(opts.net_mode, NucleusNetMode::PreserveNucleusLan) && opts.bind_ip.is_some() {
+            plan.local_bind_ip = opts.bind_ip;
+        }
+        match attach_game(
+            info.pid,
+            plan.role,
+            plan.direct_peer,
+            plan.local_bind_ip,
+            LaunchRuntimeOptions {
+                auto_resync: opts.auto_resync,
+                ..LaunchRuntimeOptions::default()
+            },
+        ) {
+            Ok((mut proc, updated_info)) => {
+                proc.reserve_session_paths(opts.game_root);
+                log_attach_diagnostics(&updated_info, plan.warning.as_deref());
+                println!(
+                    "  [READY] Attached Instance #{} (PID {}, role={}, bind={:?}, peer={:?})",
+                    next_slot + 1,
+                    proc.pid,
+                    proc.peer_role.as_str(),
+                    plan.local_bind_ip,
+                    plan.direct_peer.map(|p| p.ip)
+                );
+                next_slot += 1;
+                ever_attached = true;
+                attached.push(MonitoredInstance {
+                    proc,
+                    desync_dumped: false,
+                    trace_notified: false,
+                });
+            }
+            Err(e) => {
+                eprintln!("  [ATTACH ERROR] Failed to attach PID {}: {:#}", info.pid, e);
+            }
+        }
+    }
+
+    if !opts.watch && attached.is_empty() {
+        drop(quicksave_guard);
+        bail!(
+            "No running splintercell3.exe process found. Launch Chaos Theory (or Nucleus Co-op) first, or run with --nucleus / --attach --watch."
+        );
+    }
+
+    if !attached.is_empty() {
+        println!(
+            "\n  >>> Monitoring {} attached instance(s). In game, go to Co-op -> Enhanced Coop.",
+            attached.len()
+        );
+        println!(
+            "  >>> (If an instance was already inside the Co-op menu, back out to Main Menu and re-enter.)\n"
+        );
+    }
+
+    loop {
+        if opts.watch && last_scan.elapsed() >= Duration::from_millis(250) {
+            last_scan = Instant::now();
+            let running = find_running_scct_processes();
+            let live_set: HashSet<u32> = running.iter().map(|i| i.pid).collect();
+            pending_new_pids.retain(|pid, _| live_set.contains(pid));
+
+            for info in running {
+                if !pid_matches(info.pid) || known_pids.contains(&info.pid) {
+                    continue;
+                }
+                let first_seen = *pending_new_pids
+                    .entry(info.pid)
+                    .or_insert_with(Instant::now);
+                // Wait briefly so Windows loader, ForceBindIP (BindIP.dll), and ProtoInput finish init.
+                if first_seen.elapsed() < Duration::from_millis(1500)
+                    || !is_process_initialized_for_attach(info.pid)
+                {
+                    continue;
+                }
+                pending_new_pids.remove(&info.pid);
+                known_pids.insert(info.pid);
+
+                let mut plan = plan_nucleus_instance(next_slot, opts.net_mode, &info);
+                if matches!(opts.net_mode, NucleusNetMode::PreserveNucleusLan)
+                    && opts.bind_ip.is_some()
+                {
+                    plan.local_bind_ip = opts.bind_ip;
+                }
+                match attach_game(
+                    info.pid,
+                    plan.role,
+                    plan.direct_peer,
+                    plan.local_bind_ip,
+                    LaunchRuntimeOptions {
+                        auto_resync: opts.auto_resync,
+                        ..LaunchRuntimeOptions::default()
+                    },
+                ) {
+                    Ok((mut proc, updated_info)) => {
+                        proc.reserve_session_paths(opts.game_root);
+                        log_attach_diagnostics(&updated_info, plan.warning.as_deref());
+                        println!(
+                            "  [READY] Auto-attached Instance #{} (PID {}, role={}, bind={:?}, peer={:?})",
+                            next_slot + 1,
+                            proc.pid,
+                            proc.peer_role.as_str(),
+                            plan.local_bind_ip,
+                            plan.direct_peer.map(|p| p.ip)
+                        );
+                        next_slot += 1;
+                        ever_attached = true;
+                        idle_notice_printed = false;
+                        attached.push(MonitoredInstance {
+                            proc,
+                            desync_dumped: false,
+                            trace_notified: false,
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("  [ATTACH ERROR] Failed to attach PID {}: {:#}", info.pid, e);
+                    }
+                }
+            }
+        }
+
+        let mut i = 0;
+        while i < attached.len() {
+            let alive = attached[i].proc.is_alive();
+            let pid = attached[i].proc.pid;
+            let role_str = attached[i].proc.peer_role.as_str();
+            let poll = {
+                let slot = &mut attached[i];
+                slot.proc.poll_monitor_once(
+                    opts.game_root,
+                    &mut slot.desync_dumped,
+                    &mut slot.trace_notified,
+                )
+            };
+            if let Some(trace_path) = poll.trace_started {
+                println!(
+                    "  >>> [TRACE PID {}] Recording startup sync/tick trace ({}) to: {}",
+                    pid,
+                    role_str,
+                    trace_path.display()
+                );
+            }
+            for line in poll.resync_logs {
+                println!("  [PID {}] {}", pid, line);
+            }
+            if let Some(desync_res) = poll.desync {
+                match desync_res {
+                    Ok(report) => {
+                        println!(
+                            "\n  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                        );
+                        println!(
+                            "  >>> [DESYNC DETECTED PID {}] Simulation lockstep mismatch detected!",
+                            pid
+                        );
+                        println!("  >>> [MISMATCH SLOTS] {}", report.mismatched_slots);
+                        println!(
+                            "  >>> [DESYNC DUMP]   Actor state:  {}",
+                            report.dump_path.display()
+                        );
+                        if let Some(ref tp) = report.trace_path {
+                            println!("  >>> [STARTUP TRACE] Sync trace:   {}", tp.display());
+                        }
+                        println!(
+                            "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  >>> [DESYNC ERROR PID {}] Failed to dump desync state: {:#}",
+                            pid, e
+                        );
+                    }
+                }
+            }
+            if !alive {
+                let exited = attached.remove(i);
+                exited.proc.wait_for_exit();
+                println!("  [EXIT] Chaos Theory (PID {}) has exited.", pid);
+                let _ = quicksave_guard.flush();
+            } else {
+                i += 1;
+            }
+        }
+
+        if attached.is_empty() {
+            if !opts.watch {
+                break;
+            }
+            if ever_attached && !idle_notice_printed {
+                println!(
+                    "  [WATCH] All attached instances exited. Still watching for new Nucleus Co-op launches (Ctrl+C to quit)..."
+                );
+                idle_notice_printed = true;
+                next_slot = 0;
+            }
+        }
+
+        let any_resync = attached.iter().any(|m| m.proc.resync_coord.is_some());
+        let sleep_ms = if any_resync { 10 } else { 50 };
+        thread::sleep(Duration::from_millis(sleep_ms));
+    }
+
+    drop(quicksave_guard);
+    println!("  [EXIT] All monitored Chaos Theory instances exited cleanly.");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +941,9 @@ mod tests {
             bypass_checksum_disconnect: false,
             auto_resync: false,
             bind_ip: None,
+            attach: false,
+            watch: false,
+            target_pids: &[],
         };
         let err = run_headless_join(opts, "   ").unwrap_err();
         assert!(err.to_string().contains("cannot be empty"));
@@ -519,6 +961,9 @@ mod tests {
             bypass_checksum_disconnect: false,
             auto_resync: false,
             bind_ip: None,
+            attach: false,
+            watch: false,
+            target_pids: &[],
         };
         let err = run_headless_host(opts).unwrap_err();
         assert!(err.to_string().contains("Missing System/splintercell3.exe"));
@@ -536,8 +981,27 @@ mod tests {
             bypass_checksum_disconnect: false,
             auto_resync: false,
             bind_ip: Some(Ipv4Addr::new(192, 168, 178, 202)),
+            attach: false,
+            watch: false,
+            target_pids: &[],
         };
         let err = run_headless_lan(opts).unwrap_err();
         assert!(err.to_string().contains("Missing System/splintercell3.exe"));
+    }
+
+    #[test]
+    fn test_attach_without_running_process_returns_helpful_error() {
+        let dir = std::env::temp_dir().join("nonexistent_attach_root_12345");
+        let err = run_headless_attach(AttachModeOptions {
+            game_root: &dir,
+            bypass_checksum_disconnect: false,
+            auto_resync: false,
+            bind_ip: None,
+            net_mode: NucleusNetMode::PreserveNucleusLan,
+            watch: false,
+            target_pids: &[],
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("No running splintercell3.exe"));
     }
 }

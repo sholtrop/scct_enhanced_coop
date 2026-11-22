@@ -1,10 +1,262 @@
-#[cfg(windows)]
-use anyhow::bail;
-use anyhow::Result;
+use anyhow::{Result, bail};
 #[cfg(not(windows))]
 use anyhow::Context;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+static SESSION_PATH_LOCK: Mutex<()> = Mutex::new(());
+
+/// Built-in same-PC loopback pair addresses (`127.0.0.2` <-> `127.0.0.3`).
+/// Note: `127.0.0.1` (`0x7F000001`) MUST NOT be used because SCCT's `Quazal::InterfaceTable::Build`
+/// (`0x10DE5999`) and `GS_LanBroadcast` (`0x10EFBA39`) explicitly skip `127.0.0.1`, leaving an
+/// instance bound to `127.0.0.1` with zero Quazal interfaces. Windows routes and binds all of
+/// `127.0.0.0/8` natively, so `.2` and `.3` pass `InterfaceTable::Build` cleanly with zero adapters.
+pub const LOOPBACK_PAIR_HOST_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+pub const LOOPBACK_PAIR_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
+
+/// Snapshot of a running `splintercell3.exe` process discovered for live attach / Nucleus Co-op.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningGameInfo {
+    pub pid: u32,
+    pub exe_path: Option<PathBuf>,
+    /// True if `BindIP.dll` / `BindIP64.dll` (ForceBindIP) is loaded in the process.
+    pub has_forcebindip: bool,
+    /// True if Nucleus Co-op / ProtoInput hook DLLs are loaded in the process.
+    pub has_nucleus_hooks: bool,
+    /// True if `splintercell3.exe` in memory contains our patched PE network caves.
+    pub has_mod_net_caves: bool,
+    /// Current `ONLINE_CAVE` target if enabled in process memory: `(ip, disco_port, game_port)`.
+    pub online_target: Option<(Ipv4Addr, u16, u16)>,
+    /// Current `G_LOCAL_BIND_IP_VA` in process memory (`None` when `0.0.0.0` / Auto).
+    pub local_bind_ip: Option<Ipv4Addr>,
+    /// True if startup trace hooks (`0x10A792A6`) are already installed.
+    pub has_trace_hooks: bool,
+    /// True if persistent quick-save hooks (`0x10B28732`) are already installed.
+    pub has_quicksave_hooks: bool,
+}
+
+impl RunningGameInfo {
+    pub fn summary_line(&self) -> String {
+        let mut tags = Vec::new();
+        if self.has_forcebindip {
+            tags.push("ForceBindIP".to_string());
+        }
+        if self.has_nucleus_hooks {
+            tags.push("Nucleus/ProtoInput".to_string());
+        }
+        if self.has_mod_net_caves {
+            tags.push("ModCaves=OK".to_string());
+        } else {
+            tags.push("ModCaves=MISSING/OUTDATED".to_string());
+        }
+        match self.local_bind_ip {
+            Some(ip) => tags.push(format!("bind={}", ip)),
+            None => tags.push("bind=auto".to_string()),
+        }
+        if let Some((ip, dport, gport)) = self.online_target {
+            tags.push(format!("peer={}:{}/{}", ip, dport, gport));
+        } else {
+            tags.push("peer=LAN".to_string());
+        }
+        if self.has_trace_hooks {
+            tags.push("TraceHooked".to_string());
+        }
+        if self.has_quicksave_hooks {
+            tags.push("QuickLoadHooked".to_string());
+        }
+        let path_part = self
+            .exe_path
+            .as_ref()
+            .map(|p| format!(" [{}]", p.display()))
+            .unwrap_or_default();
+        format!("PID {} ({}){}", self.pid, tags.join(", "), path_part)
+    }
+}
+
+/// Networking policy when attaching to multi-instance Nucleus Co-op `splintercell3.exe` processes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NucleusNetMode {
+    /// Respect Nucleus Co-op's own networking (ForceBindIP / KM-TEST Loopback Adapters / IP Aliasing).
+    /// Clears stale online Friend-Code targets and leaves `G_LOCAL_BIND_IP_VA = 0`.
+    PreserveNucleusLan,
+    /// Built-in same-PC loopback pairing (`127.0.0.2` <-> `127.0.0.3`) via `G_LOCAL_BIND_IP_VA` + `ONLINE_CAVE`.
+    /// Requires no ForceBindIP and no virtual network adapters.
+    BuiltInLoopbackPair,
+    /// Explicit two-IP local pairing (`ip1` <-> `ip2`), e.g. two KM-TEST / Hyper-V / alias IPs.
+    ExplicitPair(Ipv4Addr, Ipv4Addr),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachInstancePlan {
+    pub role: crate::trace::PeerRole,
+    pub direct_peer: Option<DirectPeerTarget>,
+    pub local_bind_ip: Option<Ipv4Addr>,
+    pub warning: Option<String>,
+}
+
+/// Classifies loaded module filenames from a target process into `(has_forcebindip, has_nucleus_hooks)`.
+pub fn classify_loaded_module_names(modules: &[String]) -> (bool, bool) {
+    let mut has_forcebindip = false;
+    let mut has_nucleus_hooks = false;
+    for name in modules {
+        let low = name.to_ascii_lowercase();
+        if low.contains("bindip") || low.contains("forcebindip") {
+            has_forcebindip = true;
+        }
+        if low.contains("protoinput") || low.contains("nucleus") || low.contains("xinputplus") {
+            has_nucleus_hooks = true;
+        }
+    }
+    (has_forcebindip, has_nucleus_hooks)
+}
+
+/// Parses a pair of distinct non-unspecified IPv4 addresses such as `"192.168.178.202,192.168.178.203"`.
+pub fn parse_ip_pair(raw: &str) -> Result<(Ipv4Addr, Ipv4Addr)> {
+    let parts: Vec<&str> = raw
+        .split(|c: char| c == ',' || c == ';' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if parts.len() != 2 {
+        bail!(
+            "Expected two IPv4 addresses separated by a comma (e.g. 192.168.178.202,192.168.178.203), got '{}'",
+            raw
+        );
+    }
+    let ip1: Ipv4Addr = parts[0]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid first IPv4 address '{}'", parts[0]))?;
+    let ip2: Ipv4Addr = parts[1]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid second IPv4 address '{}'", parts[1]))?;
+    if ip1.is_unspecified() || ip2.is_unspecified() {
+        bail!("Pair IPv4 addresses cannot be 0.0.0.0");
+    }
+    if ip1 == Ipv4Addr::LOCALHOST || ip2 == Ipv4Addr::LOCALHOST {
+        bail!(
+            "127.0.0.1 cannot be used because SCCT's Quazal::InterfaceTable::Build skips 127.0.0.1; use 127.0.0.2 and 127.0.0.3 instead"
+        );
+    }
+    if ip1 == ip2 {
+        bail!(
+            "Pair IPv4 addresses must be distinct so both instances can bind ports 9100/9103 (got {} twice)",
+            ip1
+        );
+    }
+    Ok((ip1, ip2))
+}
+
+/// Computes the per-instance runtime network injection plan for Nucleus Co-op attach.
+pub fn plan_nucleus_instance(
+    slot_index: usize,
+    mode: NucleusNetMode,
+    info: &RunningGameInfo,
+) -> AttachInstancePlan {
+    match mode {
+        NucleusNetMode::PreserveNucleusLan => {
+            let warning = if slot_index >= 1 && !info.has_forcebindip {
+                Some(
+                    "ForceBindIP (BindIP.dll) was not detected in this instance. Without per-instance IP isolation, both instances bind 0.0.0.0:9100/9103 and collide! Switch to Built-in Loopback Pair (127.0.0.2 <-> 127.0.0.3) or Custom Adapter IP Pair.".to_string(),
+                )
+            } else {
+                None
+            };
+            AttachInstancePlan {
+                role: crate::trace::PeerRole::LanOrDirect,
+                direct_peer: None,
+                local_bind_ip: None,
+                warning,
+            }
+        }
+        NucleusNetMode::BuiltInLoopbackPair => {
+            plan_paired_instance(slot_index, LOOPBACK_PAIR_HOST_IP, LOOPBACK_PAIR_CLIENT_IP, info)
+        }
+        NucleusNetMode::ExplicitPair(ip1, ip2) => {
+            plan_paired_instance(slot_index, ip1, ip2, info)
+        }
+    }
+}
+
+fn plan_paired_instance(
+    slot_index: usize,
+    ip1: Ipv4Addr,
+    ip2: Ipv4Addr,
+    info: &RunningGameInfo,
+) -> AttachInstancePlan {
+    let (role, my_ip, peer_ip) = if slot_index.is_multiple_of(2) {
+        (crate::trace::PeerRole::Host, ip1, ip2)
+    } else {
+        (crate::trace::PeerRole::Guest, ip2, ip1)
+    };
+    let warning = if info.has_forcebindip {
+        Some(format!(
+            "BindIP.dll (ForceBindIP) is already loaded in PID {} and may override explicit bind IP {}. Consider using 'Respect Nucleus Network' mode instead when Nucleus handles ForceBindIP.",
+            info.pid, my_ip
+        ))
+    } else {
+        None
+    };
+    AttachInstancePlan {
+        role,
+        direct_peer: Some(DirectPeerTarget {
+            ip: peer_ip,
+            disco_port: crate::net::DISCOVERY_PORT,
+            game_port: crate::net::GAME_PORT,
+        }),
+        local_bind_ip: Some(my_ip),
+        warning,
+    }
+}
+
+/// Returns true if a suspended thread's 32-bit `Eip` lies inside any `.text` site we plan to patch.
+pub fn eip_intersects_patch_sites(eip: u32, sites: &[(u32, usize)]) -> bool {
+    sites.iter().any(|&(va, len)| {
+        let end = va.saturating_add(len as u32);
+        eip >= va && eip < end
+    })
+}
+
+/// Prepares `System/splintercell3.exe` on disk for Nucleus Co-op LAN play by clearing any stale
+/// Online Friend-Code target left from an earlier Internet session.
+/// Returns `Ok(true)` if the EXE was checked/updated on disk, or `Ok(false)` if skipped because
+/// `splintercell3.exe` is already running (in which case live attach clears the target in memory).
+pub fn prepare_exe_for_nucleus_lan(
+    game_root: &Path,
+    bypass_checksum_disconnect: bool,
+) -> Result<bool> {
+    let sys_dir = crate::patcher::find_child_ci(game_root, "System");
+    let exe_path = crate::patcher::find_child_ci(&sys_dir, "splintercell3.exe");
+    if !exe_path.exists() {
+        return Ok(false);
+    }
+    if !find_running_scct_processes().is_empty() {
+        return Ok(false);
+    }
+    let exe_bak_path = sys_dir.join("splintercell3.exe.bak");
+    let cur = std::fs::read(&exe_path)?;
+    if !crate::net::is_online_coop_fix_applied(&cur) {
+        return Ok(false);
+    }
+    match crate::net::update_direct_ip_in_exe(&exe_path, &exe_bak_path, None) {
+        Ok(()) => {
+            crate::net::sync_startup_checksum_bypass_in_exe(&exe_path, bypass_checksum_disconnect)?;
+            Ok(true)
+        }
+        Err(err) => {
+            let msg = format!("{:#}", err).to_ascii_lowercase();
+            if msg.contains("being used by another process")
+                || msg.contains("permission denied")
+                || msg.contains("access is denied")
+                || msg.contains("os error 32")
+                || msg.contains("os error 5")
+            {
+                Ok(false)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
 
 pub const CAVE_DESYNC_FLAG_VA: usize = crate::net::CAVE_DESYNC_FLAG_VA as usize;
 pub const CAVE_DESYNC_COUNT_VA: usize = crate::net::CAVE_DESYNC_COUNT_VA as usize;
@@ -75,7 +327,7 @@ pub struct GameProcess {
     #[cfg(windows)]
     handle_val: usize,
     #[cfg(not(windows))]
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     trace_buf_va: usize,
     trace_flushed_seq: u32,
     trace_prev_u0: Option<u32>,
@@ -208,7 +460,13 @@ impl GameProcess {
         }
         #[cfg(not(windows))]
         {
-            let _ = self.child.wait();
+            if let Some(mut child) = self.child.take() {
+                let _ = child.wait();
+            } else {
+                while is_pid_alive(self.pid) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
         }
     }
 
@@ -227,7 +485,11 @@ impl GameProcess {
         }
         #[cfg(not(windows))]
         {
-            matches!(self.child.try_wait(), Ok(None))
+            if let Some(ref mut child) = self.child {
+                matches!(child.try_wait(), Ok(None))
+            } else {
+                is_pid_alive(self.pid)
+            }
         }
     }
 
@@ -455,12 +717,19 @@ impl GameProcess {
         if let (Some(trace_path), Some(dump_path)) = (&self.trace_path, &self.dump_path) {
             return (trace_path.clone(), dump_path.clone());
         }
+        let _guard = SESSION_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (trace_path, dump_path, marker) =
             resolve_session_paths_with(game_root, self.peer_role, self.pid, is_pid_alive);
         self.trace_path = Some(trace_path.clone());
         self.dump_path = Some(dump_path.clone());
         self.trace_owner_marker = marker;
         (trace_path, dump_path)
+    }
+
+    /// Eagerly claims unique trace/dump paths for this process (avoids filename collisions
+    /// when multiple concurrent instances share the same game directory, e.g. Nucleus Co-op).
+    pub fn reserve_session_paths(&mut self, game_root: &Path) {
+        let _ = self.ensure_session_paths(game_root);
     }
 
     pub fn trace_output_path(&self) -> Option<&Path> {
@@ -1040,6 +1309,514 @@ unsafe fn write_proc_bytes(
 }
 
 #[cfg(windows)]
+unsafe fn read_proc_bytes(
+    h_process: windows_sys::Win32::Foundation::HANDLE,
+    addr: usize,
+    out: &mut [u8],
+) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    let mut bytes_read: usize = 0;
+    let ok = unsafe {
+        ReadProcessMemory(
+            h_process,
+            addr as *const _,
+            out.as_mut_ptr() as *mut _,
+            out.len(),
+            &mut bytes_read,
+        )
+    };
+    ok != 0 && bytes_read == out.len()
+}
+
+#[cfg(windows)]
+fn decode_utf16_nul(slice: &[u16]) -> String {
+    let len = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    String::from_utf16_lossy(&slice[..len])
+}
+
+#[cfg(windows)]
+fn inspect_process_modules(pid: u32) -> Option<(Option<PathBuf>, bool, bool, bool)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
+        TH32CS_SNAPMODULE32,
+    };
+
+    let mut snap = INVALID_HANDLE_VALUE;
+    for _ in 0..4 {
+        snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if snap != INVALID_HANDLE_VALUE {
+            break;
+        }
+        let err = unsafe { GetLastError() };
+        if err != ERROR_BAD_LENGTH {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    if snap == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut me: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    me.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+
+    let mut exe_path: Option<PathBuf> = None;
+    let mut mod_names: Vec<String> = Vec::new();
+    let mut loader_ready = false;
+
+    let mut ok = unsafe { Module32FirstW(snap, &mut me) };
+    while ok != 0 {
+        let mod_name = decode_utf16_nul(&me.szModule);
+        let mod_low = mod_name.to_ascii_lowercase();
+        if exe_path.is_none() || mod_low == "splintercell3.exe" {
+            let full = decode_utf16_nul(&me.szExePath);
+            if !full.is_empty() {
+                exe_path = Some(PathBuf::from(full));
+            }
+        }
+        if mod_low == "ws2_32.dll" || mod_low == "kernel32.dll" {
+            loader_ready = true;
+        }
+        mod_names.push(mod_name);
+        ok = unsafe { Module32NextW(snap, &mut me) };
+    }
+
+    unsafe {
+        CloseHandle(snap);
+    }
+
+    let (has_forcebindip, has_nucleus_hooks) = classify_loaded_module_names(&mod_names);
+    Some((exe_path, has_forcebindip, has_nucleus_hooks, loader_ready))
+}
+
+#[cfg(windows)]
+unsafe fn inspect_running_game_from_handle(
+    pid: u32,
+    h_process: windows_sys::Win32::Foundation::HANDLE,
+    modules_info: Option<(Option<PathBuf>, bool, bool, bool)>,
+) -> RunningGameInfo {
+    let (exe_path, has_forcebindip, has_nucleus_hooks, _) =
+        modules_info.unwrap_or((None, false, false, false));
+
+    let mut mz = [0u8; 2];
+    let has_mz = unsafe { read_proc_bytes(h_process, crate::net::PE_IMAGE_BASE as usize, &mut mz) }
+        && &mz == b"MZ";
+
+    let mut net_buf = vec![0u8; crate::net::NET_CAVE_HEX.len() / 2];
+    let mut online_head = [0u8; crate::net::ONLINE_CAVE_ENABLED_OFFSET];
+    let mut sock_buf = vec![0u8; crate::net::SOCKET_CAVE_HEX.len() / 2];
+    let mut multi_buf = vec![0u8; crate::net::MULTI_NIC_LAN_CAVE_HEX.len() / 2];
+    let has_mod_net_caves = has_mz
+        && unsafe { read_proc_bytes(h_process, crate::net::NET_CAVE_VA as usize, &mut net_buf) }
+        && unsafe { read_proc_bytes(h_process, crate::net::ONLINE_CAVE_VA as usize, &mut online_head) }
+        && unsafe { read_proc_bytes(h_process, crate::net::SOCKET_CAVE_VA as usize, &mut sock_buf) }
+        && unsafe {
+            read_proc_bytes(
+                h_process,
+                crate::net::MULTI_NIC_LAN_CAVE_VA as usize,
+                &mut multi_buf,
+            )
+        }
+        && crate::net::is_net_cave_signature_present(&net_buf, &online_head, &sock_buf, &multi_buf);
+
+    let mut online_target = None;
+    let mut local_bind_ip = None;
+    if has_mod_net_caves {
+        let mut en = [0u8; 1];
+        if unsafe { read_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &mut en) } && en[0] != 0 {
+            let mut ip_b = [0u8; 4];
+            let mut dport_b = [0u8; 2];
+            let mut gport_b = [0u8; 4];
+            if unsafe { read_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &mut ip_b) }
+                && unsafe { read_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &mut dport_b) }
+                && unsafe { read_proc_bytes(h_process, JOIN_GAME_PORT_VA, &mut gport_b) }
+            {
+                online_target = Some((
+                    Ipv4Addr::from(ip_b),
+                    u16::from_be_bytes(dport_b),
+                    u32::from_le_bytes(gport_b) as u16,
+                ));
+            }
+        }
+        let mut bind_b = [0u8; 4];
+        if unsafe { read_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &mut bind_b) } {
+            let ip = Ipv4Addr::from(bind_b);
+            if !ip.is_unspecified() {
+                local_bind_ip = Some(ip);
+            }
+        }
+    }
+
+    let mut tick_b = [0u8; 1];
+    let has_trace_hooks = has_mz
+        && unsafe { read_proc_bytes(h_process, crate::trace::HOOK_TRACE_TICK_VA as usize, &mut tick_b) }
+        && tick_b[0] == 0xE9;
+
+    let mut ql_b = [0u8; 1];
+    let has_quicksave_hooks = has_mz
+        && unsafe {
+            read_proc_bytes(
+                h_process,
+                crate::quicksave_persistence::HOOK_PAUSE_QUICKLOAD_VA as usize,
+                &mut ql_b,
+            )
+        }
+        && ql_b[0] == 0xE9;
+
+    RunningGameInfo {
+        pid,
+        exe_path,
+        has_forcebindip,
+        has_nucleus_hooks,
+        has_mod_net_caves,
+        online_target,
+        local_bind_ip,
+        has_trace_hooks,
+        has_quicksave_hooks,
+    }
+}
+
+/// Inspects a single running `splintercell3.exe` process by PID.
+#[cfg(windows)]
+pub fn inspect_running_game(pid: u32) -> Option<RunningGameInfo> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    let mods = inspect_process_modules(pid);
+    let h = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return mods.map(|(exe_path, has_forcebindip, has_nucleus_hooks, _)| RunningGameInfo {
+            pid,
+            exe_path,
+            has_forcebindip,
+            has_nucleus_hooks,
+            has_mod_net_caves: false,
+            online_target: None,
+            local_bind_ip: None,
+            has_trace_hooks: false,
+            has_quicksave_hooks: false,
+        });
+    }
+    let info = unsafe { inspect_running_game_from_handle(pid, h, mods) };
+    unsafe {
+        CloseHandle(h);
+    }
+    Some(info)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn inspect_running_game(_pid: u32) -> Option<RunningGameInfo> {
+    None
+}
+
+/// Returns true once a newly-spawned `splintercell3.exe` has finished initial PE/DLL loading
+/// (so ForceBindIP / ProtoInput DLLs are visible and loader locks won't race live attach).
+#[cfg(windows)]
+pub fn is_process_initialized_for_attach(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    let Some((_, _, _, loader_ready)) = inspect_process_modules(pid) else {
+        return false;
+    };
+    if !loader_ready {
+        return false;
+    }
+    let h = unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return false;
+    }
+    let mut mz = [0u8; 2];
+    let ok = unsafe { read_proc_bytes(h, crate::net::PE_IMAGE_BASE as usize, &mut mz) } && &mz == b"MZ";
+    unsafe {
+        CloseHandle(h);
+    }
+    ok
+}
+
+#[cfg(not(windows))]
+pub fn is_process_initialized_for_attach(_pid: u32) -> bool {
+    false
+}
+
+/// Enumerates all currently running `splintercell3.exe` processes sorted ascending by PID.
+#[cfg(windows)]
+pub fn find_running_scct_processes() -> Vec<RunningGameInfo> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+
+    let mut pids = Vec::new();
+    let mut pe: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut ok = unsafe { Process32FirstW(snap, &mut pe) };
+    while ok != 0 {
+        let exe_name = decode_utf16_nul(&pe.szExeFile);
+        if exe_name.eq_ignore_ascii_case("splintercell3.exe") && pe.th32ProcessID != 0 {
+            pids.push(pe.th32ProcessID);
+        }
+        ok = unsafe { Process32NextW(snap, &mut pe) };
+    }
+
+    unsafe {
+        CloseHandle(snap);
+    }
+
+    pids.sort_unstable();
+    pids.into_iter()
+        .map(|pid| {
+            inspect_running_game(pid).unwrap_or(RunningGameInfo {
+                pid,
+                exe_path: None,
+                has_forcebindip: false,
+                has_nucleus_hooks: false,
+                has_mod_net_caves: false,
+                online_target: None,
+                local_bind_ip: None,
+                has_trace_hooks: false,
+                has_quicksave_hooks: false,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn find_running_scct_processes() -> Vec<RunningGameInfo> {
+    Vec::new()
+}
+
+/// RAII guard that suspends every thread of a running 32-bit WOW64 process, verifies no thread's
+/// `Eip` sits inside any `.text` patch window, and unconditionally resumes all threads on drop.
+#[cfg(windows)]
+struct SuspendedProcessGuard {
+    threads: Vec<windows_sys::Win32::Foundation::HANDLE>,
+}
+
+#[cfg(windows)]
+impl SuspendedProcessGuard {
+    unsafe fn acquire(pid: u32, patch_sites: &[(u32, usize)]) -> Result<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            WOW64_CONTEXT, WOW64_CONTEXT_CONTROL, Wow64GetThreadContext,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME,
+            Wow64SuspendThread,
+        };
+
+        for attempt in 0..10 {
+            let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snap == INVALID_HANDLE_VALUE {
+                bail!(
+                    "CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+
+            let mut suspended = Vec::new();
+            let mut te: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            te.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+            let mut ok = unsafe { Thread32First(snap, &mut te) };
+            while ok != 0 {
+                if te.th32OwnerProcessID == pid {
+                    let ht = unsafe {
+                        OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, te.th32ThreadID)
+                    };
+                    if !ht.is_null() {
+                        let prev = unsafe { Wow64SuspendThread(ht) };
+                        let prev = if prev == u32::MAX {
+                            unsafe { SuspendThread(ht) }
+                        } else {
+                            prev
+                        };
+                        if prev != u32::MAX {
+                            suspended.push(ht);
+                        } else {
+                            unsafe {
+                                CloseHandle(ht);
+                            }
+                        }
+                    }
+                }
+                ok = unsafe { Thread32Next(snap, &mut te) };
+            }
+
+            unsafe {
+                CloseHandle(snap);
+            }
+
+            let mut collision = false;
+            if !patch_sites.is_empty() {
+                for &ht in &suspended {
+                    let mut ctx: WOW64_CONTEXT = unsafe { std::mem::zeroed() };
+                    ctx.ContextFlags = WOW64_CONTEXT_CONTROL;
+                    if unsafe { Wow64GetThreadContext(ht, &mut ctx) } != 0
+                        && eip_intersects_patch_sites(ctx.Eip, patch_sites)
+                    {
+                        collision = true;
+                        break;
+                    }
+                }
+            }
+
+            if !collision || attempt == 9 {
+                return Ok(Self { threads: suspended });
+            }
+
+            for ht in suspended {
+                unsafe {
+                    ResumeThread(ht);
+                    CloseHandle(ht);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        Ok(Self {
+            threads: Vec::new(),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SuspendedProcessGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ResumeThread;
+        for ht in self.threads.drain(..) {
+            unsafe {
+                ResumeThread(ht);
+                CloseHandle(ht);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe fn apply_runtime_patches_to_process(
+    h_process: windows_sys::Win32::Foundation::HANDLE,
+    direct_peer: Option<DirectPeerTarget>,
+    local_bind_ip: Option<Ipv4Addr>,
+    opts: LaunchRuntimeOptions,
+    has_mod_net_caves: bool,
+    is_live_attach: bool,
+) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+
+    unsafe {
+        let zero = 0u32.to_le_bytes();
+
+        if has_mod_net_caves && (opts.install_trace_hooks || opts.auto_resync || opts.monitor_desync_dump) {
+            write_proc_bytes(h_process, CAVE_DESYNC_FLAG_VA, &[0u8; 8], false);
+        }
+
+        // 1. Explicitly zero out inherited socket and keepalive tick locations in .data on fresh launch
+        //    (avoid clearing live keepalive timestamps when re-attaching unless caves are present).
+        if has_mod_net_caves && opts.inject_lan_net_globals && !is_live_attach {
+            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9100, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9103, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9100, &zero, false);
+            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9103, &zero, false);
+            write_proc_bytes(h_process, CAVE_LAST_9103_KEEPALIVE_VA, &zero, false);
+            write_proc_bytes(h_process, CAVE_LAST_9100_KEEPALIVE_VA, &zero, false);
+        }
+
+        // 2. Configure ONLINE_CAVE, JOIN_GAME_PORT_VA, CAVE_LAN_PEER_VA, and CAVE_LOCAL_BIND_IP_VA
+        if has_mod_net_caves {
+            if let Some(target) = direct_peer {
+                if opts.inject_nat_direct_target {
+                    let disco_port = if target.disco_port == 0 {
+                        crate::net::DISCOVERY_PORT
+                    } else {
+                        target.disco_port
+                    };
+                    let game_port = if target.game_port == 0 {
+                        crate::net::GAME_PORT
+                    } else {
+                        target.game_port
+                    };
+                    let ip_bytes = target.ip.octets();
+                    let disco_be = disco_port.to_be_bytes();
+                    let game_le = (game_port as u32).to_le_bytes();
+
+                    write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[1u8], true);
+                    write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &ip_bytes, true);
+                    write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &disco_be, true);
+                    write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &game_le, true);
+                }
+
+                if opts.inject_lan_net_globals {
+                    let oct = target.ip.octets();
+                    let is_private = oct[0] == 10
+                        || (oct[0] == 172 && (16..=31).contains(&oct[1]))
+                        || (oct[0] == 192 && oct[1] == 168);
+                    let is_local_routable =
+                        !is_private || crate::ip::find_matching_subnet_ip(target.ip).is_some();
+                    let probe_ip = if is_local_routable { oct } else { [0u8; 4] };
+                    write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
+                }
+            } else {
+                let zero_ip = [0u8; 4];
+                if opts.inject_nat_direct_target {
+                    let default_disco_be = crate::net::DISCOVERY_PORT.to_be_bytes();
+                    let default_game_le = (crate::net::GAME_PORT as u32).to_le_bytes();
+
+                    write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[0u8], true);
+                    write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &zero_ip, true);
+                    write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &default_disco_be, true);
+                    write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
+                }
+                if opts.inject_lan_net_globals {
+                    write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
+                }
+            }
+
+            if opts.inject_lan_net_globals {
+                let bind_octets = local_bind_ip
+                    .filter(|ip| !ip.is_unspecified())
+                    .map(|ip| ip.octets())
+                    .unwrap_or([0u8; 4]);
+                write_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &bind_octets, false);
+            }
+        }
+
+        let trace_buf_va = if opts.install_trace_hooks || opts.auto_resync {
+            crate::trace::install_startup_trace(h_process, write_proc_bytes, opts.auto_resync)
+        } else {
+            0
+        };
+
+        if opts.enable_persistent_quicksave_load {
+            crate::quicksave_persistence::install_quicksave_persistence_hooks(
+                h_process,
+                write_proc_bytes,
+            );
+        }
+
+        let _ = FlushInstructionCache(h_process, std::ptr::null(), 0);
+        trace_buf_va
+    }
+}
+
+#[cfg(windows)]
 pub fn launch_game(
     exe_path: &Path,
     game_dir: &Path,
@@ -1092,96 +1869,18 @@ pub fn launch_game(
     let peer_ip = direct_peer.map(|p| p.ip);
 
     let trace_buf_va = unsafe {
-        let zero = 0u32.to_le_bytes();
-
-        if opts.install_trace_hooks || opts.auto_resync || opts.monitor_desync_dump {
-            write_proc_bytes(h_process, CAVE_DESYNC_FLAG_VA, &[0u8; 8], false);
-        }
-
-        // 1. Explicitly zero out inherited socket and keepalive tick locations in .data when LAN globals are enabled
-        if opts.inject_lan_net_globals {
-            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9100, &zero, false);
-            write_proc_bytes(h_process, CAVE_INHERITED_SOCK_9103, &zero, false);
-            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9100, &zero, false);
-            write_proc_bytes(h_process, CAVE_INHERITED_PRIMED_9103, &zero, false);
-            write_proc_bytes(h_process, CAVE_LAST_9103_KEEPALIVE_VA, &zero, false);
-            write_proc_bytes(h_process, CAVE_LAST_9100_KEEPALIVE_VA, &zero, false);
-        }
-
-        // 2. Configure ONLINE_CAVE, JOIN_GAME_PORT_VA, CAVE_LAN_PEER_VA, and CAVE_LOCAL_BIND_IP_VA
-        if let Some(target) = direct_peer {
-            if opts.inject_nat_direct_target {
-                let disco_port = if target.disco_port == 0 {
-                    crate::net::DISCOVERY_PORT
-                } else {
-                    target.disco_port
-                };
-                let game_port = if target.game_port == 0 {
-                    crate::net::GAME_PORT
-                } else {
-                    target.game_port
-                };
-                let ip_bytes = target.ip.octets();
-                let disco_be = disco_port.to_be_bytes();
-                let game_le = (game_port as u32).to_le_bytes();
-
-                write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[1u8], true);
-                write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &ip_bytes, true);
-                write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &disco_be, true);
-                write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &game_le, true);
-            }
-
-            if opts.inject_lan_net_globals {
-                let oct = target.ip.octets();
-                let is_private = oct[0] == 10
-                    || (oct[0] == 172 && (16..=31).contains(&oct[1]))
-                    || (oct[0] == 192 && oct[1] == 168);
-                let is_local_routable =
-                    !is_private || crate::ip::find_matching_subnet_ip(target.ip).is_some();
-                let probe_ip = if is_local_routable { oct } else { [0u8; 4] };
-                write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &probe_ip, false);
-            }
-        } else {
-            let zero_ip = [0u8; 4];
-            if opts.inject_nat_direct_target {
-                let default_disco_be = crate::net::DISCOVERY_PORT.to_be_bytes();
-                let default_game_le = (crate::net::GAME_PORT as u32).to_le_bytes();
-
-                write_proc_bytes(h_process, CAVE_ONLINE_ENABLED_VA, &[0u8], true);
-                write_proc_bytes(h_process, CAVE_ONLINE_IP_VA, &zero_ip, true);
-                write_proc_bytes(h_process, CAVE_ONLINE_PORT_VA, &default_disco_be, true);
-                write_proc_bytes(h_process, JOIN_GAME_PORT_VA, &default_game_le, true);
-            }
-            if opts.inject_lan_net_globals {
-                write_proc_bytes(h_process, CAVE_LAN_PEER_VA, &zero_ip, false);
-            }
-        }
-
-        if opts.inject_lan_net_globals {
-            let bind_octets = local_bind_ip
-                .filter(|ip| !ip.is_unspecified())
-                .map(|ip| ip.octets())
-                .unwrap_or([0u8; 4]);
-            write_proc_bytes(h_process, CAVE_LOCAL_BIND_IP_VA, &bind_octets, false);
-        }
-
-        let trace_buf_va = if opts.install_trace_hooks || opts.auto_resync {
-            crate::trace::install_startup_trace(h_process, write_proc_bytes, opts.auto_resync)
-        } else {
-            0
-        };
-
-        if opts.enable_persistent_quicksave_load {
-            crate::quicksave_persistence::install_quicksave_persistence_hooks(
-                h_process,
-                write_proc_bytes,
-            );
-        }
-
-        // 3. Resume the game thread
+        let trace_va = apply_runtime_patches_to_process(
+            h_process,
+            direct_peer,
+            local_bind_ip,
+            opts,
+            true,
+            false,
+        );
+        // Resume the game thread
         ResumeThread(h_thread);
         CloseHandle(h_thread);
-        trace_buf_va
+        trace_va
     };
 
     let resync_coord = if opts.auto_resync {
@@ -1215,6 +1914,237 @@ pub fn launch_game(
     })
 }
 
+/// Attaches to an already-running `splintercell3.exe` process (e.g. launched by Nucleus Co-op,
+/// Steam, or another external launcher), briefly suspends its threads to patch runtime network
+/// globals and hooks safely, then resumes execution and returns a live `GameProcess` handle.
+#[cfg(windows)]
+pub fn attach_game(
+    pid: u32,
+    peer_role: crate::trace::PeerRole,
+    direct_peer: Option<DirectPeerTarget>,
+    local_bind_ip: Option<Ipv4Addr>,
+    opts: LaunchRuntimeOptions,
+) -> Result<(GameProcess, RunningGameInfo)> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_VM_OPERATION,
+        PROCESS_VM_READ, PROCESS_VM_WRITE,
+    };
+
+    let desired_access = PROCESS_VM_READ
+        | PROCESS_VM_WRITE
+        | PROCESS_VM_OPERATION
+        | PROCESS_QUERY_INFORMATION
+        | PROCESS_SYNCHRONIZE;
+    let h_process = unsafe { OpenProcess(desired_access, 0, pid) };
+    if h_process.is_null() {
+        let os_err = std::io::Error::last_os_error();
+        if os_err.raw_os_error() == Some(5) {
+            bail!(
+                "Access denied opening splintercell3.exe (PID {}). If Nucleus Co-op is running as Administrator, run scct_coop_enhancer as Administrator too.",
+                pid
+            );
+        }
+        bail!("OpenProcess failed for PID {}: {}", pid, os_err);
+    }
+
+    let modules_info = inspect_process_modules(pid);
+    let info = unsafe { inspect_running_game_from_handle(pid, h_process, modules_info) };
+
+    let mut mz = [0u8; 2];
+    if !unsafe { read_proc_bytes(h_process, crate::net::PE_IMAGE_BASE as usize, &mut mz) }
+        || &mz != b"MZ"
+    {
+        unsafe {
+            CloseHandle(h_process);
+        }
+        bail!(
+            "PID {} does not have retail splintercell3.exe mapped at 0x{:08X} (process may still be initializing or is a different binary)",
+            pid,
+            crate::net::PE_IMAGE_BASE
+        );
+    }
+
+    let mut patch_sites: Vec<(u32, usize)> = Vec::new();
+    if info.has_mod_net_caves && opts.inject_nat_direct_target {
+        patch_sites.push((crate::net::CAVE_ONLINE_ENABLED_VA, 1));
+        patch_sites.push((crate::net::CAVE_ONLINE_IP_VA, 4));
+        patch_sites.push((crate::net::CAVE_ONLINE_PORT_VA, 2));
+        patch_sites.push((crate::net::JOIN_GAME_PORT_VA, 4));
+    }
+    if opts.install_trace_hooks || opts.auto_resync {
+        patch_sites.push((
+            crate::trace::HOOK_TRACE_RESET_VA,
+            crate::trace::HOOK_TRACE_RESET_ORIG.len(),
+        ));
+        patch_sites.push((
+            crate::trace::HOOK_TRACE_TICK_VA,
+            crate::trace::HOOK_TRACE_TICK_ORIG.len(),
+        ));
+        patch_sites.push((
+            crate::trace::HOOK_TRACE_SEND_VA,
+            crate::trace::HOOK_TRACE_SEND_ORIG.len(),
+        ));
+        patch_sites.push((
+            crate::trace::HOOK_TRACE_CMP_VA,
+            crate::trace::HOOK_TRACE_CMP_ORIG.len(),
+        ));
+    }
+    if opts.enable_persistent_quicksave_load {
+        patch_sites.push((
+            crate::quicksave_persistence::HOOK_PAUSE_QUICKLOAD_VA,
+            crate::quicksave_persistence::HOOK_PAUSE_QUICKLOAD_ORIG.len(),
+        ));
+        patch_sites.push((
+            crate::quicksave_persistence::HOOK_GAMEOVER_QUICKLOAD_VA,
+            crate::quicksave_persistence::HOOK_GAMEOVER_QUICKLOAD_ORIG.len(),
+        ));
+        patch_sites.push((
+            crate::quicksave_persistence::HOOK_COOP_QUICKLOAD_LEN_VA,
+            crate::quicksave_persistence::HOOK_COOP_QUICKLOAD_LEN_ORIG.len(),
+        ));
+    }
+
+    let trace_buf_va = {
+        let _suspend_guard = match unsafe { SuspendedProcessGuard::acquire(pid, &patch_sites) } {
+            Ok(g) => g,
+            Err(e) => {
+                unsafe {
+                    CloseHandle(h_process);
+                }
+                return Err(e);
+            }
+        };
+        unsafe {
+            apply_runtime_patches_to_process(
+                h_process,
+                direct_peer,
+                local_bind_ip,
+                opts,
+                info.has_mod_net_caves,
+                true,
+            )
+        }
+    };
+
+    let peer_ip = direct_peer.map(|p| p.ip);
+    let resync_coord = if opts.auto_resync {
+        match crate::resync::ResyncCoordinator::new(peer_role, peer_ip, local_bind_ip) {
+            Ok(coord) => Some(coord),
+            Err(e) => {
+                crate::scct_log!("  [RESYNC] Disabled for PID {} (UDP socket init failed: {:#})", pid, e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let updated_info =
+        unsafe { inspect_running_game_from_handle(pid, h_process, inspect_process_modules(pid)) };
+
+    Ok((
+        GameProcess {
+            pid,
+            peer_role,
+            peer_ip,
+            handle_val: h_process as usize,
+            trace_buf_va,
+            trace_flushed_seq: 0,
+            trace_prev_u0: None,
+            trace_last_mismatch_total: 0,
+            trace_path: None,
+            dump_path: None,
+            trace_owner_marker: None,
+            monitor_desync_dump: opts.monitor_desync_dump,
+            resync_coord,
+            resync_aborted: false,
+            last_resync_error: None,
+        },
+        updated_info,
+    ))
+}
+
+/// Re-applies runtime network target/bind globals (`ONLINE_CAVE`, `JOIN_GAME_PORT_VA`,
+/// `G_LAN_PEER_VA`, `G_LOCAL_BIND_IP_VA`) in-place on an already-attached `splintercell3.exe`
+/// process without spawning a duplicate monitor thread or reinstalling hooks.
+#[cfg(windows)]
+pub fn reconfigure_running_game_network(
+    pid: u32,
+    direct_peer: Option<DirectPeerTarget>,
+    local_bind_ip: Option<Ipv4Addr>,
+    opts: LaunchRuntimeOptions,
+) -> Result<RunningGameInfo> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ,
+        PROCESS_VM_WRITE,
+    };
+
+    let desired_access =
+        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION;
+    let h_process = unsafe { OpenProcess(desired_access, 0, pid) };
+    if h_process.is_null() {
+        let os_err = std::io::Error::last_os_error();
+        if os_err.raw_os_error() == Some(5) {
+            bail!(
+                "Access denied opening splintercell3.exe (PID {}). If Nucleus Co-op is running as Administrator, run scct_coop_enhancer as Administrator too.",
+                pid
+            );
+        }
+        bail!("OpenProcess failed for PID {}: {}", pid, os_err);
+    }
+
+    let modules_info = inspect_process_modules(pid);
+    let info = unsafe { inspect_running_game_from_handle(pid, h_process, modules_info) };
+
+    let mut patch_sites: Vec<(u32, usize)> = Vec::new();
+    if info.has_mod_net_caves && opts.inject_nat_direct_target {
+        patch_sites.push((crate::net::CAVE_ONLINE_ENABLED_VA, 1));
+        patch_sites.push((crate::net::CAVE_ONLINE_IP_VA, 4));
+        patch_sites.push((crate::net::CAVE_ONLINE_PORT_VA, 2));
+        patch_sites.push((crate::net::JOIN_GAME_PORT_VA, 4));
+    }
+
+    let net_only_opts = LaunchRuntimeOptions {
+        install_trace_hooks: false,
+        monitor_desync_dump: false,
+        auto_resync: false,
+        enable_persistent_quicksave_load: false,
+        inject_lan_net_globals: opts.inject_lan_net_globals,
+        inject_nat_direct_target: opts.inject_nat_direct_target,
+    };
+
+    {
+        let _suspend_guard = match unsafe { SuspendedProcessGuard::acquire(pid, &patch_sites) } {
+            Ok(g) => g,
+            Err(e) => {
+                unsafe {
+                    CloseHandle(h_process);
+                }
+                return Err(e);
+            }
+        };
+        unsafe {
+            let _ = apply_runtime_patches_to_process(
+                h_process,
+                direct_peer,
+                local_bind_ip,
+                net_only_opts,
+                info.has_mod_net_caves,
+                true,
+            );
+        }
+    }
+
+    let updated_info =
+        unsafe { inspect_running_game_from_handle(pid, h_process, inspect_process_modules(pid)) };
+    unsafe {
+        CloseHandle(h_process);
+    }
+    Ok(updated_info)
+}
+
 #[cfg(not(windows))]
 pub fn launch_game(
     exe_path: &Path,
@@ -1240,7 +2170,7 @@ pub fn launch_game(
         pid: child.id(),
         peer_role,
         peer_ip,
-        child,
+        child: Some(child),
         trace_buf_va: 0,
         trace_flushed_seq: 0,
         trace_prev_u0: None,
@@ -1253,6 +2183,33 @@ pub fn launch_game(
         resync_aborted: false,
         last_resync_error: None,
     })
+}
+
+#[cfg(not(windows))]
+pub fn attach_game(
+    pid: u32,
+    _peer_role: crate::trace::PeerRole,
+    _direct_peer: Option<DirectPeerTarget>,
+    _local_bind_ip: Option<Ipv4Addr>,
+    _opts: LaunchRuntimeOptions,
+) -> Result<(GameProcess, RunningGameInfo)> {
+    bail!(
+        "Live process attach (PID {}) is only supported on Windows (where splintercell3.exe runs natively)",
+        pid
+    )
+}
+
+#[cfg(not(windows))]
+pub fn reconfigure_running_game_network(
+    pid: u32,
+    _direct_peer: Option<DirectPeerTarget>,
+    _local_bind_ip: Option<Ipv4Addr>,
+    _opts: LaunchRuntimeOptions,
+) -> Result<RunningGameInfo> {
+    bail!(
+        "Live process reconfigure (PID {}) is only supported on Windows (where splintercell3.exe runs natively)",
+        pid
+    )
 }
 
 #[cfg(test)]
@@ -1305,5 +2262,120 @@ mod tests {
         assert_eq!(m2, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classify_loaded_module_names_detects_forcebindip_and_nucleus() {
+        let mods = vec![
+            "splintercell3.exe".to_string(),
+            "BindIP.dll".to_string(),
+            "ProtoInputHooks32.dll".to_string(),
+            "ws2_32.dll".to_string(),
+        ];
+        assert_eq!(super::classify_loaded_module_names(&mods), (true, true));
+
+        let plain = vec!["splintercell3.exe".to_string(), "ws2_32.dll".to_string()];
+        assert_eq!(super::classify_loaded_module_names(&plain), (false, false));
+    }
+
+    #[test]
+    fn parse_ip_pair_validates_format_and_distinctness() {
+        assert_eq!(
+            super::parse_ip_pair("192.168.178.202, 192.168.178.203").unwrap(),
+            (
+                std::net::Ipv4Addr::new(192, 168, 178, 202),
+                std::net::Ipv4Addr::new(192, 168, 178, 203),
+            )
+        );
+        assert!(super::parse_ip_pair("192.168.1.10,192.168.1.10").is_err());
+        assert!(super::parse_ip_pair("0.0.0.0,192.168.1.10").is_err());
+        assert!(super::parse_ip_pair("127.0.0.1,127.0.0.2").is_err());
+        assert_eq!(
+            super::parse_ip_pair("127.0.0.2,127.0.0.3").unwrap(),
+            (
+                std::net::Ipv4Addr::new(127, 0, 0, 2),
+                std::net::Ipv4Addr::new(127, 0, 0, 3),
+            )
+        );
+        assert!(super::parse_ip_pair("192.168.1.10").is_err());
+    }
+
+    #[test]
+    fn plan_nucleus_instance_handles_all_three_modes() {
+        let base_info = super::RunningGameInfo {
+            pid: 4242,
+            exe_path: None,
+            has_forcebindip: false,
+            has_nucleus_hooks: true,
+            has_mod_net_caves: true,
+            online_target: None,
+            local_bind_ip: None,
+            has_trace_hooks: false,
+            has_quicksave_hooks: false,
+        };
+
+        // 1. PreserveNucleusLan clears online target and leaves local_bind_ip = None
+        let p0 = super::plan_nucleus_instance(0, super::NucleusNetMode::PreserveNucleusLan, &base_info);
+        assert_eq!(p0.direct_peer, None);
+        assert_eq!(p0.local_bind_ip, None);
+        assert!(p0.warning.is_none());
+
+        let p1 = super::plan_nucleus_instance(1, super::NucleusNetMode::PreserveNucleusLan, &base_info);
+        assert_eq!(p1.direct_peer, None);
+        assert_eq!(p1.local_bind_ip, None);
+        assert!(p1.warning.is_some()); // warns ForceBindIP not detected on 2nd instance
+
+        let fb_info = super::RunningGameInfo {
+            has_forcebindip: true,
+            ..base_info.clone()
+        };
+        let p1_fb = super::plan_nucleus_instance(1, super::NucleusNetMode::PreserveNucleusLan, &fb_info);
+        assert!(p1_fb.warning.is_none());
+
+        // 2. BuiltInLoopbackPair assigns 127.0.0.2 <-> 127.0.0.3 symmetrically (avoiding 127.0.0.1!)
+        assert_eq!(super::LOOPBACK_PAIR_HOST_IP, std::net::Ipv4Addr::new(127, 0, 0, 2));
+        assert_eq!(super::LOOPBACK_PAIR_CLIENT_IP, std::net::Ipv4Addr::new(127, 0, 0, 3));
+        let lb0 = super::plan_nucleus_instance(0, super::NucleusNetMode::BuiltInLoopbackPair, &base_info);
+        let lb1 = super::plan_nucleus_instance(1, super::NucleusNetMode::BuiltInLoopbackPair, &base_info);
+        assert_eq!(lb0.role, crate::trace::PeerRole::Host);
+        assert_eq!(lb0.local_bind_ip, Some(super::LOOPBACK_PAIR_HOST_IP));
+        assert_eq!(lb0.direct_peer.unwrap().ip, super::LOOPBACK_PAIR_CLIENT_IP);
+        assert_eq!(lb1.role, crate::trace::PeerRole::Guest);
+        assert_eq!(lb1.local_bind_ip, Some(super::LOOPBACK_PAIR_CLIENT_IP));
+        assert_eq!(lb1.direct_peer.unwrap().ip, super::LOOPBACK_PAIR_HOST_IP);
+        assert!(lb0.warning.is_none());
+
+        let summary_with_net = super::RunningGameInfo {
+            local_bind_ip: Some(super::LOOPBACK_PAIR_HOST_IP),
+            online_target: Some((super::LOOPBACK_PAIR_CLIENT_IP, 9100, 9103)),
+            ..base_info.clone()
+        }
+        .summary_line();
+        assert!(summary_with_net.contains("bind=127.0.0.2"));
+        assert!(summary_with_net.contains("peer=127.0.0.3:9100/9103"));
+
+        // Warns if ForceBindIP is already injected when BuiltInLoopbackPair is selected
+        let lb_fb = super::plan_nucleus_instance(0, super::NucleusNetMode::BuiltInLoopbackPair, &fb_info);
+        assert!(lb_fb.warning.is_some());
+
+        // 3. ExplicitPair assigns ip1 <-> ip2
+        let ip1 = std::net::Ipv4Addr::new(10, 0, 0, 1);
+        let ip2 = std::net::Ipv4Addr::new(10, 0, 0, 2);
+        let ex0 = super::plan_nucleus_instance(0, super::NucleusNetMode::ExplicitPair(ip1, ip2), &base_info);
+        let ex1 = super::plan_nucleus_instance(1, super::NucleusNetMode::ExplicitPair(ip1, ip2), &base_info);
+        assert_eq!(ex0.local_bind_ip, Some(ip1));
+        assert_eq!(ex0.direct_peer.unwrap().ip, ip2);
+        assert_eq!(ex1.local_bind_ip, Some(ip2));
+        assert_eq!(ex1.direct_peer.unwrap().ip, ip1);
+    }
+
+    #[test]
+    fn eip_intersects_patch_sites_checks_half_open_bounds() {
+        let sites = [(0x10A7_92A6u32, 6usize), (0x10DF_86BAu32, 6usize)];
+        assert!(!super::eip_intersects_patch_sites(0x10A7_92A5, &sites));
+        assert!(super::eip_intersects_patch_sites(0x10A7_92A6, &sites));
+        assert!(super::eip_intersects_patch_sites(0x10A7_92AB, &sites));
+        assert!(!super::eip_intersects_patch_sites(0x10A7_92AC, &sites));
+        assert!(super::eip_intersects_patch_sites(0x10DF_86BC, &sites));
     }
 }

@@ -49,6 +49,34 @@ struct Args {
     #[arg(long)]
     lan: bool,
 
+    /// Attach to already-running splintercell3.exe process(es) instead of launching (for Nucleus Co-op / external launchers)
+    #[arg(long)]
+    attach: bool,
+
+    /// Nucleus Co-op companion mode: pre-clean stale online targets, watch for Nucleus-launched splintercell3.exe instances, and auto-attach hooks/networking
+    #[arg(long)]
+    nucleus: bool,
+
+    /// Keep watching for newly-started splintercell3.exe processes when using --attach (enabled automatically by --nucleus)
+    #[arg(long)]
+    watch: bool,
+
+    /// Target specific splintercell3.exe PID(s) when using --attach (repeatable)
+    #[arg(long = "pid", value_name = "PID")]
+    pids: Vec<u32>,
+
+    /// Pair 2 attached/Nucleus instances over built-in loopback addresses (127.0.0.2 <-> 127.0.0.3; default for --nucleus, no ForceBindIP or virtual adapters needed)
+    #[arg(long)]
+    pair_loopback: bool,
+
+    /// Pair 2 attached/Nucleus instances over two explicit local IPv4 addresses (e.g. 192.168.178.202,192.168.178.203)
+    #[arg(long, value_name = "IP1,IP2")]
+    pair_ips: Option<String>,
+
+    /// Leave IP binding to Nucleus Co-op / ForceBindIP (0.0.0.0) instead of built-in 127.0.0.2 <-> 127.0.0.3 loopback pairing
+    #[arg(long)]
+    respect_nucleus_net: bool,
+
     /// Bind sockets and game LAN traffic to a specific local IPv4 adapter address (default: auto/all adapters)
     #[arg(long, value_name = "IP")]
     bind_ip: Option<std::net::Ipv4Addr>,
@@ -86,17 +114,52 @@ struct Args {
     cli: bool,
 }
 
+fn validate_and_resolve_nucleus_net_mode(args: &Args) -> Result<launcher::NucleusNetMode> {
+    let mode_count = usize::from(args.host)
+        + usize::from(args.join.is_some())
+        + usize::from(args.lan)
+        + usize::from(args.nucleus);
+    if mode_count > 1 {
+        anyhow::bail!("Cannot combine --host, --join, --lan, and --nucleus at the same time.");
+    }
+    if args.pair_loopback && args.pair_ips.is_some() {
+        anyhow::bail!("Cannot combine --pair-loopback and --pair-ips at the same time.");
+    }
+    if args.respect_nucleus_net && (args.pair_loopback || args.pair_ips.is_some()) {
+        anyhow::bail!(
+            "Cannot combine --respect-nucleus-net with --pair-loopback or --pair-ips."
+        );
+    }
+    if (args.pair_loopback || args.pair_ips.is_some()) && (args.host || args.join.is_some()) {
+        anyhow::bail!("Cannot combine --pair-loopback or --pair-ips with --host or --join.");
+    }
+    if args.pair_loopback {
+        Ok(launcher::NucleusNetMode::BuiltInLoopbackPair)
+    } else if let Some(ref raw) = args.pair_ips {
+        let (ip1, ip2) = launcher::parse_ip_pair(raw)?;
+        Ok(launcher::NucleusNetMode::ExplicitPair(ip1, ip2))
+    } else if args.respect_nucleus_net {
+        Ok(launcher::NucleusNetMode::PreserveNucleusLan)
+    } else if args.nucleus && args.bind_ip.is_none() {
+        Ok(launcher::NucleusNetMode::BuiltInLoopbackPair)
+    } else {
+        Ok(launcher::NucleusNetMode::PreserveNucleusLan)
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+    let nucleus_net_mode = validate_and_resolve_nucleus_net_mode(&args)?;
 
-    let mode_count = usize::from(args.host) + usize::from(args.join.is_some()) + usize::from(args.lan);
-    if mode_count > 1 {
-        anyhow::bail!("Cannot combine --host, --join, and --lan at the same time.");
-    }
+    let is_headless = args.restore
+        || args.cli
+        || args.host
+        || args.join.is_some()
+        || args.lan
+        || args.attach
+        || args.nucleus;
 
-    let is_headless = args.restore || args.cli || args.host || args.join.is_some() || args.lan;
-
-    // If restore, cli, host, or join is specified, run directly in headless CLI mode
+    // If restore, cli, host, join, lan, attach, or nucleus is specified, run in headless CLI mode
     if is_headless {
         #[cfg(windows)]
         {
@@ -117,6 +180,19 @@ fn main() -> Result<()> {
 
         let bind_ip = args.bind_ip.filter(|ip| !ip.is_unspecified());
 
+        if args.nucleus || (args.attach && !args.host && args.join.is_none() && !args.lan) {
+            headless::run_headless_attach(headless::AttachModeOptions {
+                game_root: &game_root,
+                bypass_checksum_disconnect: args.bypass_checksum_disconnect,
+                auto_resync: args.resync,
+                bind_ip,
+                net_mode: nucleus_net_mode,
+                watch: args.nucleus || args.watch,
+                target_pids: &args.pids,
+            })?;
+            return Ok(());
+        }
+
         if args.lan {
             let opts = headless::HeadlessOptions {
                 game_root: &game_root,
@@ -127,6 +203,9 @@ fn main() -> Result<()> {
                 bypass_checksum_disconnect: args.bypass_checksum_disconnect,
                 auto_resync: args.resync,
                 bind_ip,
+                attach: args.attach,
+                watch: args.watch,
+                target_pids: &args.pids,
             };
             headless::run_headless_lan(opts)?;
             return Ok(());
@@ -142,6 +221,9 @@ fn main() -> Result<()> {
                 bypass_checksum_disconnect: args.bypass_checksum_disconnect,
                 auto_resync: args.resync,
                 bind_ip,
+                attach: args.attach,
+                watch: args.watch,
+                target_pids: &args.pids,
             };
             headless::run_headless_host(opts)?;
             return Ok(());
@@ -157,6 +239,9 @@ fn main() -> Result<()> {
                 bypass_checksum_disconnect: args.bypass_checksum_disconnect,
                 auto_resync: args.resync,
                 bind_ip,
+                attach: args.attach,
+                watch: args.watch,
+                target_pids: &args.pids,
             };
             headless::run_headless_join(opts, code)?;
             return Ok(());
@@ -219,6 +304,69 @@ mod tests {
 
         let dev_args = Args::try_parse_from(["scct_coop_enhancer", "--dev"]).unwrap();
         assert!(dev_args.dev);
+    }
+
+    #[test]
+    fn test_cli_nucleus_and_attach_flags_parse_and_validate() {
+        let nuc = Args::try_parse_from(["scct_coop_enhancer", "--nucleus"]).unwrap();
+        assert!(nuc.nucleus);
+        assert_eq!(
+            validate_and_resolve_nucleus_net_mode(&nuc).unwrap(),
+            launcher::NucleusNetMode::BuiltInLoopbackPair
+        );
+
+        let respect = Args::try_parse_from([
+            "scct_coop_enhancer",
+            "--nucleus",
+            "--respect-nucleus-net",
+        ])
+        .unwrap();
+        assert_eq!(
+            validate_and_resolve_nucleus_net_mode(&respect).unwrap(),
+            launcher::NucleusNetMode::PreserveNucleusLan
+        );
+
+        let lb =
+            Args::try_parse_from(["scct_coop_enhancer", "--nucleus", "--pair-loopback"]).unwrap();
+        assert_eq!(
+            validate_and_resolve_nucleus_net_mode(&lb).unwrap(),
+            launcher::NucleusNetMode::BuiltInLoopbackPair
+        );
+
+        let pair = Args::try_parse_from([
+            "scct_coop_enhancer",
+            "--attach",
+            "--pid",
+            "1234",
+            "--pid",
+            "5678",
+            "--pair-ips",
+            "192.168.178.202,192.168.178.203",
+        ])
+        .unwrap();
+        assert!(pair.attach);
+        assert_eq!(pair.pids, vec![1234, 5678]);
+        assert_eq!(
+            validate_and_resolve_nucleus_net_mode(&pair).unwrap(),
+            launcher::NucleusNetMode::ExplicitPair(
+                std::net::Ipv4Addr::new(192, 168, 178, 202),
+                std::net::Ipv4Addr::new(192, 168, 178, 203),
+            )
+        );
+
+        let bad_combo =
+            Args::try_parse_from(["scct_coop_enhancer", "--nucleus", "--host"]).unwrap();
+        assert!(validate_and_resolve_nucleus_net_mode(&bad_combo).is_err());
+
+        let bad_pair = Args::try_parse_from([
+            "scct_coop_enhancer",
+            "--nucleus",
+            "--pair-loopback",
+            "--pair-ips",
+            "10.0.0.1,10.0.0.2",
+        ])
+        .unwrap();
+        assert!(validate_and_resolve_nucleus_net_mode(&bad_pair).is_err());
     }
 
     #[test]
