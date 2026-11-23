@@ -24,6 +24,8 @@ All features:
 
 ## How to use
 
+### Online
+
 You must have a valid copy of Splinter Cell Chaos Theory for it to work, e.g. via Steam.
 
 1. (Both) Download the latest SCCT Coop Enhancer version from [the releases](https://github.com/sholtrop/scct_enhanced_coop/releases):
@@ -47,6 +49,31 @@ You must have a valid copy of Splinter Cell Chaos Theory for it to work, e.g. vi
 
 > [!NOTE]
 > To see single player levels, you have to scroll down in the level select
+
+### Nucleus Co-op
+
+You can use this mod together with [Nucleus Co-op](https://www.splitscreen.me/) to play split-screen on a single PC (including all single player levels in coop, persistent quick saves, and networking/gameplay fixes).
+
+1. Complete steps 1–3 from the [Online](#online) guide above so the mod is installed to your Splinter Cell: Chaos Theory folder first.
+
+   *(If you have already played Chaos Theory in Nucleus Co-op before, delete Nucleus's cached `content` folder for Chaos Theory so it picks up the newly patched game files instead of older vanilla copies.)*
+
+2. In `scct_coop_enhancer`, expand **"Nucleus Co-op / External Launcher (Attach Mode)"**.
+
+3. Leave **Nucleus Networking** on the default **"Built-in Loopback Pair (127.0.0.2 <-> 127.0.0.3) — Recommended"** (this pairs both local instances automatically without needing ForceBindIP or virtual network adapters).
+
+   *(If your Nucleus handler manages its own ForceBindIP / loopback adapters, you can switch to **"Respect Nucleus Network"**, or pick two local IPs manually with **"Custom Adapter IP Pair"**.)*
+
+4. Click **"Watch & Auto-Attach (Nucleus Mode)"**.
+
+   *(Alternatively, you can launch Nucleus Co-op first and click **"Attach / Re-apply to Running Game(s)"** while both instances are on the Main Menu.)*
+
+5. Launch 2-player Splinter Cell: Chaos Theory in Nucleus Co-op. `scct_coop_enhancer` will automatically attach to both instances as they start.
+
+6. In both game windows, go to **Coop -> Enhanced Coop**. One player creates a game and the other joins.
+
+> [!NOTE]
+> If you run Nucleus Co-op as Administrator, run `scct_coop_enhancer` as Administrator as well so it has permission to attach to the game processes. If either window was already inside the Coop menu before attaching, back out to the Main Menu and re-enter **Coop -> Enhanced Coop** so the sockets rebind.
 
 ## FAQ
 
