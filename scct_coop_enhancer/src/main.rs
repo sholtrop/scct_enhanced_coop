@@ -102,7 +102,7 @@ struct Args {
     bypass_checksum_disconnect: bool,
 
     /// Automatically resync Host -> Client simulation state in memory on lockstep checksum mismatch
-    #[arg(long, visible_alias = "auto-resync")]
+    #[arg(long, visible_alias = "auto-resync", default_value_t = true)]
     resync: bool,
 
     /// Show advanced developer / debug flag controls in the launcher UI
@@ -126,9 +126,7 @@ fn validate_and_resolve_nucleus_net_mode(args: &Args) -> Result<launcher::Nucleu
         anyhow::bail!("Cannot combine --pair-loopback and --pair-ips at the same time.");
     }
     if args.respect_nucleus_net && (args.pair_loopback || args.pair_ips.is_some()) {
-        anyhow::bail!(
-            "Cannot combine --respect-nucleus-net with --pair-loopback or --pair-ips."
-        );
+        anyhow::bail!("Cannot combine --respect-nucleus-net with --pair-loopback or --pair-ips.");
     }
     if (args.pair_loopback || args.pair_ips.is_some()) && (args.host || args.join.is_some()) {
         anyhow::bail!("Cannot combine --pair-loopback or --pair-ips with --host or --join.");
@@ -253,7 +251,12 @@ fn main() -> Result<()> {
 
     // Default: Launch GUI!
     let initial_bind_ip = args.bind_ip.filter(|ip| !ip.is_unspecified());
-    if let Err(e) = gui::run_gui(args.game_dir.clone(), initial_bind_ip, args.resync, args.dev) {
+    if let Err(e) = gui::run_gui(
+        args.game_dir.clone(),
+        initial_bind_ip,
+        args.resync,
+        args.dev,
+    ) {
         #[cfg(windows)]
         {
             unsafe extern "system" {
@@ -315,12 +318,9 @@ mod tests {
             launcher::NucleusNetMode::BuiltInLoopbackPair
         );
 
-        let respect = Args::try_parse_from([
-            "scct_coop_enhancer",
-            "--nucleus",
-            "--respect-nucleus-net",
-        ])
-        .unwrap();
+        let respect =
+            Args::try_parse_from(["scct_coop_enhancer", "--nucleus", "--respect-nucleus-net"])
+                .unwrap();
         assert_eq!(
             validate_and_resolve_nucleus_net_mode(&respect).unwrap(),
             launcher::NucleusNetMode::PreserveNucleusLan
