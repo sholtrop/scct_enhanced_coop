@@ -41,6 +41,13 @@ macro_rules! scct_log {
     }};
 }
 
+use crate::interactions::{
+    is_coop_aivolume_leave_guard_patched, is_coop_interaction_lock_fixes_patched,
+    is_softbody_render_gate_sync_patched, patch_coop_aivolume_leave_guard_bytes,
+    patch_coop_interaction_lock_fixes_bytes, patch_softbody_render_gate_sync_bytes,
+    revert_coop_aivolume_leave_guard_bytes, revert_coop_interaction_lock_fixes_bytes,
+    revert_softbody_render_gate_sync_bytes,
+};
 use crate::levels::{SP_COOP_LEVELS, VANILLA_COOP_STEMS};
 use crate::net::{
     NetExeFlags, is_ai_visibility_culling_disabled, is_lan_bind_hooks_applied,
@@ -1086,7 +1093,7 @@ pub fn revert_ai_render_gate_sync_bytes(data: &mut [u8]) -> bool {
     revert_byte_sites(data, AI_RENDER_GATE_SYNC_SITES)
 }
 
-/// Logical feature groups used to organize all 28 mod toggles cleanly in the UI.
+/// Logical feature groups used to organize all 31 mod toggles cleanly in the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlagGroup {
     Networking,
@@ -1130,7 +1137,7 @@ pub struct FlagDescriptor {
     pub get_mut: fn(&mut ModFlags) -> &mut bool,
 }
 
-/// Comprehensive 28-flag configuration covering every modification `scct_coop_enhancer`
+/// Comprehensive 31-flag configuration covering every modification `scct_coop_enhancer`
 /// makes across `.exe`, `.u`, `.umd`, `.ini`, `Data/Maps/*.scl` UPKs, and runtime launch hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModFlags {
@@ -1149,12 +1156,15 @@ pub struct ModFlags {
     pub disable_ai_visibility_cull: bool,
     pub unsynced_render_rng: bool,
     pub exclude_controller_checksum: bool,
+    pub softbody_render_gate_sync: bool,
     // 4. Gameplay & Script Fixes
     pub camera_alarm_fixes: bool,
     pub nonlethal_gameover_menu: bool,
     pub coop_aizone_enable: bool,
     pub coop_endmission_dispatch: bool,
     pub eev_remote_hacking: bool,
+    pub coop_interaction_lock_fixes: bool,
+    pub coop_aivolume_leave_guard: bool,
     // 5. Archives & Map UPK Conversion
     pub umd_coop_missions_and_loc: bool,
     pub umd_lan_menu_caption: bool,
@@ -1282,6 +1292,15 @@ pub const FLAG_DESCRIPTORS: &[FlagDescriptor] = &[
         get: |f| f.exclude_controller_checksum,
         get_mut: |f| &mut f.exclude_controller_checksum,
     },
+    FlagDescriptor {
+        group: FlagGroup::SyncAiSkel,
+        short_name: "softbody_sync",
+        label: "#7 USoftBody::Tick Off-Screen Render Gate Sync (0x10A4B4A1)",
+        tooltip: "Removes the 5s LastRenderTime culling gate in USoftBody::Tick so off-screen softbody ropes/cloth (e.g. Bank roof rope) simulate deterministically on both peers.",
+        requires_heavy_rebuild: false,
+        get: |f| f.softbody_render_gate_sync,
+        get_mut: |f| &mut f.softbody_render_gate_sync,
+    },
     // 4. Gameplay & Script Fixes
     FlagDescriptor {
         group: FlagGroup::Gameplay,
@@ -1327,6 +1346,24 @@ pub const FLAG_DESCRIPTORS: &[FlagDescriptor] = &[
         requires_heavy_rebuild: false,
         get: |f| f.eev_remote_hacking,
         get_mut: |f| &mut f.eev_remote_hacking,
+    },
+    FlagDescriptor {
+        group: FlagGroup::Gameplay,
+        short_name: "coop_interactions",
+        label: "Co-op Interaction Lock, Lifecycle & Multi-Player IPC Fixes (16 sites)",
+        tooltip: "Fixes GIM::InitInteract orphaned bLock, GIM::PostInteract unlock, Destroy() LockedList UAF cleanup, deterministic stale-lock reclaimer (Bank/Displace ropes & SP interactions), and multi-player IPC ownership.",
+        requires_heavy_rebuild: false,
+        get: |f| f.coop_interaction_lock_fixes,
+        get_mut: |f| &mut f.coop_interaction_lock_fixes,
+    },
+    FlagDescriptor {
+        group: FlagGroup::Gameplay,
+        short_name: "coop_aivol_leave",
+        label: "Multi-Player EAIVolume PawnLeavingVolume Guard (0x10A9731B)",
+        tooltip: "Prevents EAIVolume PLPatternID triggers (e.g. Displace vent shaft RappelOff) from firing when one player leaves while another living player remains inside.",
+        requires_heavy_rebuild: false,
+        get: |f| f.coop_aivolume_leave_guard,
+        get_mut: |f| &mut f.coop_aivolume_leave_guard,
     },
     // 5. Archives & Map UPK Conversion
     FlagDescriptor {
@@ -1455,7 +1492,7 @@ fn sync_exe_toggle(
 }
 
 impl ModFlags {
-    /// Standard Co-op Mod preset: 26/28 standard features enabled; keeps Checksum Disconnect Bypass and COOP_AIZONE_ENABLE OFF.
+    /// Standard Co-op Mod preset: 29/31 standard features enabled; keeps Checksum Disconnect Bypass and COOP_AIZONE_ENABLE OFF.
     pub const fn standard_coop() -> Self {
         Self {
             net_multi_nic_adapter_fix: true,
@@ -1470,11 +1507,14 @@ impl ModFlags {
             disable_ai_visibility_cull: true,
             unsynced_render_rng: true,
             exclude_controller_checksum: true,
+            softbody_render_gate_sync: true,
             camera_alarm_fixes: true,
             nonlethal_gameover_menu: true,
             coop_aizone_enable: false,
             coop_endmission_dispatch: true,
             eev_remote_hacking: true,
+            coop_interaction_lock_fixes: true,
+            coop_aivolume_leave_guard: true,
             umd_coop_missions_and_loc: true,
             umd_lan_menu_caption: true,
             loose_map_rotation_ini: true,
@@ -1504,11 +1544,14 @@ impl ModFlags {
             disable_ai_visibility_cull: false,
             unsynced_render_rng: false,
             exclude_controller_checksum: false,
+            softbody_render_gate_sync: false,
             camera_alarm_fixes: false,
             nonlethal_gameover_menu: false,
             coop_aizone_enable: false,
             coop_endmission_dispatch: false,
             eev_remote_hacking: false,
+            coop_interaction_lock_fixes: false,
+            coop_aivolume_leave_guard: false,
             umd_coop_missions_and_loc: false,
             umd_lan_menu_caption: false,
             loose_map_rotation_ini: false,
@@ -1610,7 +1653,7 @@ impl ModFlags {
         }
     }
 
-    /// Applies/reverts ONLY the 10 non-network gameplay/sync/pause `.exe` byte sites.
+    /// Applies/reverts ONLY the 13 non-network gameplay/sync/pause `.exe` byte sites.
     pub fn apply_gameplay_to_exe_bytes(&self, exe_bytes: &mut [u8]) -> Result<()> {
         type ExeSiteToggle = (
             bool,
@@ -1618,7 +1661,7 @@ impl ModFlags {
             fn(&mut [u8]) -> Result<usize>,
             fn(&mut [u8]) -> bool,
         );
-        let exe_toggles: [ExeSiteToggle; 10] = [
+        let exe_toggles: [ExeSiteToggle; 13] = [
             (
                 self.skel_getframe_once_per_tick,
                 is_skel_getframe_once_patched,
@@ -1656,6 +1699,12 @@ impl ModFlags {
                 revert_controller_checksum_bytes,
             ),
             (
+                self.softbody_render_gate_sync,
+                is_softbody_render_gate_sync_patched,
+                patch_softbody_render_gate_sync_bytes,
+                revert_softbody_render_gate_sync_bytes,
+            ),
+            (
                 self.camera_alarm_fixes,
                 is_camera_alarm_patched,
                 patch_camera_alarm_bytes,
@@ -1678,6 +1727,18 @@ impl ModFlags {
                 is_coop_endmission_dispatch_patched,
                 patch_coop_endmission_dispatch_bytes,
                 revert_coop_endmission_dispatch_bytes,
+            ),
+            (
+                self.coop_interaction_lock_fixes,
+                is_coop_interaction_lock_fixes_patched,
+                patch_coop_interaction_lock_fixes_bytes,
+                revert_coop_interaction_lock_fixes_bytes,
+            ),
+            (
+                self.coop_aivolume_leave_guard,
+                is_coop_aivolume_leave_guard_patched,
+                patch_coop_aivolume_leave_guard_bytes,
+                revert_coop_aivolume_leave_guard_bytes,
             ),
         ];
         for (enabled, is_patched, patch, revert) in exe_toggles {
@@ -1777,11 +1838,14 @@ impl ModFlags {
             disable_ai_visibility_cull: is_ai_visibility_culling_disabled(&exe_bytes),
             unsynced_render_rng: is_unsynced_render_rng_patched(&exe_bytes),
             exclude_controller_checksum: is_controller_checksum_patched(&exe_bytes),
+            softbody_render_gate_sync: is_softbody_render_gate_sync_patched(&exe_bytes),
             camera_alarm_fixes: is_camera_alarm_patched(&exe_bytes),
             nonlethal_gameover_menu: is_nonlethal_gameover_menu_patched(&exe_bytes),
             coop_aizone_enable: is_coop_aizone_enable_patched(&exe_bytes),
             coop_endmission_dispatch: is_coop_endmission_dispatch_patched(&exe_bytes),
             eev_remote_hacking,
+            coop_interaction_lock_fixes: is_coop_interaction_lock_fixes_patched(&exe_bytes),
+            coop_aivolume_leave_guard: is_coop_aivolume_leave_guard_patched(&exe_bytes),
             umd_coop_missions_and_loc: umd_opts.coop_missions_and_loc,
             umd_lan_menu_caption: umd_opts.lan_menu_caption,
             loose_map_rotation_ini,
@@ -1839,7 +1903,7 @@ fn has_any_generated_coop_artifacts(maps_dir: &Path, gen_loadings_dir: &Path) ->
     false
 }
 
-/// Synchronizes all 28 mod flags incrementally: `.exe`, `Echelon.u`, loose `MapRotation.ini`,
+/// Synchronizes all 31 mod flags incrementally: `.exe`, `Echelon.u`, loose `MapRotation.ini`,
 /// `dynamic-pc.umd`, and `Data/Maps/*_COOP.*` / `GenLoadings` are only rewritten when out of sync.
 pub fn sync_mod_flags(
     game_root: &Path,
@@ -2106,8 +2170,11 @@ pub fn are_gameplay_fixes_applied(exe_path: &Path) -> bool {
             && is_unsynced_render_rng_patched(&data)
             && is_controller_checksum_patched(&data)
             && is_skel_bone_sync_patched(&data)
+            && is_softbody_render_gate_sync_patched(&data)
             && is_pause_always_ready_patched(&data)
             && is_ai_visibility_culling_disabled(&data)
+            && is_coop_interaction_lock_fixes_patched(&data)
+            && is_coop_aivolume_leave_guard_patched(&data)
     } else {
         false
     }
@@ -2157,6 +2224,21 @@ pub fn revert_exe_fixes(exe_path: &Path) -> Result<bool> {
 
     if revert_ai_visibility_culling_disabled_bytes(&mut data) {
         scct_log!("  [EXE] Restored vanilla AI visibility tick-culling (0x10C1852C)");
+        changed = true;
+    }
+
+    if revert_softbody_render_gate_sync_bytes(&mut data) {
+        scct_log!("  [EXE] Restored vanilla USoftBody::Tick render gate (0x10A4B4A1)");
+        changed = true;
+    }
+
+    if revert_coop_interaction_lock_fixes_bytes(&mut data) {
+        scct_log!("  [EXE] Reverted Co-op interaction lock/IPC fixes (16 sites)");
+        changed = true;
+    }
+
+    if revert_coop_aivolume_leave_guard_bytes(&mut data) {
+        scct_log!("  [EXE] Reverted Co-op EAIVolume PawnLeavingVolume guard (0x10A9731B)");
         changed = true;
     }
 
@@ -2238,6 +2320,33 @@ pub fn patch_exe_fixes(exe_path: &Path, exe_bak_path: &Path) -> Result<()> {
         scct_log!(
             "  [EXE] Disabled AI visibility tick-culling (0x10C1852C) @ 0x{:06X}",
             cull_off
+        );
+        modified = true;
+    }
+
+    if !is_softbody_render_gate_sync_patched(&data) {
+        let sb_off = patch_softbody_render_gate_sync_bytes(&mut data)?;
+        scct_log!(
+            "  [EXE] Patched USoftBody::Tick off-screen render gate sync @ 0x{:06X}",
+            sb_off
+        );
+        modified = true;
+    }
+
+    if !is_coop_interaction_lock_fixes_patched(&data) {
+        let lock_off = patch_coop_interaction_lock_fixes_bytes(&mut data)?;
+        scct_log!(
+            "  [EXE] Patched Co-op interaction lock/IPC fixes (16 sites, first @ 0x{:06X})",
+            lock_off
+        );
+        modified = true;
+    }
+
+    if !is_coop_aivolume_leave_guard_patched(&data) {
+        let vol_off = patch_coop_aivolume_leave_guard_bytes(&mut data)?;
+        scct_log!(
+            "  [EXE] Patched Co-op EAIVolume PawnLeavingVolume guard (2 sites, first @ 0x{:06X})",
+            vol_off
         );
         modified = true;
     }
@@ -2511,10 +2620,15 @@ mod tests {
         let p2 = Path::new(
             "../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
         );
+        let p3 = Path::new(
+            "../../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
+        );
         let clean_exe = if p1.exists() {
             p1
         } else if p2.exists() {
             p2
+        } else if p3.exists() {
+            p3
         } else {
             return;
         };
@@ -2535,6 +2649,9 @@ mod tests {
         assert!(!is_skel_bone_sync_patched(&vanilla_bytes));
         assert!(!is_pause_always_ready_patched(&vanilla_bytes));
         assert!(!is_ai_visibility_culling_disabled(&vanilla_bytes));
+        assert!(!is_softbody_render_gate_sync_patched(&vanilla_bytes));
+        assert!(!is_coop_interaction_lock_fixes_patched(&vanilla_bytes));
+        assert!(!is_coop_aivolume_leave_guard_patched(&vanilla_bytes));
         assert!(!are_gameplay_fixes_applied(&test_exe));
 
         patch_exe_fixes(&test_exe, &test_bak).unwrap();
@@ -2547,6 +2664,9 @@ mod tests {
         assert!(is_skel_bone_sync_patched(&patched_bytes));
         assert!(is_pause_always_ready_patched(&patched_bytes));
         assert!(is_ai_visibility_culling_disabled(&patched_bytes));
+        assert!(is_softbody_render_gate_sync_patched(&patched_bytes));
+        assert!(is_coop_interaction_lock_fixes_patched(&patched_bytes));
+        assert!(is_coop_aivolume_leave_guard_patched(&patched_bytes));
         assert!(are_gameplay_fixes_applied(&test_exe));
         assert!(test_bak.exists());
 
@@ -2682,7 +2802,7 @@ mod tests {
 
     #[test]
     fn test_mod_flags_descriptor_table_integrity() {
-        assert_eq!(FLAG_DESCRIPTORS.len(), 28);
+        assert_eq!(FLAG_DESCRIPTORS.len(), 31);
         let mut seen = HashSet::new();
         for d in FLAG_DESCRIPTORS {
             assert!(seen.insert(d.short_name), "duplicate short_name {}", d.short_name);
@@ -2704,10 +2824,13 @@ mod tests {
     fn test_exe_patch_flags_roundtrip_on_clean_files() {
         let p1 = Path::new("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
         let p2 = Path::new("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
+        let p3 = Path::new("../../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory");
         let clean_root = if p1.exists() {
             p1
         } else if p2.exists() {
             p2
+        } else if p3.exists() {
+            p3
         } else {
             return;
         };
@@ -2765,6 +2888,9 @@ mod tests {
         assert!(is_camera_alarm_patched(&after_no_skel));
         assert!(is_nonlethal_gameover_patched(&after_no_skel));
         assert!(is_pause_always_ready_patched(&after_no_skel));
+        assert!(is_softbody_render_gate_sync_patched(&after_no_skel));
+        assert!(is_coop_interaction_lock_fixes_patched(&after_no_skel));
+        assert!(is_coop_aivolume_leave_guard_patched(&after_no_skel));
 
         let min_sync = ModFlags::minimal_coop_sync();
         sync_mod_flags(&dir, &min_sync, None).unwrap();
@@ -2775,7 +2901,7 @@ mod tests {
         assert!(!String::from_utf8_lossy(&std::fs::read(&loose_rot).unwrap())
             .contains("01_Lighthouse_COOP"));
 
-        // Disable all 28 flags -> exe bytes match 100% vanilla and Echelon.u reverts
+        // Disable all 31 flags -> exe bytes match 100% vanilla and Echelon.u reverts
         let all_off = ModFlags::all_disabled();
         sync_mod_flags(&dir, &all_off, None).unwrap();
         assert_eq!(std::fs::read(&test_exe).unwrap(), vanilla_exe);

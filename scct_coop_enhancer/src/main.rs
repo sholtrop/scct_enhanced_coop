@@ -2,6 +2,7 @@
 
 mod gui;
 mod headless;
+mod interactions;
 mod ip;
 mod launcher;
 mod levels;

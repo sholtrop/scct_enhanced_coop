@@ -881,9 +881,9 @@ impl PatcherApp {
         let mut qs_toggled = false;
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button(RichText::new("All Standard ON (26/28)").size(11.0))
+                .button(RichText::new("All Standard ON (29/31)").size(11.0))
                 .on_hover_text(
-                    "Enables all 26 standard Co-op Mod features (keeps Checksum Disconnect Bypass and execAddPlayerInZones AI Zone Wake OFF)",
+                    "Enables all 29 standard Co-op Mod features (keeps Checksum Disconnect Bypass and execAddPlayerInZones AI Zone Wake OFF)",
                 )
                 .clicked()
             {
@@ -901,7 +901,7 @@ impl PatcherApp {
                 qs_toggled = true;
             }
             if ui
-                .button(RichText::new("Net Only (2/28)").size(11.0))
+                .button(RichText::new("Net Only (2/31)").size(11.0))
                 .on_hover_text(
                     "Enables ONLY Multi-NIC LAN & Direct-IP NAT hooks; reverts all gameplay, menu, UMD, MapRotation, and UPK changes to vanilla",
                 )
@@ -913,7 +913,7 @@ impl PatcherApp {
             if ui
                 .button(RichText::new("All OFF (100% Vanilla)").size(11.0))
                 .on_hover_text(
-                    "Disables ALL 28 mod flags: restores vanilla EXE, Echelon.u, dynamic-pc.umd, MapRotation.ini, removes *_COOP.* maps, and skips all runtime hooks",
+                    "Disables ALL 31 mod flags: restores vanilla EXE, Echelon.u, dynamic-pc.umd, MapRotation.ini, removes *_COOP.* maps, and skips all runtime hooks",
                 )
                 .clicked()
             {
