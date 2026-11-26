@@ -142,6 +142,29 @@ pub fn serialize_object_property(name_idx: i32, obj_ref: i32) -> Vec<u8> {
     out
 }
 
+/// Serializes an UnrealScript `ArrayProperty` (`ptype = 9`) of object references
+/// (`CompactIndex` count + `CompactIndex` per object reference), matching retail Co-op maps
+/// such as `01_Panama.scl` `EAIZone0.StartPoints` byte-for-byte (`info = 0x59`).
+pub fn serialize_object_array_property(name_idx: i32, obj_refs: &[i32]) -> Vec<u8> {
+    let mut payload = write_compact_index(obj_refs.len() as i32);
+    for &r in obj_refs {
+        payload.extend_from_slice(&write_compact_index(r));
+    }
+    let (size_code, size_bytes): (u8, Vec<u8>) = if payload.len() <= u8::MAX as usize {
+        (5, vec![payload.len() as u8])
+    } else if payload.len() <= u16::MAX as usize {
+        (6, (payload.len() as u16).to_le_bytes().to_vec())
+    } else {
+        (7, (payload.len() as u32).to_le_bytes().to_vec())
+    };
+    let info = 9 | (size_code << 4);
+    let mut out = write_compact_index(name_idx);
+    out.push(info);
+    out.extend_from_slice(&size_bytes);
+    out.extend_from_slice(&payload);
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct ImportEntry {
     pub class_pkg: i32,
@@ -306,6 +329,7 @@ pub fn parse_state_frame_end(data: &[u8], offset: usize) -> Result<usize> {
 pub struct RawProperty {
     pub name: String,
     pub ptype: u8,
+    pub bool_val: bool,
     pub raw_full: Vec<u8>,
     pub raw_header: Vec<u8>,
     pub raw_val: Vec<u8>,
@@ -386,6 +410,7 @@ pub fn parse_tagged_properties_raw(
         props.push(RawProperty {
             name: prop_name.clone(),
             ptype,
+            bool_val: ptype == 3 && array_flag != 0,
             raw_full: data[prop_start..val_end].to_vec(),
             raw_header: data[prop_start..val_start].to_vec(),
             raw_val: data[val_start..val_end].to_vec(),
@@ -399,6 +424,7 @@ pub struct UpkPatchOptions {
     pub detach_speakers: bool,
     pub coop_player_mesh: bool,
     pub use_default_sound_map_false: bool,
+    pub populate_aizone_start_points: bool,
 }
 
 impl Default for UpkPatchOptions {
@@ -407,6 +433,7 @@ impl Default for UpkPatchOptions {
             detach_speakers: true,
             coop_player_mesh: true,
             use_default_sound_map_false: true,
+            populate_aizone_start_points: true,
         }
     }
 }
@@ -417,6 +444,7 @@ pub struct MapPatchSummary {
     pub p1_loc: (f32, f32, f32),
     pub p2_loc: (f32, f32, f32),
     pub detached_speakers: Vec<String>,
+    pub patched_start_zones: Vec<String>,
 }
 
 struct SpeakerZoneMatch {
@@ -869,6 +897,73 @@ pub fn patch_sp_map_to_coop_with_options(
         }
     }
 
+    // 5b. Populate `StartPoints = [P1_Start, P2_Start]` on every `bEnableAtStart = True` `EAIZone`.
+    // In Multiplayer/Co-op mode (`EchelonGameInfo::execAddPlayerInZones` @ 0x10C10CB9), the engine
+    // only activates `bEnableAtStart = True` zones whose `StartPoints` array contains a spawning
+    // `EchelonPlayerStart` (matching all retail Co-op maps such as `01_Panama.scl`). SP maps leave
+    // `StartPoints` empty, so once `AEAIPawn::vt+0x2BC` (`0x10C18551`) properly keeps disabled zones
+    // asleep, starting zones (e.g. Hokkaido's `EAIZone1` CreekGuard) need `StartPoints` populated
+    // while `bEnableAtStart = False` zones (e.g. Teahouse, Bathhouse staging box) stay asleep.
+    let mut patched_start_zones = Vec::new();
+    let mut patched_aizones: Vec<(usize, Vec<u8>)> = Vec::new();
+
+    if options.populate_aizone_start_points {
+        let mut matched_zones: Vec<(usize, String, usize, usize, usize, usize, Vec<RawProperty>)> =
+            Vec::new();
+        for (pos, e) in exports.iter().enumerate() {
+            if e.serial_size <= 0 {
+                continue;
+            }
+            let cname = resolve_class_name(&names, &imports, &exports, e.class_idx);
+            if cname != "EAIZone" {
+                continue;
+            }
+            let exp_start = e.serial_offset as usize;
+            let exp_end = exp_start + (e.serial_size as usize);
+            if exp_end > orig_data.len() {
+                continue;
+            }
+            let Ok(prop_start) = parse_state_frame_end(&orig_data, exp_start) else {
+                continue;
+            };
+            let Ok((props, first_none, _)) =
+                parse_tagged_properties_raw(&names, &orig_data, prop_start, exp_end)
+            else {
+                continue;
+            };
+            let is_enable_at_start = props
+                .iter()
+                .any(|p| p.name == "bEnableAtStart" && p.bool_val);
+            if !is_enable_at_start {
+                continue;
+            }
+            let oname = names[e.obj_name as usize].0.clone();
+            matched_zones.push((pos, oname, exp_start, prop_start, first_none, exp_end, props));
+        }
+
+        if !matched_zones.is_empty() {
+            let idx_start_points =
+                ensure_name(&mut names, &mut name_to_idx, "StartPoints", 0x00070010);
+            let start_points_prop = serialize_object_array_property(
+                idx_start_points,
+                &[pstart1_exp_index, new_pstart2_exp_idx],
+            );
+            for (pos, oname, exp_start, prop_start, first_none, exp_end, props) in matched_zones {
+                let mut patched_bytes = Vec::new();
+                patched_bytes.extend_from_slice(&orig_data[exp_start..prop_start]);
+                for p in &props {
+                    if p.name != "StartPoints" {
+                        patched_bytes.extend_from_slice(&p.raw_full);
+                    }
+                }
+                patched_bytes.extend_from_slice(&start_points_prop);
+                patched_bytes.extend_from_slice(&orig_data[first_none..exp_end]);
+                patched_aizones.push((pos, patched_bytes));
+                patched_start_zones.push(oname);
+            }
+        }
+    }
+
     // 6. Build output stream
     let mut out_stream = Vec::from(&orig_data[..upk.import_offset]);
 
@@ -888,6 +983,12 @@ pub fn patch_sp_map_to_coop_with_options(
         exports[*spk_pos].serial_offset = out_stream.len() as i32;
         exports[*spk_pos].serial_size = spk_bytes.len() as i32;
         out_stream.extend_from_slice(spk_bytes);
+    }
+
+    for (zone_pos, zone_bytes) in &patched_aizones {
+        exports[*zone_pos].serial_offset = out_stream.len() as i32;
+        exports[*zone_pos].serial_size = zone_bytes.len() as i32;
+        out_stream.extend_from_slice(zone_bytes);
     }
 
     let pstart2_exp = ExportEntry {
@@ -967,6 +1068,7 @@ pub fn patch_sp_map_to_coop_with_options(
         p1_loc,
         p2_loc,
         detached_speakers,
+        patched_start_zones,
     })
 }
 
@@ -1003,20 +1105,50 @@ fn check_penthouse_has_use_default_sound_map(map_path: &Path) -> Option<bool> {
     Some(props.iter().any(|p| p.name == "UseDefaultSoundMap"))
 }
 
+fn check_map_aizone_start_points(map_path: &Path) -> Option<bool> {
+    let data = fs::read(map_path).ok()?;
+    let upk = parse_upk_tables(&data).ok()?;
+    let mut saw_enable_at_start = false;
+    for e in &upk.exports {
+        if e.serial_size <= 0 {
+            continue;
+        }
+        let cname = resolve_class_name(&upk.names, &upk.imports, &upk.exports, e.class_idx);
+        if cname != "EAIZone" {
+            continue;
+        }
+        let exp_start = e.serial_offset as usize;
+        let exp_end = exp_start + (e.serial_size as usize);
+        let prop_start = parse_state_frame_end(&data, exp_start).ok()?;
+        let (props, _, _) =
+            parse_tagged_properties_raw(&upk.names, &data, prop_start, exp_end).ok()?;
+        if props.iter().any(|p| p.name == "bEnableAtStart" && p.bool_val) {
+            saw_enable_at_start = true;
+            if !props.iter().any(|p| p.name == "StartPoints") {
+                return Some(false);
+            }
+        }
+    }
+    saw_enable_at_start.then_some(true)
+}
+
 /// Inspects already-installed `*_COOP.scl` maps in `maps_dir` to recover which `UpkPatchOptions`
 /// were used to generate them, or returns `None` if no `*_COOP.scl` files exist.
 pub fn detect_upk_options_from_maps(maps_dir: &Path) -> Option<UpkPatchOptions> {
     let mut coop_player_mesh = None;
     let mut first_coop_map = None;
+    let mut populate_aizone_start_points = None;
     for lvl in crate::levels::SP_COOP_LEVELS {
         let p = maps_dir.join(format!("{}.scl", lvl.coop_map));
         if p.exists() {
             if first_coop_map.is_none() {
                 first_coop_map = Some(p.clone());
             }
-            if lvl.source_map == "01_Lighthouse" {
+            if lvl.source_map == "01_Lighthouse" && coop_player_mesh.is_none() {
                 coop_player_mesh = check_map_uses_coop_player_mesh(&p);
-                break;
+            }
+            if populate_aizone_start_points.is_none() && lvl.source_map != "01_Lighthouse" {
+                populate_aizone_start_points = check_map_aizone_start_points(&p);
             }
         }
     }
@@ -1043,6 +1175,7 @@ pub fn detect_upk_options_from_maps(maps_dir: &Path) -> Option<UpkPatchOptions> 
         detach_speakers: detach_speakers.unwrap_or(true),
         coop_player_mesh: coop_player_mesh.unwrap_or(true),
         use_default_sound_map_false: use_default_sound_map_false.unwrap_or(true),
+        populate_aizone_start_points: populate_aizone_start_points.unwrap_or(true),
     })
 }
 
@@ -1137,6 +1270,7 @@ mod tests {
             detach_speakers: false,
             coop_player_mesh: false,
             use_default_sound_map_false: false,
+            populate_aizone_start_points: false,
         };
         let summary = patch_sp_map_to_coop_with_options(
             &bank_src,
@@ -1148,12 +1282,112 @@ mod tests {
         .expect("patch_sp_map_to_coop_with_options failed");
 
         assert!(summary.detached_speakers.is_empty());
+        assert!(summary.patched_start_zones.is_empty());
         assert_eq!(check_map_uses_coop_player_mesh(&out_bank), Some(false));
         assert_eq!(check_bank_speakers_detached(&out_bank), Some(false));
+        assert_eq!(check_map_aizone_start_points(&out_bank), Some(false));
 
         let detected = detect_upk_options_from_maps(&temp_dir).expect("detected");
         assert!(!detected.detach_speakers);
         assert!(!detected.coop_player_mesh);
+        assert!(!detected.populate_aizone_start_points);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_serialize_object_array_property_matches_retail_panama() {
+        // Retail 01_Panama.scl EAIZone0 StartPoints @ offset 640:
+        // NameIdx=1048 (58 10), info=0x59, size=0x05, count=2 (02), refs=[923 (5b 0e), 776 (48 0c)]
+        let bytes = serialize_object_array_property(1048, &[923, 776]);
+        assert_eq!(
+            bytes,
+            vec![0x58, 0x10, 0x59, 0x05, 0x02, 0x5B, 0x0E, 0x48, 0x0C]
+        );
+    }
+
+    #[test]
+    fn test_patch_sp_map_populates_aizone_start_points_on_hokkaido_and_lighthouse() {
+        let roots = [
+            PathBuf::from("../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps"),
+            PathBuf::from("../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps"),
+            PathBuf::from("../../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/Data/Maps"),
+        ];
+        let Some(maps_root) = roots.into_iter().find(|p| p.exists()) else {
+            eprintln!("Skipping test_patch_sp_map_populates_aizone_start_points (clean Maps not found)");
+            return;
+        };
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("scct_upk_aizone_sp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // 06_Hokkaido.scl: ONLY EAIZone1 (CreekGuard) has bEnableAtStart=True; EAIZone9 (Teahouse)
+        // and EAIZone10 (OldShoinGarden) must remain without StartPoints so they stay asleep.
+        let hok_src = maps_root.join("06_Hokkaido.scl");
+        let hok_out = temp_dir.join("06_Hokkaido_COOP.scl");
+        let summary = patch_sp_map_to_coop(&hok_src, &hok_out, (0.0, 0.0, 0.0), (50.0, 0.0, 0.0))
+            .expect("patch 06_Hokkaido.scl failed");
+        assert_eq!(summary.patched_start_zones, vec!["EAIZone1".to_string()]);
+        assert_eq!(check_map_aizone_start_points(&hok_out), Some(true));
+
+        let data = std::fs::read(&hok_out).unwrap();
+        let upk = parse_upk_tables(&data).unwrap();
+        let p1_ref = upk
+            .exports
+            .iter()
+            .find(|e| {
+                resolve_class_name(&upk.names, &upk.imports, &upk.exports, e.class_idx)
+                    == "EchelonPlayerStart"
+                    && upk.names[e.obj_name as usize].0 != "EchelonPlayerStartCoop"
+            })
+            .unwrap()
+            .index as i32;
+        let p2_ref = upk
+            .exports
+            .iter()
+            .find(|e| upk.names[e.obj_name as usize].0 == "EchelonPlayerStartCoop")
+            .unwrap()
+            .index as i32;
+
+        let mut checked_zone1 = false;
+        let mut checked_zone9 = false;
+        for e in &upk.exports {
+            let oname = &upk.names[e.obj_name as usize].0;
+            if oname == "EAIZone1" || oname == "EAIZone9" {
+                let s = e.serial_offset as usize;
+                let end = s + (e.serial_size as usize);
+                let ps = parse_state_frame_end(&data, s).unwrap();
+                let (props, _, _) = parse_tagged_properties_raw(&upk.names, &data, ps, end).unwrap();
+                let sp = props.iter().find(|p| p.name == "StartPoints");
+                if oname == "EAIZone1" {
+                    checked_zone1 = true;
+                    let sp = sp.expect("EAIZone1 must have StartPoints");
+                    assert_eq!(sp.ptype, 9);
+                    let mut off = 0usize;
+                    assert_eq!(read_compact_index(&sp.raw_val, &mut off).unwrap(), 2);
+                    assert_eq!(read_compact_index(&sp.raw_val, &mut off).unwrap(), p1_ref);
+                    assert_eq!(read_compact_index(&sp.raw_val, &mut off).unwrap(), p2_ref);
+                    assert_eq!(off, sp.raw_val.len());
+                } else {
+                    checked_zone9 = true;
+                    assert!(sp.is_none(), "EAIZone9 (bEnableAtStart=False) must NOT have StartPoints");
+                }
+            }
+        }
+        assert!(checked_zone1 && checked_zone9);
+
+        let detected = detect_upk_options_from_maps(&temp_dir).unwrap();
+        assert!(detected.populate_aizone_start_points);
+
+        // 01_Lighthouse.scl has 0 bEnableAtStart=True zones -> patched_start_zones must be empty
+        let lh_src = maps_root.join("01_Lighthouse.scl");
+        let lh_out = temp_dir.join("01_Lighthouse_COOP.scl");
+        let lh_sum = patch_sp_map_to_coop(&lh_src, &lh_out, (0.0, 0.0, 0.0), (50.0, 0.0, 0.0))
+            .expect("patch 01_Lighthouse.scl failed");
+        assert!(lh_sum.patched_start_zones.is_empty());
+        assert_eq!(check_map_aizone_start_points(&lh_out), None);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -391,7 +391,7 @@ pub struct PatcherApp {
     // Show debug/mod flag UI controls only when `--dev` is passed at startup
     dev_mode: bool,
 
-    // Per-feature patch toggles across all 6 mod groups (28 toggles)
+    // Per-feature patch toggles across all 6 mod groups (33 toggles)
     patch_flags: crate::patcher::ModFlags,
     applied_flags: Option<crate::patcher::ModFlags>,
     applying_flags: bool,
@@ -881,9 +881,9 @@ impl PatcherApp {
         let mut qs_toggled = false;
         ui.horizontal_wrapped(|ui| {
             if ui
-                .button(RichText::new("All Standard ON (29/31)").size(11.0))
+                .button(RichText::new("All Standard ON (31/33)").size(11.0))
                 .on_hover_text(
-                    "Enables all 29 standard Co-op Mod features (keeps Checksum Disconnect Bypass and execAddPlayerInZones AI Zone Wake OFF)",
+                    "Enables all 31 standard Co-op Mod features (keeps Checksum Disconnect Bypass and execAddPlayerInZones AI Zone Wake OFF)",
                 )
                 .clicked()
             {
@@ -893,7 +893,7 @@ impl PatcherApp {
             if ui
                 .button(RichText::new("Min Sync (Net + #4/#6 + Diag)").size(11.0))
                 .on_hover_text(
-                    "Enables ONLY Multi-NIC/NAT networking, #4 AI Vis Cull, #6 Controller Checksum, and Trace/Desync Diagnostics",
+                    "Enables ONLY Multi-NIC/NAT networking, #4 AI Zone-Sleep Sync, #6 Controller Checksum, and Trace/Desync Diagnostics",
                 )
                 .clicked()
             {
@@ -901,7 +901,7 @@ impl PatcherApp {
                 qs_toggled = true;
             }
             if ui
-                .button(RichText::new("Net Only (2/31)").size(11.0))
+                .button(RichText::new("Net Only (2/33)").size(11.0))
                 .on_hover_text(
                     "Enables ONLY Multi-NIC LAN & Direct-IP NAT hooks; reverts all gameplay, menu, UMD, MapRotation, and UPK changes to vanilla",
                 )
@@ -913,7 +913,7 @@ impl PatcherApp {
             if ui
                 .button(RichText::new("All OFF (100% Vanilla)").size(11.0))
                 .on_hover_text(
-                    "Disables ALL 31 mod flags: restores vanilla EXE, Echelon.u, dynamic-pc.umd, MapRotation.ini, removes *_COOP.* maps, and skips all runtime hooks",
+                    "Disables ALL 33 mod flags: restores vanilla EXE, Echelon.u, Engine.u, dynamic-pc.umd, MapRotation.ini, removes *_COOP.* maps, and skips all runtime hooks",
                 )
                 .clicked()
             {

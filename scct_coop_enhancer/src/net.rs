@@ -303,14 +303,24 @@ pub const HOOK_PAUSE_IS_PLAYER_READY: u32 = 0x109639E0;
 pub const PAUSE_IS_PLAYER_READY_ORIG_HEX: &str = "a19c551f1183ec28";
 pub const PAUSE_IS_PLAYER_READY_NEW_HEX: &str = "b801000000c39090";
 
-/// `AEAIPawn::[vt+0x2BC]` (`0x10C18480`) render-visibility tick cull gate at VA `0x10C1852C`
-/// (immediately after once-only static `FName` initialization, with zero `.reloc` entries):
-/// returns `1` to skip `AEPawn::Tick` (`0x10B89DD0`) & pattern updates when `[esi+0x424] & 4`,
-/// `LastRenderTime ([esi+0x50]) == 0.0f`, or `TimeSeconds - LastRenderTime > 1.0f`.
-/// Patching with `xor eax, eax; pop esi; ret` disables visibility-gated AI tick culling.
-pub const HOOK_AI_VISIBILITY_CULL: u32 = 0x10C1852C;
-pub const AI_VISIBILITY_CULL_ORIG: &[u8] = &[0x80, 0x7E, 0x4C, 0x07, 0x74, 0x61, 0x8B, 0x8E];
-pub const AI_VISIBILITY_CULL_PATCHED: &[u8] = &[0x33, 0xC0, 0x5E, 0xC3, 0x90, 0x90, 0x90, 0x90];
+/// `AEAIPawn::[vt+0x2BC]` (`0x10C18480`) disabled-zone sleep check (`CanBeDisabled` / `IsDisabledInZone`):
+/// returns `1` = SLEEP (stay disabled inside a disabled `EAIZone` or while `bGhost`), `0` = STAY AWAKE.
+/// Deterministic preamble at `0x10C1852C..0x10C18550` checks `PHYS_KarmaRagDoll` (`[esi+0x4C] == 7`),
+/// `AIController+0x7BC` alert/script enum (`1`/`2`), and `bGhost` (`[esi+0x424] & 4`).
+/// Only `0x10C18553..0x10C1858A` is render-dependent (a 1-second `LastRenderTime` grace period that
+/// desyncs Host vs Client when an AI zone disables while visible on one peer).
+/// Patching `0x10C18551` (`75 39` `jne 0x10c1858c` -> `EB 39` `jmp 0x10c1858c`, zero PE relocations)
+/// skips ONLY the `LastRenderTime` block and deterministically returns `1` (sleep) for disabled zones
+/// and `bGhost=True` NPCs, instead of waking all late-level/ghost AI from Step 1.
+pub const HOOK_AI_VISIBILITY_CULL: u32 = 0x10C18551;
+pub const AI_VISIBILITY_CULL_ORIG: &[u8] = &[0x75, 0x39];
+pub const AI_VISIBILITY_CULL_PATCHED: &[u8] = &[0xEB, 0x39];
+
+/// Legacy (inverted) patch site at `0x10C1852C` (`xor eax, eax; pop esi; ret` = ALWAYS return `0` / never sleep).
+/// Automatically detected and restored back to vanilla bytes on upgrade or revert.
+pub const HOOK_AI_VISIBILITY_CULL_LEGACY: u32 = 0x10C1852C;
+pub const AI_VISIBILITY_CULL_LEGACY_ORIG: &[u8] = &[0x80, 0x7E, 0x4C, 0x07, 0x74, 0x61, 0x8B, 0x8E];
+pub const AI_VISIBILITY_CULL_LEGACY_PATCHED: &[u8] = &[0x33, 0xC0, 0x5E, 0xC3, 0x90, 0x90, 0x90, 0x90];
 
 pub struct PatchSite {
     pub va: u32,
@@ -936,13 +946,27 @@ pub fn revert_pause_always_ready_bytes(pe_bytes: &mut [u8]) -> bool {
     revert_text_site_bytes(pe_bytes, HOOK_PAUSE_IS_PLAYER_READY, &orig, &new)
 }
 
-/// Returns whether AI visibility tick-culling (`AEAIPawn::vt+0x2BC` @ `0x10C1852C`) is disabled.
+/// Returns whether deterministic AI zone-sleep (`AEAIPawn::vt+0x2BC` @ `0x10C18551`) is applied
+/// and the legacy inverted `0x10C1852C` bytes are NOT present.
 pub fn is_ai_visibility_culling_disabled(pe_bytes: &[u8]) -> bool {
     is_text_patch_applied(pe_bytes, HOOK_AI_VISIBILITY_CULL, AI_VISIBILITY_CULL_PATCHED)
+        && is_text_patch_applied(
+            pe_bytes,
+            HOOK_AI_VISIBILITY_CULL_LEGACY,
+            AI_VISIBILITY_CULL_LEGACY_ORIG,
+        )
 }
 
-/// Patches `AEAIPawn::vt+0x2BC` (`0x10C1852C`) to return `0`, disabling visibility tick-culling (idempotent).
+/// Patches `AEAIPawn::vt+0x2BC` (`0x10C18551`) to deterministically skip the `LastRenderTime` grace
+/// period (`75 39` -> `EB 39`), automatically migrating away from the legacy inverted `0x10C1852C`
+/// patch if present (idempotent).
 pub fn patch_ai_visibility_culling_disabled_bytes(pe_bytes: &mut [u8]) -> Result<usize> {
+    revert_text_site_bytes(
+        pe_bytes,
+        HOOK_AI_VISIBILITY_CULL_LEGACY,
+        AI_VISIBILITY_CULL_LEGACY_ORIG,
+        AI_VISIBILITY_CULL_LEGACY_PATCHED,
+    );
     patch_text_site_bytes(
         pe_bytes,
         HOOK_AI_VISIBILITY_CULL,
@@ -952,14 +976,21 @@ pub fn patch_ai_visibility_culling_disabled_bytes(pe_bytes: &mut [u8]) -> Result
     )
 }
 
-/// Reverts `AEAIPawn::vt+0x2BC` (`0x10C1852C`) back to vanilla visibility culling bytes.
+/// Reverts `AEAIPawn::vt+0x2BC` (`0x10C18551` and any legacy `0x10C1852C` bytes) back to vanilla.
 pub fn revert_ai_visibility_culling_disabled_bytes(pe_bytes: &mut [u8]) -> bool {
-    revert_text_site_bytes(
+    let reverted_new = revert_text_site_bytes(
         pe_bytes,
         HOOK_AI_VISIBILITY_CULL,
         AI_VISIBILITY_CULL_ORIG,
         AI_VISIBILITY_CULL_PATCHED,
-    )
+    );
+    let reverted_legacy = revert_text_site_bytes(
+        pe_bytes,
+        HOOK_AI_VISIBILITY_CULL_LEGACY,
+        AI_VISIBILITY_CULL_LEGACY_ORIG,
+        AI_VISIBILITY_CULL_LEGACY_PATCHED,
+    );
+    reverted_new || reverted_legacy
 }
 
 fn is_sim_checksum_site_valid(pe_bytes: &[u8]) -> bool {
@@ -2022,9 +2053,12 @@ mod tests {
     #[test]
     fn test_ai_visibility_culling_toggle() {
         let cull_off = va_to_text_off(HOOK_AI_VISIBILITY_CULL).unwrap();
-        assert_eq!(cull_off, 0x31852C);
+        let legacy_off = va_to_text_off(HOOK_AI_VISIBILITY_CULL_LEGACY).unwrap();
+        assert_eq!(cull_off, 0x318551);
+        assert_eq!(legacy_off, 0x31852C);
         let mut mock = vec![0u8; cull_off + 16];
-        mock[cull_off..cull_off + 8].copy_from_slice(AI_VISIBILITY_CULL_ORIG);
+        mock[legacy_off..legacy_off + 8].copy_from_slice(AI_VISIBILITY_CULL_LEGACY_ORIG);
+        mock[cull_off..cull_off + 2].copy_from_slice(AI_VISIBILITY_CULL_ORIG);
 
         assert!(!is_ai_visibility_culling_disabled(&mock));
         assert_eq!(
@@ -2032,7 +2066,11 @@ mod tests {
             cull_off
         );
         assert!(is_ai_visibility_culling_disabled(&mock));
-        assert_eq!(&mock[cull_off..cull_off + 8], AI_VISIBILITY_CULL_PATCHED);
+        assert_eq!(&mock[cull_off..cull_off + 2], AI_VISIBILITY_CULL_PATCHED);
+        assert_eq!(
+            &mock[legacy_off..legacy_off + 8],
+            AI_VISIBILITY_CULL_LEGACY_ORIG
+        );
         // Idempotent
         assert_eq!(
             patch_ai_visibility_culling_disabled_bytes(&mut mock).unwrap(),
@@ -2041,11 +2079,37 @@ mod tests {
         // Revert
         assert!(revert_ai_visibility_culling_disabled_bytes(&mut mock));
         assert!(!is_ai_visibility_culling_disabled(&mock));
-        assert_eq!(&mock[cull_off..cull_off + 8], AI_VISIBILITY_CULL_ORIG);
+        assert_eq!(&mock[cull_off..cull_off + 2], AI_VISIBILITY_CULL_ORIG);
+
+        // Legacy migration: old inverted 0x10C1852C bytes must be detected as NOT migrated,
+        // automatically restored on patch, and cleanly reverted on revert.
+        mock[legacy_off..legacy_off + 8].copy_from_slice(AI_VISIBILITY_CULL_LEGACY_PATCHED);
+        assert!(!is_ai_visibility_culling_disabled(&mock));
+        assert_eq!(
+            patch_ai_visibility_culling_disabled_bytes(&mut mock).unwrap(),
+            cull_off
+        );
+        assert!(is_ai_visibility_culling_disabled(&mock));
+        assert_eq!(
+            &mock[legacy_off..legacy_off + 8],
+            AI_VISIBILITY_CULL_LEGACY_ORIG
+        );
+        assert_eq!(&mock[cull_off..cull_off + 2], AI_VISIBILITY_CULL_PATCHED);
+        assert!(revert_ai_visibility_culling_disabled_bytes(&mut mock));
+        assert_eq!(&mock[cull_off..cull_off + 2], AI_VISIBILITY_CULL_ORIG);
+
+        // Direct revert from legacy-only state
+        mock[legacy_off..legacy_off + 8].copy_from_slice(AI_VISIBILITY_CULL_LEGACY_PATCHED);
+        assert!(revert_ai_visibility_culling_disabled_bytes(&mut mock));
+        assert_eq!(
+            &mock[legacy_off..legacy_off + 8],
+            AI_VISIBILITY_CULL_LEGACY_ORIG
+        );
 
         let clean_candidates = [
             "../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
             "../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
+            "../../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/splintercell3.exe",
         ];
         if let Some(p) = clean_candidates
             .iter()
@@ -2055,13 +2119,15 @@ mod tests {
             let mut real_exe = std::fs::read(p).unwrap();
             assert!(!is_ai_visibility_culling_disabled(&real_exe));
             assert_eq!(
-                &real_exe[cull_off..cull_off + 8],
-                AI_VISIBILITY_CULL_ORIG
+                &real_exe[legacy_off..legacy_off + 8],
+                AI_VISIBILITY_CULL_LEGACY_ORIG
             );
+            assert_eq!(&real_exe[cull_off..cull_off + 2], AI_VISIBILITY_CULL_ORIG);
             patch_ai_visibility_culling_disabled_bytes(&mut real_exe).unwrap();
             assert!(is_ai_visibility_culling_disabled(&real_exe));
             assert!(revert_ai_visibility_culling_disabled_bytes(&mut real_exe));
             assert!(!is_ai_visibility_culling_disabled(&real_exe));
+            assert_eq!(&real_exe[cull_off..cull_off + 2], AI_VISIBILITY_CULL_ORIG);
         }
     }
 

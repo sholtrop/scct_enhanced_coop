@@ -472,6 +472,65 @@ pub fn patch_echelon_u_eev_bytes(data: &mut [u8]) -> Result<usize> {
     bail!("Could not locate EPlayerController.SwitchEEV gate bytecode pattern in Echelon.u");
 }
 
+/// Bytecode pattern in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008 @ `0x02B82E..0x02B848`):
+/// `ClassName = ("EchelonPattern.V" $ temp);` where `temp` (`00 40 02`, EX_LocalVariable) is
+/// `GetCurrentMapName()` (e.g. `"06_Hokkaido_COOP"`), causing `DynamicLoadObject("EchelonPattern.V06_Hokkaido_COOP")`
+/// to fail and leaving `Level.VarObject == None` on all 11 converted SP-to-Co-op maps.
+const ENGINE_U_VAROBJECT_ORIG: &[u8] = &[
+    0x0F, 0x00, 0x7B, 0x08, 0x70, 0x1F,
+    b'E', b'c', b'h', b'e', b'l', b'o', b'n', b'P', b'a', b't', b't', b'e', b'r', b'n', b'.', b'V', 0x00,
+    0x00, 0x40, 0x02, 0x16,
+];
+
+/// Patched bytecode in `System/Engine.u` (`LevelInfo.PostBeginPlay`, export 2008 @ `0x02B82E..0x02B848`):
+/// Replaces `00 40 02` (`EX_LocalVariable temp`) at `0x02B845..0x02B847` with `01 7A 16`
+/// (`EX_InstanceVariable LevelInfo.SoundMapName`, export 1466). Zero size change, 100% deterministic,
+/// and preserves vanilla behavior across all 7 retail Co-op maps and all 11 SP maps.
+const ENGINE_U_VAROBJECT_PATCHED: &[u8] = &[
+    0x0F, 0x00, 0x7B, 0x08, 0x70, 0x1F,
+    b'E', b'c', b'h', b'e', b'l', b'o', b'n', b'P', b'a', b't', b't', b'e', b'r', b'n', b'.', b'V', 0x00,
+    0x01, 0x7A, 0x16, 0x16,
+];
+
+pub fn is_engine_u_varobject_patched(data: &[u8]) -> bool {
+    data.windows(ENGINE_U_VAROBJECT_PATCHED.len())
+        .any(|w| w == ENGINE_U_VAROBJECT_PATCHED)
+}
+
+pub fn revert_engine_u_varobject_bytes(data: &mut [u8]) -> bool {
+    let nlen = ENGINE_U_VAROBJECT_PATCHED.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_VAROBJECT_PATCHED)
+    {
+        data[pos..pos + nlen].copy_from_slice(ENGINE_U_VAROBJECT_ORIG);
+        return true;
+    }
+    false
+}
+
+pub fn patch_engine_u_varobject_bytes(data: &mut [u8]) -> Result<usize> {
+    assert_eq!(
+        ENGINE_U_VAROBJECT_ORIG.len(),
+        ENGINE_U_VAROBJECT_PATCHED.len()
+    );
+    let nlen = ENGINE_U_VAROBJECT_ORIG.len();
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_VAROBJECT_ORIG)
+    {
+        data[pos..pos + nlen].copy_from_slice(ENGINE_U_VAROBJECT_PATCHED);
+        return Ok(pos);
+    }
+    if let Some(pos) = data
+        .windows(nlen)
+        .position(|w| w == ENGINE_U_VAROBJECT_PATCHED)
+    {
+        return Ok(pos);
+    }
+    bail!("Could not locate LevelInfo.PostBeginPlay VarObject bytecode pattern in Engine.u");
+}
+
 /// Security camera alarm check in `splintercell3.exe` (`EAIZone::StartAlarm`, VA 0x1099BCA4):
 /// In multiplayer (`Level->bMultiplayerMap == 1`), `jne 0x1099bccc` (75 1c) skips `TriggerAlarm`.
 /// Patch: `75 1c` -> `90 90` (nop; nop).
@@ -1119,7 +1178,7 @@ impl FlagGroup {
             FlagGroup::Networking => "1. Networking & Connection (EXE)",
             FlagGroup::MenusLobby => "2. Menus & Lobby QoL (EXE)",
             FlagGroup::SyncAiSkel => "3. Lockstep Sync, AI & Skeletal Fixes (EXE)",
-            FlagGroup::Gameplay => "4. Gameplay & Script Fixes (EXE + Echelon.u)",
+            FlagGroup::Gameplay => "4. Gameplay & Script Fixes (EXE + Echelon.u + Engine.u)",
             FlagGroup::ArchivesMaps => "5. Archives, Map INI & UPK Conversion (UMD + Maps)",
             FlagGroup::RuntimeDiag => "6. Runtime Launch, Persistence & Diagnostics",
         }
@@ -1137,7 +1196,7 @@ pub struct FlagDescriptor {
     pub get_mut: fn(&mut ModFlags) -> &mut bool,
 }
 
-/// Comprehensive 31-flag configuration covering every modification `scct_coop_enhancer`
+/// Comprehensive 33-flag configuration covering every modification `scct_coop_enhancer`
 /// makes across `.exe`, `.u`, `.umd`, `.ini`, `Data/Maps/*.scl` UPKs, and runtime launch hooks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModFlags {
@@ -1163,6 +1222,7 @@ pub struct ModFlags {
     pub coop_aizone_enable: bool,
     pub coop_endmission_dispatch: bool,
     pub eev_remote_hacking: bool,
+    pub engine_u_varobject_fix: bool,
     pub coop_interaction_lock_fixes: bool,
     pub coop_aivolume_leave_guard: bool,
     // 5. Archives & Map UPK Conversion
@@ -1173,6 +1233,7 @@ pub struct ModFlags {
     pub upk_detach_speakers: bool,
     pub upk_coop_player_mesh: bool,
     pub upk_use_default_sound_map_false: bool,
+    pub upk_populate_aizone_start_points: bool,
     // 6. Runtime Launch, Persistence & Diagnostics
     pub runtime_startup_trace_hooks: bool,
     pub runtime_desync_monitor_dump: bool,
@@ -1268,8 +1329,8 @@ pub const FLAG_DESCRIPTORS: &[FlagDescriptor] = &[
     FlagDescriptor {
         group: FlagGroup::SyncAiSkel,
         short_name: "ai_vis_cull",
-        label: "#4 Disable AI Visibility Tick-Culling (AEAIPawn::vt+0x2BC @ 0x10C1852C)",
-        tooltip: "Prevents off-screen AI pawns from skipping AEPawn::Tick / patterns asymmetrically.",
+        label: "#4 AI Deterministic Zone-Sleep Sync (AEAIPawn::vt+0x2BC @ 0x10C18551)",
+        tooltip: "Skips only the per-peer LastRenderTime visibility grace period in AEAIPawn::vt+0x2BC so disabled EAIZone and bGhost NPCs stay asleep deterministically while preventing asymmetric off-screen drift.",
         requires_heavy_rebuild: false,
         get: |f| f.disable_ai_visibility_cull,
         get_mut: |f| &mut f.disable_ai_visibility_cull,
@@ -1365,6 +1426,15 @@ pub const FLAG_DESCRIPTORS: &[FlagDescriptor] = &[
         get: |f| f.coop_aivolume_leave_guard,
         get_mut: |f| &mut f.coop_aivolume_leave_guard,
     },
+    FlagDescriptor {
+        group: FlagGroup::Gameplay,
+        short_name: "engine_varobject",
+        label: "System/Engine.u Level.VarObject SoundMapName Fix (0x02B845)",
+        tooltip: "Fixes LevelInfo.PostBeginPlay to spawn EchelonPattern.V<SoundMapName> instead of V<CurrentMapName>, so Level.VarObject is non-None on all *_COOP maps (fixes Hokkaido sliding door softlock & mission variables).",
+        requires_heavy_rebuild: false,
+        get: |f| f.engine_u_varobject_fix,
+        get_mut: |f| &mut f.engine_u_varobject_fix,
+    },
     // 5. Archives & Map UPK Conversion
     FlagDescriptor {
         group: FlagGroup::ArchivesMaps,
@@ -1429,6 +1499,15 @@ pub const FLAG_DESCRIPTORS: &[FlagDescriptor] = &[
         get: |f| f.upk_use_default_sound_map_false,
         get_mut: |f| &mut f.upk_use_default_sound_map_false,
     },
+    FlagDescriptor {
+        group: FlagGroup::ArchivesMaps,
+        short_name: "upk_aizone_starts",
+        label: "UPK: Populate EAIZone.StartPoints on bEnableAtStart Zones",
+        tooltip: "Populates StartPoints=[P1, P2] on bEnableAtStart=True EAIZone exports inside *_COOP.scl so starting/HQ zones wake on spawn while disabled zones stay asleep until triggered.",
+        requires_heavy_rebuild: true,
+        get: |f| f.upk_populate_aizone_start_points,
+        get_mut: |f| &mut f.upk_populate_aizone_start_points,
+    },
     // 6. Runtime Launch, Persistence & Diagnostics
     FlagDescriptor {
         group: FlagGroup::RuntimeDiag,
@@ -1492,7 +1571,7 @@ fn sync_exe_toggle(
 }
 
 impl ModFlags {
-    /// Standard Co-op Mod preset: 29/31 standard features enabled; keeps Checksum Disconnect Bypass and COOP_AIZONE_ENABLE OFF.
+    /// Standard Co-op Mod preset: 31/33 standard features enabled; keeps Checksum Disconnect Bypass and COOP_AIZONE_ENABLE OFF.
     pub const fn standard_coop() -> Self {
         Self {
             net_multi_nic_adapter_fix: true,
@@ -1515,6 +1594,7 @@ impl ModFlags {
             eev_remote_hacking: true,
             coop_interaction_lock_fixes: true,
             coop_aivolume_leave_guard: true,
+            engine_u_varobject_fix: true,
             umd_coop_missions_and_loc: true,
             umd_lan_menu_caption: true,
             loose_map_rotation_ini: true,
@@ -1522,6 +1602,7 @@ impl ModFlags {
             upk_detach_speakers: true,
             upk_coop_player_mesh: true,
             upk_use_default_sound_map_false: true,
+            upk_populate_aizone_start_points: true,
             runtime_startup_trace_hooks: true,
             runtime_desync_monitor_dump: true,
             runtime_bypass_checksum_disconnect: false,
@@ -1552,6 +1633,7 @@ impl ModFlags {
             eev_remote_hacking: false,
             coop_interaction_lock_fixes: false,
             coop_aivolume_leave_guard: false,
+            engine_u_varobject_fix: false,
             umd_coop_missions_and_loc: false,
             umd_lan_menu_caption: false,
             loose_map_rotation_ini: false,
@@ -1559,6 +1641,7 @@ impl ModFlags {
             upk_detach_speakers: false,
             upk_coop_player_mesh: false,
             upk_use_default_sound_map_false: false,
+            upk_populate_aizone_start_points: false,
             runtime_startup_trace_hooks: false,
             runtime_desync_monitor_dump: false,
             runtime_bypass_checksum_disconnect: false,
@@ -1614,6 +1697,7 @@ impl ModFlags {
             detach_speakers: self.upk_detach_speakers,
             coop_player_mesh: self.upk_coop_player_mesh,
             use_default_sound_map_false: self.upk_use_default_sound_map_false,
+            populate_aizone_start_points: self.upk_populate_aizone_start_points,
         }
     }
 
@@ -1782,6 +1866,11 @@ impl ModFlags {
             .map(|buf| is_echelon_u_eev_patched(&buf))
             .unwrap_or(false);
 
+        let engine_u_path = find_child_ci(&system_dir, "Engine.u");
+        let engine_u_varobject_fix = std::fs::read(&engine_u_path)
+            .map(|buf| is_engine_u_varobject_patched(&buf))
+            .unwrap_or(false);
+
         let umd_path = find_child_ci(&system_dir, "dynamic-pc.umd");
         let umd_opts = detect_umd_options_fast(&umd_path).unwrap_or(UmdPatchOptions {
             coop_missions_and_loc: false,
@@ -1812,6 +1901,7 @@ impl ModFlags {
                     detach_speakers: false,
                     coop_player_mesh: false,
                     use_default_sound_map_false: false,
+                    populate_aizone_start_points: false,
                 },
                 |p| p.upk_options(),
             )
@@ -1846,6 +1936,7 @@ impl ModFlags {
             eev_remote_hacking,
             coop_interaction_lock_fixes: is_coop_interaction_lock_fixes_patched(&exe_bytes),
             coop_aivolume_leave_guard: is_coop_aivolume_leave_guard_patched(&exe_bytes),
+            engine_u_varobject_fix,
             umd_coop_missions_and_loc: umd_opts.coop_missions_and_loc,
             umd_lan_menu_caption: umd_opts.lan_menu_caption,
             loose_map_rotation_ini,
@@ -1853,6 +1944,7 @@ impl ModFlags {
             upk_detach_speakers: upk_opts.detach_speakers,
             upk_coop_player_mesh: upk_opts.coop_player_mesh,
             upk_use_default_sound_map_false: upk_opts.use_default_sound_map_false,
+            upk_populate_aizone_start_points: upk_opts.populate_aizone_start_points,
             runtime_startup_trace_hooks: trace,
             runtime_desync_monitor_dump: mon,
             runtime_bypass_checksum_disconnect: is_startup_checksum_bypass_patched(&exe_bytes),
@@ -1903,7 +1995,7 @@ fn has_any_generated_coop_artifacts(maps_dir: &Path, gen_loadings_dir: &Path) ->
     false
 }
 
-/// Synchronizes all 31 mod flags incrementally: `.exe`, `Echelon.u`, loose `MapRotation.ini`,
+/// Synchronizes all 33 mod flags incrementally: `.exe`, `Echelon.u`, `Engine.u`, loose `MapRotation.ini`,
 /// `dynamic-pc.umd`, and `Data/Maps/*_COOP.*` / `GenLoadings` are only rewritten when out of sync.
 pub fn sync_mod_flags(
     game_root: &Path,
@@ -1985,6 +2077,37 @@ fn sync_mod_flags_inner(
                 std::fs::copy(&echelon_u_path, &echelon_u_bak_path)?;
             }
             write_file_clearing_readonly(&echelon_u_path, &echelon_bytes)?;
+        }
+    }
+
+    // 2b. Sync System/Engine.u (LevelInfo.PostBeginPlay VarObject SoundMapName fix)
+    let engine_u_path = find_child_ci(&system_dir, "Engine.u");
+    let engine_u_bak_path = system_dir.join("Engine.u.bak");
+    if engine_u_path.exists() {
+        let orig_engine = std::fs::read(&engine_u_path)
+            .with_context(|| format!("Reading {}", engine_u_path.display()))?;
+        let mut engine_bytes = if force_reinstall && engine_u_bak_path.exists() {
+            std::fs::read(&engine_u_bak_path)
+                .with_context(|| format!("Reading {}", engine_u_bak_path.display()))?
+        } else {
+            orig_engine.clone()
+        };
+        if flags.engine_u_varobject_fix {
+            if !is_engine_u_varobject_patched(&engine_bytes) {
+                patch_engine_u_varobject_bytes(&mut engine_bytes)?;
+            }
+        } else {
+            revert_engine_u_varobject_bytes(&mut engine_bytes);
+        }
+        if engine_bytes != orig_engine {
+            if !engine_u_bak_path.exists() && !is_engine_u_varobject_patched(&orig_engine) {
+                std::fs::copy(&engine_u_path, &engine_u_bak_path)?;
+                scct_log!(
+                    "  [BAK] Backed up vanilla Engine.u -> {}",
+                    engine_u_bak_path.display()
+                );
+            }
+            write_file_clearing_readonly(&engine_u_path, &engine_bytes)?;
         }
     }
 
@@ -2140,8 +2263,13 @@ fn sync_mod_flags_inner(
                     } else {
                         format!(" | Detached: {}", summary.detached_speakers.join(", "))
                     };
+                    let start_zones_info = if summary.patched_start_zones.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" | StartZones: {}", summary.patched_start_zones.join(", "))
+                    };
                     scct_log!(
-                        "  [COOP] {:22} (ID={:3}): {:9} B | P1=({:.1}, {:.1}, {:.1}) -> P2=({:.1}, {:.1}, {:.1}){}",
+                        "  [COOP] {:22} (ID={:3}): {:9} B | P1=({:.1}, {:.1}, {:.1}) -> P2=({:.1}, {:.1}, {:.1}){}{}",
                         coop_map,
                         spec.identity,
                         summary.size,
@@ -2152,6 +2280,7 @@ fn sync_mod_flags_inner(
                         summary.p2_loc.1,
                         summary.p2_loc.2,
                         detached_info,
+                        start_zones_info,
                     );
                 }
             }
@@ -2223,7 +2352,7 @@ pub fn revert_exe_fixes(exe_path: &Path) -> Result<bool> {
     }
 
     if revert_ai_visibility_culling_disabled_bytes(&mut data) {
-        scct_log!("  [EXE] Restored vanilla AI visibility tick-culling (0x10C1852C)");
+        scct_log!("  [EXE] Restored vanilla AI visibility tick-culling (0x10C18551)");
         changed = true;
     }
 
@@ -2318,7 +2447,7 @@ pub fn patch_exe_fixes(exe_path: &Path, exe_bak_path: &Path) -> Result<()> {
     if !is_ai_visibility_culling_disabled(&data) {
         let cull_off = patch_ai_visibility_culling_disabled_bytes(&mut data)?;
         scct_log!(
-            "  [EXE] Disabled AI visibility tick-culling (0x10C1852C) @ 0x{:06X}",
+            "  [EXE] Patched AI deterministic zone-sleep sync (0x10C18551) @ 0x{:06X}",
             cull_off
         );
         modified = true;
@@ -2802,7 +2931,7 @@ mod tests {
 
     #[test]
     fn test_mod_flags_descriptor_table_integrity() {
-        assert_eq!(FLAG_DESCRIPTORS.len(), 31);
+        assert_eq!(FLAG_DESCRIPTORS.len(), 33);
         let mut seen = HashSet::new();
         for d in FLAG_DESCRIPTORS {
             assert!(seen.insert(d.short_name), "duplicate short_name {}", d.short_name);
@@ -2836,6 +2965,7 @@ mod tests {
         };
         let clean_exe = clean_root.join("System/splintercell3.exe");
         let clean_echelon = clean_root.join("System/Echelon.u");
+        let clean_engine = clean_root.join("System/Engine.u");
         if !clean_exe.exists() {
             return;
         }
@@ -2848,10 +2978,17 @@ mod tests {
         let test_exe = sys.join("splintercell3.exe");
         let test_bak = sys.join("splintercell3.exe.bak");
         let test_echelon = sys.join("Echelon.u");
+        let test_engine = sys.join("Engine.u");
         std::fs::copy(&clean_exe, &test_exe).unwrap();
         if clean_echelon.exists() {
             std::fs::copy(&clean_echelon, &test_echelon).unwrap();
         }
+        let vanilla_engine = if clean_engine.exists() {
+            std::fs::copy(&clean_engine, &test_engine).unwrap();
+            Some(std::fs::read(&test_engine).unwrap())
+        } else {
+            None
+        };
         let loose_rot = sys.join("MapRotation.ini");
         std::fs::write(&loose_rot, b"[MapRotation]\r\nMaps=01_Panama\r\n").unwrap();
         let vanilla_exe = std::fs::read(&test_exe).unwrap();
@@ -2865,6 +3002,7 @@ mod tests {
         sync_mod_flags(&dir, &std_flags, None).unwrap();
         let expected_on_exe_only = ModFlags {
             eev_remote_hacking: clean_echelon.exists(),
+            engine_u_varobject_fix: clean_engine.exists(),
             umd_coop_missions_and_loc: false,
             umd_lan_menu_caption: false,
             install_sp_coop_maps: false,
@@ -2874,6 +3012,12 @@ mod tests {
             ModFlags::detect_from_disk(&dir, Some(&std_flags)),
             Some(expected_on_exe_only)
         );
+        if clean_engine.exists() {
+            assert!(sys.join("Engine.u.bak").exists());
+            assert!(is_engine_u_varobject_patched(
+                &std::fs::read(&test_engine).unwrap()
+            ));
+        }
 
         // Disable #1 & #2 SkelMesh suspects + test net_only & minimal_coop_sync presets
         let no_skel = ModFlags::without_skel_suspects();
@@ -2901,12 +3045,16 @@ mod tests {
         assert!(!String::from_utf8_lossy(&std::fs::read(&loose_rot).unwrap())
             .contains("01_Lighthouse_COOP"));
 
-        // Disable all 31 flags -> exe bytes match 100% vanilla and Echelon.u reverts
+        // Disable all 33 flags -> exe & Engine.u bytes match 100% vanilla and Echelon.u reverts
         let all_off = ModFlags::all_disabled();
         sync_mod_flags(&dir, &all_off, None).unwrap();
         assert_eq!(std::fs::read(&test_exe).unwrap(), vanilla_exe);
         if clean_echelon.exists() {
             assert!(!is_echelon_u_eev_patched(&std::fs::read(&test_echelon).unwrap()));
+        }
+        if let Some(orig_eng) = vanilla_engine {
+            assert_eq!(std::fs::read(&test_engine).unwrap(), orig_eng);
+            assert!(!is_engine_u_varobject_patched(&orig_eng));
         }
         assert_eq!(ModFlags::detect_from_disk(&dir, Some(&all_off)), Some(all_off));
 
@@ -2945,5 +3093,44 @@ mod tests {
         assert!(revert_echelon_u_eev_bytes(&mut buf));
         assert!(!is_echelon_u_eev_patched(&buf));
         assert_eq!(buf, orig);
+    }
+
+    #[test]
+    fn test_patch_engine_u_varobject_bytes_and_clean_file() {
+        let mut buf = vec![0xAA; 32];
+        buf.extend_from_slice(ENGINE_U_VAROBJECT_ORIG);
+        buf.extend_from_slice(&[0xBB; 16]);
+        let orig = buf.clone();
+
+        assert!(!is_engine_u_varobject_patched(&buf));
+        assert!(!revert_engine_u_varobject_bytes(&mut buf));
+        assert_eq!(patch_engine_u_varobject_bytes(&mut buf).unwrap(), 32);
+        assert!(is_engine_u_varobject_patched(&buf));
+        // Idempotent second call
+        assert_eq!(patch_engine_u_varobject_bytes(&mut buf).unwrap(), 32);
+        assert!(revert_engine_u_varobject_bytes(&mut buf));
+        assert!(!is_engine_u_varobject_patched(&buf));
+        assert_eq!(buf, orig);
+
+        // Verify directly against clean retail System/Engine.u if present
+        let candidates = [
+            "../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/Engine.u",
+            "../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/Engine.u",
+            "../../../clean_scct_files/Tom Clancy's Splinter Cell Chaos Theory/System/Engine.u",
+        ];
+        let Some(clean_path) = candidates.iter().map(Path::new).find(|p| p.exists()) else {
+            return;
+        };
+        let clean = std::fs::read(clean_path).unwrap();
+        let mut patched = clean.clone();
+        assert!(!is_engine_u_varobject_patched(&patched));
+        let off = patch_engine_u_varobject_bytes(&mut patched).unwrap();
+        assert_eq!(off, 0x02B82E);
+        assert_eq!(&clean[0x02B845..0x02B848], &[0x00, 0x40, 0x02]);
+        assert_eq!(&patched[0x02B845..0x02B848], &[0x01, 0x7A, 0x16]);
+        assert!(is_engine_u_varobject_patched(&patched));
+        assert_eq!(patch_engine_u_varobject_bytes(&mut patched).unwrap(), 0x02B82E);
+        assert!(revert_engine_u_varobject_bytes(&mut patched));
+        assert_eq!(patched, clean);
     }
 }
